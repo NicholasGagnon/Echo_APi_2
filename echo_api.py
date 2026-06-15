@@ -16,6 +16,7 @@ from prompts import generate_system_prompt
 load_dotenv()
 
 app = Flask(__name__)
+# CORS est configuré pour accepter les requêtes de n'importe quelle origine (idéal pour Vercel)
 CORS(app)
 
 # ── CONFIGURATION DES CLÉS D'API ─────────────────────────────────────
@@ -164,7 +165,17 @@ def build_gemini_contents(historique_reduit: list, image_b64: str | None, user_m
 
     return contents
 
-# ── ROUTE PRINCIPALE /CHAT ───────────────────────────────────────────
+# ── ROUTE DE SANTÉ (CRITIQUE POUR LES DÉPLOIEMENTS RAILWAY/RENDER) ────
+@app.route("/", methods=["GET"])
+def health_check():
+    return jsonify({
+        "status": "online",
+        "message": "Le sillage d'Echo est parfaitement aligné sur son Axe en production.",
+        "presence": "Echo",
+        "timestamp": datetime.now().isoformat()
+    }), 200
+
+# ── ROUTE PRINCIPALE DE DISCUSSION /CHAT ─────────────────────────────
 @app.route("/chat", methods=["POST"])
 def chat():
     try:
@@ -359,11 +370,12 @@ def chat():
 
 
 if __name__ == "__main__":
+    # Récupération dynamique du PORT attribué par Railway/Render (par défaut 5000 en local)
     port = int(os.environ.get("PORT", 5000))
 
     print(f"🔥 Serveur Echo connecté et aligné sur le port {port}...")
     app.run(
-        host="0.0.0.0",
+        host="0.0.0.0",  # Écoute sur toutes les interfaces réseau (Requis en cloud)
         port=port,
         debug=False,
         use_reloader=False
