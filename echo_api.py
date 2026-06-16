@@ -16,7 +16,6 @@ from prompts import generate_system_prompt
 load_dotenv()
 
 app = Flask(__name__)
-# CORS est configuré pour accepter les requêtes de n'importe quelle origine (idéal pour Vercel)
 CORS(app)
 
 # ── CONFIGURATION DES CLÉS D'API ─────────────────────────────────────
@@ -44,27 +43,18 @@ client_nvidia       = OpenAI(base_url=NVIDIA_BASE_URL,     api_key=NVIDIA_API_KE
 client_groq         = OpenAI(base_url=GROQ_BASE_URL,       api_key=GROQ_API_KEY)       if GROQ_API_KEY       else None
 client_cloudflare   = OpenAI(base_url=CLOUDFLARE_BASE_URL, api_key=CLOUDFLARE_API_TOKEN) if CLOUDFLARE_API_TOKEN else None
 
-COUNTER_FILE       = "failover_usage.json"
+# SÉCURISATION DES LIMITES DE FAILOVER VIA VARIABLE DE MÉMOIRE RUNTIME GLOBAL
+GLOBAL_FAILOVER_MEMORY_COUNT = 0
 MAX_FREE_FAILOVERS = 200
 
-# ── GESTION DU COMPTEUR DE FAILOVER (SÉCURITÉ PORTAL) ────────────────
 def get_failover_count():
-    try:
-        if os.path.exists(COUNTER_FILE):
-            with open(COUNTER_FILE, "r") as f:
-                return json.load(f).get("count", 0)
-    except Exception as e:
-        print(f"[WARN] Erreur lecture compteur failover : {e}")
-    return 0
+    global GLOBAL_FAILOVER_MEMORY_COUNT
+    return GLOBAL_FAILOVER_MEMORY_COUNT
 
 def increment_failover_count():
-    try:
-        current = get_failover_count()
-        with open(COUNTER_FILE, "w") as f:
-            json.dump({"count": current + 1}, f)
-        print(f"⚠️ [FAILOVER FREE] {current + 1} / {MAX_FREE_FAILOVERS}")
-    except Exception as e:
-        print(f"[WARN] Erreur écriture compteur failover : {e}")
+    global GLOBAL_FAILOVER_MEMORY_COUNT
+    GLOBAL_FAILOVER_MEMORY_COUNT += 1
+    print(f"⚠️ [FAILOVER FREE MEMORY] {GLOBAL_FAILOVER_MEMORY_COUNT} / {MAX_FREE_FAILOVERS}")
 
 # ── PARSAGE ET NETTOYAGE DU JSON DE RETOUR ────────────────────────────
 def clean_and_parse_json(raw_text):
@@ -217,7 +207,7 @@ def chat():
             filtered_calendar = calendar_events
 
         # ── APPEL DE LA LOGIQUE EXTERNALISÉE DU PROMPT SYSTÈME ─────────
-        system_prompt = generate_system_prompt(
+        base_system_prompt = generate_system_prompt(
             source=source,
             selected_buttons=selected_buttons,
             date_aujourdhui=date_aujourdhui,
@@ -229,6 +219,18 @@ def chat():
             current_cycle=current_cycle
         )
 
+        # ── 🛠️ DIRECTION CRITIQUE ANTI-DOUBLONS (CHANTIER 1) ──
+        anti_duplication_directive = (
+            "\n\nCRITICAL SAFETY DIRECTIVE FOR ACTION EXTRACTION:\n"
+            "You are provided with a partial chat history for baseline conversational context. However, you MUST ONLY "
+            "trigger or extract updates for structural tools (like adding calendar events, logging calories, or recording expenses) "
+            "if the intent is explicitly and newly demanded in the LATEST message from the user. "
+            "If the latest user message is conversational, neutral, or just a reply to your previous text, you MUST return "
+            "'action': null, even if earlier blocks of the chat history contain command sentences. "
+            "Never repeat or re-execute a past action from historical text."
+        )
+        system_prompt = base_system_prompt + anti_duplication_directive
+
         # =====================================================================
         # AJUSTEMENT DYNAMIQUE DE LA MÉMOIRE ET DES TOKENS SELON LE PLAN
         # =====================================================================
@@ -239,7 +241,7 @@ def chat():
             taille_memoire = 15
             output_tokens = 2048
         elif user_tier in ["ultra", "founder"]:
-            taille_memoire = 30  # Garde l'esprit d'Écho parfaitement sur son Axe
+            taille_memoire = 30
             output_tokens = 4096
         else:
             taille_memoire = 5
@@ -256,7 +258,7 @@ def chat():
             force_neutral_style=has_active_buttons or (source == "vitality")
         )
 
-        # ── INJECTION DE GOOGLE SEARCH RETRIEVAL (GROUNDING NATIONNEL) ───────
+        # ── INJECTION DE GOOGLE SEARCH RETRIEVAL (CORRIGÉ NATIVE) ───────
         def call_gemini(client, model_name):
             return client.models.generate_content(
                 model=model_name,
@@ -265,17 +267,21 @@ def chat():
                     response_mime_type="application/json",
                     system_instruction=system_prompt,
                     max_output_tokens=output_tokens,
-                    # Activation de l'outil de recherche web Google natif
-                    tools=[{"google_search_retrieval": {}}]
+                    tools=[{"google_search": {}}]
                 )
             )
 
         # =====================================================================
-        # ROUTAGE ET STRATÉGIE DE FAILOVER (SOUVERAINETÉ & SÉCURITÉ DE COÛTS)
+        # ROUTAGE ET STRATÉGIE DE FAILOVER SECURISÉE (SOUVERAINETÉ DE COÛTS)
         # =====================================================================
         
         # ── FORFAIT GRATUIT (FREE) ───────────────────────────────────────────
         if user_tier == "free":
+            current_failovers = get_failover_count()
+            if current_failovers >= MAX_FREE_FAILOVERS:
+                print(f"🔒 [CUT-CIRCUIT EXCEEDED] Coupe-circuit activé ({current_failovers}/{MAX_FREE_FAILOVERS})")
+                return jsonify({"action": None, "response": "Ouf, mon sillage sature sous l'affluence gratuite. Laisse-moi une petite seconde ! 😎"})
+
             if client_gemini_free:
                 try:
                     print("[FREE 1/3] -> Gemini 3.1 Flash-Lite")
@@ -292,19 +298,15 @@ def chat():
                 except Exception as e:
                     print(f"Echec Gemini 2.5 Free ({e})")
 
-            # Filet de secours payant pour les gratuits (limité à 200/mois pour protéger ton portefeuille)
+            # Filet de secours payant pour les gratuits (limité et sécurisé en RAM RAM)
             if client_gemini_paid:
-                current = get_failover_count()
-                if current < MAX_FREE_FAILOVERS:
-                    try:
-                        print(f"🚨 [FREE -> FILET] Gemini 2.5 Flash-Lite Payant ({current + 1}/{MAX_FREE_FAILOVERS})")
-                        r = call_gemini(client_gemini_paid, "gemini-2.5-flash-lite")
-                        increment_failover_count()
-                        return jsonify(clean_and_parse_json(r.text))
-                    except Exception as e:
-                        print(f"✕ Échec filet de sécurité : {e}")
-                else:
-                    print(f"🔒 Coupe-circuit activé : {MAX_FREE_FAILOVERS} atteint.")
+                try:
+                    print(f"🚨 [FREE -> FILET] Gemini 2.5 Flash-Lite Payant ({current_failovers + 1}/{MAX_FREE_FAILOVERS})")
+                    r = call_gemini(client_gemini_paid, "gemini-2.5-flash-lite")
+                    increment_failover_count()
+                    return jsonify(clean_and_parse_json(r.text))
+                except Exception as e:
+                    print(f"✕ Échec filet de sécurité : {e}")
 
             return jsonify({"action": None, "response": "Ouf, mon sillage sature sous l'affluence gratuite. Laisse-moi une petite seconde ! 😎"})
 
@@ -316,7 +318,6 @@ def chat():
                     r = call_gemini(client_gemini_paid, "gemini-2.5-flash-lite")
                     return jsonify(clean_and_parse_json(r.text))
                 except Exception as e:
-                    # Stratégie anti-ruine : Bascule transparente vers 3.1 Flash-Lite (coût identique)
                     print(f"⚠️ [FAILOVER BASIC/PREMIUM] Gemini 2.5 Flash-Lite saturé ({e}). Bascule sur 3.1 Flash-Lite...")
                     try:
                         r = call_gemini(client_gemini_paid, "gemini-3.1-flash-lite")
@@ -334,7 +335,6 @@ def chat():
                     r = call_gemini(client_gemini_paid, "gemini-3.1-flash-lite")
                     return jsonify(clean_and_parse_json(r.text))
                 except Exception as e:
-                    # Escalade de puissance vers le 2.5 Flash complet pour honorer le tier Ultra
                     print(f"⚠️ [FAILOVER ULTRA] Gemini 3.1 Lite saturé ({e}). Bascule de puissance sur 2.5 Flash complet...")
                     try:
                         r = call_gemini(client_gemini_paid, "gemini-2.5-flash")
@@ -372,12 +372,10 @@ def chat():
 
 
 if __name__ == "__main__":
-    # Récupération dynamique du PORT attribué par Railway/Render (par défaut 5000 en local)
     port = int(os.environ.get("PORT", 5000))
-
     print(f"🔥 Serveur Echo connecté et aligné sur le port {port}...")
     app.run(
-        host="0.0.0.0",  # Écoute sur toutes les interfaces réseau (Requis en cloud)
+        host="0.0.0.0",
         port=port,
         debug=False,
         use_reloader=False
