@@ -256,7 +256,7 @@ def chat():
             force_neutral_style=has_active_buttons or (source == "vitality")
         )
 
-        # ── INJECTION DE GOOGLE SEARCH RETRIEVAL (CORRIGÉ NATIVE) ───────
+        # ── INJECTION DE GOOGLE SEARCH RETRIEVAL (GROUNDING NATIONNEL) ───────
         def call_gemini(client, model_name):
             return client.models.generate_content(
                 model=model_name,
@@ -265,8 +265,8 @@ def chat():
                     response_mime_type="application/json",
                     system_instruction=system_prompt,
                     max_output_tokens=output_tokens,
-                    # Activation corrigée de l'outil de recherche web Google natif pour SDK 2.x
-                    tools=[{"google_search": {}}]
+                    # Activation de l'outil de recherche web Google natif
+                    tools=[{"google_search_retrieval": {}}]
                 )
             )
 
