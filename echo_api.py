@@ -33,9 +33,9 @@ def chat():
         
         print(f"📥 [REQUÊTE] Message : '{user_message}'")
 
-        # Appel brut sans aucune contrainte JSON ou Search
+        # Utilisation de l'ID stable de production (gemini-2.5-flash)
         response = client_gemini_free.models.generate_content(
-            model="gemini-2.5-flash-lite",
+            model="gemini-2.5-flash",
             contents=user_message,
             config=types.GenerateContentConfig(
                 max_output_tokens=1024
