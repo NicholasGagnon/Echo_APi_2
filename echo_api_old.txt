@@ -39,7 +39,7 @@ client_gemini_paid  = genai.Client(api_key=API_KEY_PAID)  if API_KEY_PAID  else 
 client_openrouter   = OpenAI(base_url=OPENROUTER_BASE_URL, api_key=OPENROUTER_API_KEY) if OPENROUTER_API_KEY else None
 client_github       = OpenAI(base_url=GITHUB_BASE_URL,     api_key=GITHUB_API_KEY)     if GITHUB_API_KEY     else None
 client_nvidia       = OpenAI(base_url=NVIDIA_BASE_URL,     api_key=NVIDIA_API_KEY)     if NVIDIA_API_KEY     else None
-client_groq         = OpenAI(base_url=GROQ_BASE_URL,       api_key=GROQ_API_KEY)       if GROQ_API_KEY       else None
+client_groq         = OpenAI(base_url=GROQ_BASE_URL,        api_key=GROQ_API_KEY)        if GROQ_API_KEY        else None
 client_cloudflare   = OpenAI(base_url=CLOUDFLARE_BASE_URL, api_key=CLOUDFLARE_API_TOKEN) if CLOUDFLARE_API_TOKEN else None
 
 # ── FILET DE SÉCURITÉ CONNECTED_FREE ─────────────────────────────────────────
@@ -55,6 +55,25 @@ def increment_failover_count():
     GLOBAL_FAILOVER_MEMORY_COUNT += 1
     print(f"⚠️ [FAILOVER FILET] {GLOBAL_FAILOVER_MEMORY_COUNT} / {MAX_FREE_FAILOVERS}")
 
+# ── GESTION DES LOCKS DE MODÈLES (60 SECONDES) ────────────────────────────────
+MODELS_LOCK_REGISTRY = {}
+
+def is_model_locked(model_name: str) -> bool:
+    """Vérifie si un modèle est bloqué suite à un échec récent."""
+    lock_time = MODELS_LOCK_REGISTRY.get(model_name)
+    if lock_time:
+        if datetime.now() < lock_time:
+            print(f"🔒 [CIRCUIT BREAKER] {model_name} est bloqué pour encore {(lock_time - datetime.now()).total_seconds():.1f}s")
+            return True
+        else:
+            del MODELS_LOCK_REGISTRY[model_name]
+    return False
+
+def lock_model(model_name: str):
+    """Bloque un modèle pendant 60 secondes suite à une erreur."""
+    MODELS_LOCK_REGISTRY[model_name] = datetime.now() + timedelta(seconds=60)
+    print(f"🚨 [LOCK ACTIVE] {model_name} est mis hors circuit pendant 60 secondes.")
+
 # ── NORMALISATION DU TIER ─────────────────────────────────────────────────────
 VALID_TIERS = {"connected_free", "basic", "premium", "ultra", "founder"}
 
@@ -62,7 +81,7 @@ def normalize_tier(raw: str) -> str:
     cleaned = (raw or "").lower().strip()
     if cleaned in VALID_TIERS:
         return cleaned
-    if cleaned == "free":
+    if cleaned == "free" or cleaned == "connected_free":
         return "connected_free"
     if "founder" in cleaned:
         return "founder"
@@ -161,232 +180,355 @@ def build_gemini_contents(historique_reduit: list, image_b64: str | None, user_m
     contents.append({"role": "user", "parts": last_parts})
     return contents
 
-# ── HEALTH CHECK ──────────────────────────────────────────────────────────────
-@app.route("/", methods=["GET"])
-def health_check():
-    return jsonify({
-        "status": "online",
-        "message": "Le sillage d'Echo est parfaitement aligné sur son Axe en production.",
-        "presence": "Echo",
-        "timestamp": datetime.now().isoformat()
-    }), 200
+# ── BUILD SYSTEM PROMPT ET PAYLOAD OPENROUTER CONTEXT ─────────────────────────
+def prepare_shared_context(data, source_override=None):
+    user_message     = data.get("message", "")
+    calendar_events  = data.get("calendarEvents", {})
+    raw_history      = data.get("history", [])
+    
+    # Utilise l'override si spécifié explicitement par la route active
+    source           = source_override if source_override else data.get("source", "chat").lower().strip()
+    
+    image_b64        = data.get("image", None)
+    selected_buttons = data.get("selectedButtons", [])
+    current_expenses = data.get("currentExpenses", [])
+    current_calories = data.get("currentCalories", [])
+    current_cycle    = data.get("currentCycle", "mois")
+    user_tier        = normalize_tier(data.get("userTier", "connected_free"))
 
-# ── ROUTE PRINCIPALE ──────────────────────────────────────────────────────────
+    maintenant = datetime.now()
+    date_aujourdhui = maintenant.strftime("%A %d %B %Y")
+    annee_en_cours  = maintenant.strftime("%Y")
+
+    filtered_calendar = {}
+    date_debut = (maintenant - timedelta(days=31)).date()
+    date_fin   = maintenant.date()
+    try:
+        for date_str, events in calendar_events.items():
+            if re.match(r"^\d{4}-\d{2}-\d{2}$", date_str):
+                date_evt = datetime.strptime(date_str, "%Y-%m-%d").date()
+                if date_debut <= date_evt <= date_fin:
+                    filtered_calendar[date_str] = events
+            else:
+                filtered_calendar[date_str] = events
+    except Exception as e:
+        print(f"[WARN] Erreur filtrage calendrier : {e}")
+        filtered_calendar = calendar_events
+
+    base_system_prompt = generate_system_prompt(
+        source=source, selected_buttons=selected_buttons, date_aujourdhui=date_aujourdhui,
+        annee_en_cours=annee_en_cours, user_tier=user_tier, filtered_calendar=filtered_calendar,
+        current_expenses=current_expenses, current_calories=current_calories, current_cycle=current_cycle
+    )
+
+    anti_duplication_directive = (
+        "\n\nCRITICAL SAFETY DIRECTIVE FOR ACTION EXTRACTION:\n"
+        "You must ONLY trigger updates for structural tools if explicitly and newly demanded in the LATEST message.\n"
+        "Never repeat or re-execute a past action from historical text."
+    )
+    system_prompt = base_system_prompt + anti_duplication_directive
+
+    taille_memoire = 30 if user_tier in ["ultra", "founder"] else (15 if user_tier in ["basic", "premium"] else 5)
+    output_tokens  = 4096 if user_tier in ["ultra", "founder"] else (2048 if user_tier in ["basic", "premium"] else 1024)
+    
+    historique_ajuste = raw_history[-taille_memoire:] if len(raw_history) > taille_memoire else raw_history
+    force_neutral = len(selected_buttons) > 0 or source == "vitality"
+    
+    gemini_contents = build_gemini_contents(historique_ajuste, image_b64, user_message, force_neutral)
+
+    messages_openrouter = [{"role": "system", "content": system_prompt}]
+    for msg in historique_ajuste:
+        if not isinstance(msg, str) or msg.startswith("__IMAGE__:"):
+            continue
+        clean_content = msg.split(":", 1)[1].strip() if ":" in msg else msg.strip()
+        if "action limit reached" in clean_content.lower() or "do it for you" in clean_content.lower() or clean_content == "...":
+            continue
+        if msg.startswith("You:") or msg.startswith("Toi:"):
+            messages_openrouter.append({"role": "user", "content": clean_content})
+        elif msg.startswith("Echo:"):
+            try:
+                parsed = json.loads(clean_content)
+                clean_content = parsed.get("response", clean_content)
+            except Exception:
+                pass
+            messages_openrouter.append({"role": "assistant", "content": clean_content})
+
+    # 🎯 CORRECTION CRITIQUE DU COPIER-COLLER SUR LE DERNIER MESSAGE USER
+    if user_message:
+        messages_openrouter.append({"role": "user", "content": user_message})
+
+    return {
+        "system_prompt": system_prompt,
+        "output_tokens": output_tokens,
+        "gemini_contents": gemini_contents,
+        "messages_openrouter": messages_openrouter,
+        "user_tier": user_tier
+    }
+
+# ── LOGIQUE COMMUNE D'APPEL DE CAPTURE ────────────────────────────────────────
+def execute_gemini_call(client, model, ctx):
+    return client.models.generate_content(
+        model=model, contents=ctx["gemini_contents"],
+        config=types.GenerateContentConfig(system_instruction=ctx["system_prompt"], max_output_tokens=ctx["output_tokens"])
+    )
+
+def execute_openai_call(client, model, ctx, temp=0.7, timeout=7.0):
+    res = client.chat.completions.create(
+        model=model, messages=ctx["messages_openrouter"], temperature=temp, timeout=timeout
+    )
+    return res.choices[0].message.content
+
+# ── ROUTE CLAVARDAGE (CHAT TRADITIONNEL) ──────────────────────────────────────
 @app.route("/chat", methods=["POST"])
 def chat():
     try:
-        data             = request.json or {}
-        user_message     = data.get("message", "")
-        calendar_events  = data.get("calendarEvents", {})
-        raw_history      = data.get("history", [])
-        source           = data.get("source", "chat").lower().strip()
-        image_b64        = data.get("image", None)
-        selected_buttons = data.get("selectedButtons", [])
-        current_expenses = data.get("currentExpenses", [])
-        current_calories = data.get("currentCalories", [])
-        current_cycle    = data.get("currentCycle", "mois")
+        data = request.json or {}
+        ctx = prepare_shared_context(data, source_override="chat")
 
-        # ── Normalisation robuste — "free" → "connected_free", tout inconnu → "connected_free"
-        user_tier = normalize_tier(data.get("userTier", "connected_free"))
-
-        print(f"[DEBUG] message: '{user_message[:60]}' | tier: '{user_tier}' | source: '{source}' | image: {'oui' if image_b64 else 'non'} | boutons: {selected_buttons}")
-
-        maintenant      = datetime.now()
-        date_aujourdhui = maintenant.strftime("%A %d %B %Y")
-        annee_en_cours  = maintenant.strftime("%Y")
-
-        # Filtrage calendrier 31 jours
-        filtered_calendar = {}
-        date_debut = (maintenant - timedelta(days=31)).date()
-        date_fin   = maintenant.date()
-        try:
-            for date_str, events in calendar_events.items():
-                if re.match(r"^\d{4}-\d{2}-\d{2}$", date_str):
-                    date_evt = datetime.strptime(date_str, "%Y-%m-%d").date()
-                    if date_debut <= date_evt <= date_fin:
-                        filtered_calendar[date_str] = events
-                else:
-                    filtered_calendar[date_str] = events
-        except Exception as e:
-            print(f"[WARN] Erreur filtrage calendrier : {e}")
-            filtered_calendar = calendar_events
-
-        base_system_prompt = generate_system_prompt(
-            source=source,
-            selected_buttons=selected_buttons,
-            date_aujourdhui=date_aujourdhui,
-            annee_en_cours=annee_en_cours,
-            user_tier=user_tier,
-            filtered_calendar=filtered_calendar,
-            current_expenses=current_expenses,
-            current_calories=current_calories,
-            current_cycle=current_cycle
-        )
-
-        anti_duplication_directive = (
-            "\n\nCRITICAL SAFETY DIRECTIVE FOR ACTION EXTRACTION:\n"
-            "You are provided with a partial chat history for baseline conversational context. However, you MUST ONLY "
-            "trigger or extract updates for structural tools (like adding calendar events, logging calories, or recording expenses) "
-            "if the intent is explicitly and newly demanded in the LATEST message from the user. "
-            "If the latest user message is conversational, neutral, or just a reply to your previous text, you MUST return "
-            "'action': null, even if earlier blocks of the chat history contain command sentences. "
-            "Never repeat or re-execute a past action from historical text."
-        )
-        system_prompt = base_system_prompt + anti_duplication_directive
-
-        # Taille mémoire & tokens selon tier
-        if user_tier == "connected_free":
-            taille_memoire = 5
-            output_tokens  = 1024
-        elif user_tier in ["basic", "premium"]:
-            taille_memoire = 15
-            output_tokens  = 2048
-        elif user_tier in ["ultra", "founder"]:
-            taille_memoire = 30
-            output_tokens  = 4096
-        else:
-            taille_memoire = 5
-            output_tokens  = 1024
-
-        historique_ajuste = raw_history[-taille_memoire:] if len(raw_history) > taille_memoire else raw_history
-
-        force_neutral = len(selected_buttons) > 0 or source == "vitality"
-        gemini_contents = build_gemini_contents(historique_ajuste, image_b64, user_message, force_neutral)
-
-        # ── call_gemini générique — prend le client en paramètre ──────────────
-        def call_gemini(client, model_name):
-            return client.models.generate_content(
-                model=model_name,
-                contents=gemini_contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_prompt,
-                    max_output_tokens=output_tokens,
-                )
-            )
-
-        # =====================================================================
-        # CASCADE CONNECTED_FREE
-        # Clé gratuite d'abord (même modèles que l'ancien plan free),
-        # filet payant limité à 200 si la clé gratuite est épuisée.
-        # =====================================================================
-        if user_tier == "connected_free":
+        if ctx["user_tier"] == "connected_free":
             current_failovers = get_failover_count()
             if current_failovers >= MAX_FREE_FAILOVERS:
-                print(f"🔒 [COUPE-CIRCUIT] Filet payant épuisé ({current_failovers}/{MAX_FREE_FAILOVERS})")
                 return jsonify({"action": None, "response": "Ouf, mon sillage sature sous l'affluence. Laisse-moi une petite seconde ! 😎"})
 
-            # 1/3 — Gemini 3.1 Flash-Lite (clé gratuite)
-            if client_gemini_free:
+            # 1/3 — Gemini 3.1 Flash-Lite
+            model_1 = "gemini-3.1-flash-lite"
+            if client_gemini_free and not is_model_locked(model_1):
                 try:
-                    print("[CONNECTED_FREE 1/3] → Gemini 3.1 Flash-Lite (FREE KEY)")
-                    r = call_gemini(client_gemini_free, "gemini-3.1-flash-lite")
+                    print("[CHAT - FREE 1/3] → Gemini 3.1 Flash-Lite (FREE KEY)")
+                    r = execute_gemini_call(client_gemini_free, model_1, ctx)
                     return jsonify(clean_and_parse_json(r.text))
                 except Exception as e:
-                    print(f"[CONNECTED_FREE 1/3] Echec ({e})")
+                    print(f"Échec {model_1} ({e})")
+                    lock_model(model_1)
 
-            # 2/3 — Gemini 2.5 Flash-Lite (clé gratuite)
-            if client_gemini_free:
+            # 2/3 — Gemini 2.5 Flash-Lite
+            model_2 = "gemini-2.5-flash-lite"
+            if client_gemini_free and not is_model_locked(model_2):
                 try:
-                    print("[CONNECTED_FREE 2/3] → Gemini 2.5 Flash-Lite (FREE KEY)")
-                    r = call_gemini(client_gemini_free, "gemini-2.5-flash-lite")
+                    print("[CHAT - FREE 2/3] → Gemini 2.5 Flash-Lite (FREE KEY)")
+                    r = execute_gemini_call(client_gemini_free, model_2, ctx)
                     return jsonify(clean_and_parse_json(r.text))
                 except Exception as e:
-                    print(f"[CONNECTED_FREE 2/3] Echec ({e})")
+                    print(f"Échec {model_2} ({e})")
+                    lock_model(model_2)
 
-            # 3/3 — Filet payant (limité à MAX_FREE_FAILOVERS)
-            if client_gemini_paid:
+            # 3/3 — Filet Payant
+            if client_gemini_paid and not is_model_locked("gemini-2.5-flash-lite-paid"):
                 try:
-                    print(f"[CONNECTED_FREE 3/3 FILET] → Gemini 2.5 Flash-Lite (PAID KEY) ({current_failovers + 1}/{MAX_FREE_FAILOVERS})")
-                    r = call_gemini(client_gemini_paid, "gemini-2.5-flash-lite")
+                    print(f"[CHAT - FREE 3/3 FILET] → Gemini 2.5 Flash-Lite (PAID KEY) ({current_failovers + 1}/{MAX_FREE_FAILOVERS})")
+                    r = execute_gemini_call(client_gemini_paid, "gemini-2.5-flash-lite", ctx)
                     increment_failover_count()
                     return jsonify(clean_and_parse_json(r.text))
                 except Exception as e:
-                    print(f"[CONNECTED_FREE 3/3 FILET] Echec ({e})")
+                    print(f"Échec Filet Payant ({e})")
+                    lock_model("gemini-2.5-flash-lite-paid")
 
             return jsonify({"action": None, "response": "Ouf, mon sillage sature. Laisse-moi une petite seconde ! 😎"})
 
-        # =====================================================================
-        # CASCADE BASIC / PREMIUM — gemini-2.5-flash-lite
-        # =====================================================================
-        elif user_tier in ["basic", "premium"]:
-            if client_gemini_paid:
-                try:
-                    print(f"[{user_tier.upper()} 1/2] → gemini-2.5-flash-lite (PAID KEY)")
-                    r = call_gemini(client_gemini_paid, "gemini-2.5-flash-lite")
-                    return jsonify(clean_and_parse_json(r.text))
-                except Exception as e:
-                    print(f"[{user_tier.upper()} 1/2] Echec ({e})")
-                    try:
-                        print(f"[{user_tier.upper()} 2/2] → gemini-3.1-flash-lite fallback (PAID KEY)")
-                        r = call_gemini(client_gemini_paid, "gemini-3.1-flash-lite")
-                        return jsonify(clean_and_parse_json(r.text))
-                    except Exception as e2:
-                        print(f"[{user_tier.upper()} 2/2] Echec ({e2})")
-            return jsonify({"action": None, "response": "Je ressens une petite déconnexion, redonne-moi une seconde ! 😎"})
-
-        # =====================================================================
-        # CASCADE ULTRA — gemini-3.1-flash-lite → fallback gemini-2.5-flash-lite
-        # =====================================================================
-        elif user_tier == "ultra":
-            if client_gemini_paid:
-                try:
-                    print("[ULTRA 1/2] → gemini-3.1-flash-lite (PAID KEY)")
-                    r = call_gemini(client_gemini_paid, "gemini-3.1-flash-lite")
-                    return jsonify(clean_and_parse_json(r.text))
-                except Exception as e:
-                    print(f"[ULTRA 1/2] Echec ({e})")
-                    try:
-                        print("[ULTRA 2/2] → gemini-2.5-flash-lite fallback (PAID KEY)")
-                        r = call_gemini(client_gemini_paid, "gemini-2.5-flash-lite")
-                        return jsonify(clean_and_parse_json(r.text))
-                    except Exception as e2:
-                        print(f"[ULTRA 2/2] Echec ({e2})")
-            return jsonify({"action": None, "response": "Mon sillage Ultra tangue un peu. Réessaie ! 😎"})
-
-        # =====================================================================
-        # CASCADE FOUNDER — gemini-3.5-flash → gemini-3.1-flash-lite → gemini-2.5-flash-lite
-        # =====================================================================
-        elif user_tier == "founder":
-            if client_gemini_paid:
-                try:
-                    print("[FOUNDER 1/3] → gemini-3.5-flash (PAID KEY)")
-                    r = call_gemini(client_gemini_paid, "gemini-3.5-flash")
-                    return jsonify(clean_and_parse_json(r.text))
-                except Exception as e:
-                    print(f"[FOUNDER 1/3] Echec ({e})")
-                    try:
-                        print("[FOUNDER 2/3] → gemini-3.1-flash-lite fallback (PAID KEY)")
-                        r = call_gemini(client_gemini_paid, "gemini-3.1-flash-lite")
-                        return jsonify(clean_and_parse_json(r.text))
-                    except Exception as e2:
-                        print(f"[FOUNDER 2/3] Echec ({e2})")
-                        try:
-                            print("[FOUNDER 3/3] → gemini-2.5-flash-lite fallback (PAID KEY)")
-                            r = call_gemini(client_gemini_paid, "gemini-2.5-flash-lite")
-                            return jsonify(clean_and_parse_json(r.text))
-                        except Exception as e3:
-                            print(f"[FOUNDER 3/3] Echec ({e3})")
-            return jsonify({"action": None, "response": "Même les fondateurs ont parfois des vagues. Réessaie ! 😎"})
-
-        # ── Fallback universel (ne devrait jamais arriver grâce à normalize_tier)
+        # PLANS PREMIUM / ULTRA / FOUNDER
         else:
-            print(f"[WARN] Tier '{user_tier}' non géré — fallback connected_free")
-            if client_gemini_paid:
-                try:
-                    r = call_gemini(client_gemini_paid, "gemini-2.5-flash-lite")
-                    return jsonify(clean_and_parse_json(r.text))
-                except Exception:
-                    pass
-            return jsonify({"action": None, "response": "Réessaie dans un instant ! 😎"})
+            target_model = "gemini-3.5-flash" if ctx["user_tier"] == "founder" else "gemini-3.1-flash-lite"
+            try:
+                print(f"[CHAT - PAID] → {target_model}")
+                r = execute_gemini_call(client_gemini_paid, target_model, ctx)
+                return jsonify(clean_and_parse_json(r.text))
+            except Exception as e:
+                print(f"Échec {target_model} Premium ({e})")
+                r = execute_gemini_call(client_gemini_paid, "gemini-2.5-flash-lite", ctx)
+                return jsonify(clean_and_parse_json(r.text))
 
     except Exception as e:
-        print(f"Erreur critique Flask : {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"Erreur critique /chat : {e}")
         return jsonify({"action": None, "response": "Système instable, réessaie ton message !"}), 500
+
+# ── ROUTE BOOKS (ÉCRITURE STUDIO) ────────────────────────────────────────────
+@app.route("/books", methods=["POST"])
+def books():
+    try:
+        data = request.json or {}
+        ctx = prepare_shared_context(data, source_override="books")
+
+        if ctx["user_tier"] == "connected_free":
+            current_failovers = get_failover_count()
+            if current_failovers >= MAX_FREE_FAILOVERS:
+                return jsonify({"action": None, "response": "Mon sillage d'écriture est saturé pour l'instant ! 😎"})
+
+            # 1/3 — Ernie 4.5 VL (OpenRouter)
+            model_1 = "baidu/ernie-4.5-vl-424b-a47b"
+            if client_openrouter and not is_model_locked(model_1):
+                try:
+                    print("[BOOKS - FREE 1/3] → Ernie 4.5 (OpenRouter)")
+                    res = execute_openai_call(client_openrouter, model_1, ctx)
+                    return jsonify(clean_and_parse_json(res))
+                except Exception as e:
+                    print(f"Échec {model_1} ({e})")
+                    lock_model(model_1)
+
+            # 2/3 — GLM 4.7 Flash (Cloudflare)
+            model_2 = "@cf/zai-org/glm-4.7-flash"
+            if client_cloudflare and not is_model_locked(model_2):
+                try:
+                    print("[BOOKS - FREE 2/3] → GLM 4.7 Flash (Cloudflare)")
+                    res = execute_openai_call(client_cloudflare, model_2, ctx)
+                    return jsonify(clean_and_parse_json(res))
+                except Exception as e:
+                    print(f"Échec {model_2} ({e})")
+                    lock_model(model_2)
+
+            # 3/3 — Gemini 2.5 Flash-Lite Paid
+            if client_gemini_paid and not is_model_locked("gemini-2.5-flash-lite-books"):
+                try:
+                    print(f"[BOOKS - FREE 3/3 FILET] → Gemini 2.5 Flash-Lite (PAID KEY)")
+                    r = execute_gemini_call(client_gemini_paid, "gemini-2.5-flash-lite", ctx)
+                    increment_failover_count()
+                    return jsonify(clean_and_parse_json(r.text))
+                except Exception as e:
+                    print(f"Échec Filet Payant Books ({e})")
+                    lock_model("gemini-2.5-flash-lite-books")
+
+            return jsonify({"action": None, "response": "Ouf, mon sillage d'écriture sature. Laisse-moi une seconde ! 😎"})
+        
+        # VERSION PAYANTE / SECURE DES LIVRES
+        else:
+            try:
+                print("[BOOKS - PAID] → Gemini 2.5 Flash-Lite (PAID KEY)")
+                r = execute_gemini_call(client_gemini_paid, "gemini-2.5-flash-lite", ctx)
+                return jsonify(clean_and_parse_json(r.text))
+            except Exception as e:
+                print(f"Échec Paid Books, fallback immédiat: {e}")
+                r = execute_gemini_call(client_gemini_paid, "gemini-2.5-flash-lite", ctx)
+                return jsonify(clean_and_parse_json(r.text))
+
+    except Exception as e:
+        print(f"Erreur critique /books : {e}")
+        return jsonify({"action": None, "response": "Studio d'écriture instable, réessaie !"}), 500
+
+# ── ROUTE HOME (TABLEAU DE BORD ACCUEIL) ──────────────────────────────────────
+@app.route("/home", methods=["POST"])
+def home():
+    try:
+        data = request.json or {}
+        ctx = prepare_shared_context(data, source_override="home")
+
+        if ctx["user_tier"] == "connected_free":
+            current_failovers = get_failover_count()
+            if current_failovers >= MAX_FREE_FAILOVERS:
+                return jsonify({"action": None, "response": "Mon sillage d'accueil est au repos forcé ! 😎"})
+
+            # 1/3 — DeepSeek V3 (GitHub)
+            model_1 = "deepseek/DeepSeek-V3-0324"
+            if client_github and not is_model_locked(model_1):
+                try:
+                    print("[HOME - FREE 1/3] → DeepSeek V3 (GitHub)")
+                    res = execute_openai_call(client_github, model_1, ctx)
+                    return jsonify(clean_and_parse_json(res))
+                except Exception as e:
+                    print(f"Échec {model_1} ({e})")
+                    lock_model(model_1)
+
+            # 2/3 — Kimi K2.6 (NVIDIA)
+            model_2 = "moonshotai/kimi-k2.6"
+            if client_nvidia and not is_model_locked(model_2):
+                try:
+                    print("[HOME - FREE 2/3] → Kimi K2.6 (NVIDIA)")
+                    res = execute_openai_call(client_nvidia, model_2, ctx)
+                    return jsonify(clean_and_parse_json(res))
+                except Exception as e:
+                    print(f"Échec {model_2} ({e})")
+                    lock_model(model_2)
+
+            # 3/3 — Gemini 2.5 Flash-Lite Paid
+            if client_gemini_paid and not is_model_locked("gemini-2.5-flash-lite-home"):
+                try:
+                    print(f"[HOME - FREE 3/3 FILET] → Gemini 2.5 Flash-Lite (PAID KEY)")
+                    r = execute_gemini_call(client_gemini_paid, "gemini-2.5-flash-lite", ctx)
+                    increment_failover_count()
+                    return jsonify(clean_and_parse_json(r.text))
+                except Exception as e:
+                    print(f"Échec Filet Payant Home ({e})")
+                    lock_model("gemini-2.5-flash-lite-home")
+
+            return jsonify({"action": None, "response": "Espace d'accueil surchargé, redonne-moi une seconde ! 😎"})
+        
+        # VERSION PAYANTE / SECURE DE LA HOME
+        else:
+            try:
+                print("[HOME - PAID] → Gemini 2.5 Flash-Lite (PAID KEY)")
+                r = execute_gemini_call(client_gemini_paid, "gemini-2.5-flash-lite", ctx)
+                return jsonify(clean_and_parse_json(r.text))
+            except Exception as e:
+                print(f"Échec Paid Home: {e}")
+                r = execute_gemini_call(client_gemini_paid, "gemini-2.5-flash-lite", ctx)
+                return jsonify(clean_and_parse_json(r.text))
+
+    except Exception as e:
+        print(f"Erreur critique /home : {e}")
+        return jsonify({"action": None, "response": "Espace d'accueil instable, réessaie !"}), 500
+
+# ── ROUTE HISTORY (ARCHIVES & SILLAGES PASSÉS) ────────────────────────────────
+@app.route("/history", methods=["POST"])
+def history():
+    try:
+        data = request.json or {}
+        ctx = prepare_shared_context(data, source_override="history")
+
+        if ctx["user_tier"] == "connected_free":
+            current_failovers = get_failover_count()
+            if current_failovers >= MAX_FREE_FAILOVERS:
+                return jsonify({"action": None, "response": "Les archives historiques sont momentanément inaccessibles ! 😎"})
+
+            # 1/3 — Groq Compound (Groq)
+            model_1 = "groq/compound"
+            if client_groq and not is_model_locked(model_1):
+                try:
+                    print("[HISTORY - FREE 1/3] → Groq Compound")
+                    res = execute_openai_call(client_groq, model_1, ctx)
+                    return jsonify(clean_and_parse_json(res))
+                except Exception as e:
+                    print(f"Échec {model_1} ({e})")
+                    lock_model(model_1)
+
+            # 2/3 — Kimi K2.6 (NVIDIA)
+            model_2 = "moonshotai/kimi-k2.6"
+            if client_nvidia and not is_model_locked(model_2):
+                try:
+                    print("[HISTORY - FREE 2/3] → Kimi K2.6 (NVIDIA)")
+                    res = execute_openai_call(client_nvidia, model_2, ctx)
+                    return jsonify(clean_and_parse_json(res))
+                except Exception as e:
+                    print(f"Échec {model_2} ({e})")
+                    lock_model(model_2)
+
+            # 3/3 — Gemini 2.5 Flash-Lite Paid
+            if client_gemini_paid and not is_model_locked("gemini-2.5-flash-lite-history"):
+                try:
+                    print(f"[HISTORY - FREE 3/3 FILET] → Gemini 2.5 Flash-Lite (PAID KEY)")
+                    r = execute_gemini_call(client_gemini_paid, "gemini-2.5-flash-lite", ctx)
+                    increment_failover_count()
+                    return jsonify(clean_and_parse_json(r.text))
+                except Exception as e:
+                    print(f"Échec Filet Payant History ({e})")
+                    lock_model("gemini-2.5-flash-lite-history")
+
+            return jsonify({"action": None, "response": "Module d'historique saturé, redonne-moi une seconde ! 😎"})
+        
+        # VERSION PAYANTE / SECURE DE L'HISTORIQUE
+        else:
+            try:
+                print("[HISTORY - PAID] → Gemini 2.5 Flash-Lite (PAID KEY)")
+                r = execute_gemini_call(client_gemini_paid, "gemini-2.5-flash-lite", ctx)
+                return jsonify(clean_and_parse_json(r.text))
+            except Exception as e:
+                print(f"Échec Paid History: {e}")
+                r = execute_gemini_call(client_gemini_paid, "gemini-2.5-flash-lite", ctx)
+                return jsonify(clean_and_parse_json(r.text))
+
+    except Exception as e:
+        print(f"Erreur critique /history : {e}")
+        return jsonify({"action": None, "response": "Historique instable, réessaie !"}), 500
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    print(f"🔥 Serveur Echo connecté et aligné sur le port {port}...")
+    print(f"🔥 Serveur Multi-Cascades branché et synchronisé sur le port {port}...")
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
