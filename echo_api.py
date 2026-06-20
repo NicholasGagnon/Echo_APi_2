@@ -522,3 +522,6 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print(f"🔥 Serveur Multi-Cascades branché et synchronisé sur le port {port}...")
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+
+# Pour Render : pas besoin de gunicorn
+# Start command dans Render : python echo_api.py
