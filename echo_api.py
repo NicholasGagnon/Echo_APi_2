@@ -4,7 +4,7 @@ import re
 import json
 import base64
 from datetime import datetime, timedelta
-from flask import Flask, request, jsonify, send_file, send_file
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from google import genai
 from google.genai import types
