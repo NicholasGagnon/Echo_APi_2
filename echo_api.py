@@ -10,8 +10,15 @@ from google import genai
 from google.genai import types
 from openai import OpenAI
 from dotenv import load_dotenv
-
 from prompts import generate_system_prompt
+
+try:
+    from export_handler import handle_file_download as handle_export
+    EXPORT_OK = True
+except Exception as e:
+    print(f"[EXPORT] Import failed: {e}")
+    EXPORT_OK = False
+
 
 load_dotenv()
 
