@@ -1,4 +1,4 @@
-import os
+﻿import os
 import io
 import re
 import json
@@ -189,7 +189,7 @@ def prepare_shared_context(data, source_override=None):
     taille_memoire = 30 if user_tier in ["ultra", "founder"] else (15 if user_tier in ["basic", "premium"] else 5)
     output_tokens  = 4096 if user_tier in ["ultra", "founder"] else (2048 if user_tier in ["basic", "premium"] else 1024)
     historique_ajuste = raw_history[-taille_memoire:]
-    force_neutral = len(selected_buttons) > 0 or source == "vitality"
+    force_neutral = source == "vitality"
     gemini_contents = build_gemini_contents(historique_ajuste, image_b64, user_message, force_neutral)
 
     messages_openrouter = [{"role": "system", "content": system_prompt}]
