@@ -3,6 +3,7 @@ import io
 import re
 import json
 import base64
+import requests as _requests_lib
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
@@ -24,11 +25,11 @@ MODELS = {
     "gemini_free_1":    "gemini-3.1-flash-lite",
     "gemini_free_2":    "gemini-2.5-flash-lite",
     # Gratuits tiers
-    "deepseek":         "deepseek/DeepSeek-V3-0324",        # GitHub
-    "kimi":             "moonshotai/kimi-k2.6",              # NVIDIA
-    "nemotron":         "nvidia/nemotron-3-super-120b-a12b:free",  # OpenRouter
-    "glm":              "@cf/zai-org/glm-5.2",              # Cloudflare
-    "compound":         "compound-beta",                     # Groq
+    "deepseek":         "deepseek/DeepSeek-V3-0324",
+    "kimi":             "moonshotai/kimi-k2.6",
+    "nemotron":         "nvidia/nemotron-3-super-120b-a12b:free",
+    "glm":              "@cf/zai-org/glm-5.2",
+    "compound":         "compound-beta",
     # Payants
     "gemini_paid_founder":  "gemini-3.5-flash",
     "gemini_paid_ultra":    "gemini-3.1-flash-lite",
@@ -59,6 +60,11 @@ client_github       = OpenAI(base_url=GITHUB_BASE_URL,     api_key=GITHUB_API_KE
 client_nvidia       = OpenAI(base_url=NVIDIA_BASE_URL,     api_key=NVIDIA_API_KEY)     if NVIDIA_API_KEY     else None
 client_groq         = OpenAI(base_url=GROQ_BASE_URL,       api_key=GROQ_API_KEY)       if GROQ_API_KEY       else None
 client_cloudflare   = OpenAI(base_url=CLOUDFLARE_BASE_URL, api_key=CLOUDFLARE_API_TOKEN) if CLOUDFLARE_API_TOKEN else None
+
+# OPTIMISATION 4 — Session HTTP persistante pour Cloudflare (Keep-Alive TLS)
+# Réutilise la même connexion TCP au lieu d'en ouvrir une nouvelle à chaque requête.
+# Gain estimé : 200-500ms par appel /vitality côté Cloudflare.
+_cf_session = _requests_lib.Session()
 
 # ── FILET DE SÉCURITÉ CONNECTED_FREE ─────────────────────────────────────────
 GLOBAL_FAILOVER_MEMORY_COUNT = 0
@@ -103,11 +109,11 @@ def normalize_tier(raw: str) -> str:
     return "connected_free"
 
 # ── MESSAGES D'ERREUR UTILISATEUR ────────────────────────────────────────────
-ERR_QUOTA    = {"action": None, "response": "Le service est temporairement saturé. Réessaie dans quelques instants."}
-ERR_FINAL    = {"action": None, "response": "Tous les serveurs sont momentanément indisponibles. Réessaie dans 1 minute."}
-ERR_CRASH    = {"action": None, "response": "Une erreur inattendue s'est produite. Réessaie dans quelques secondes."}
+ERR_QUOTA    = {"action": None, "response": "Le service est temporairement sature. Reessaie dans quelques instants."}
+ERR_FINAL    = {"action": None, "response": "Tous les serveurs sont momentanement indisponibles. Reessaie dans 1 minute."}
+ERR_CRASH    = {"action": None, "response": "Une erreur inattendue s'est produite. Reessaie dans quelques secondes."}
 ERR_HORIZON  = {
-    "response": "Le moteur de recherche est temporairement indisponible. Réessaie dans quelques instants.",
+    "response": "Le moteur de recherche est temporairement indisponible. Reessaie dans quelques instants.",
     "attributes": [],
     "matrix": None
 }
@@ -180,9 +186,11 @@ def build_gemini_contents(historique_reduit, image_b64, user_message, force_neut
         clean_content = msg.split(":", 1)[1].strip() if ":" in msg else msg.strip()
         if "action limit reached" in clean_content.lower() or clean_content == "...":
             continue
-        if msg.startswith("You:") or msg.startswith("Toi:"):
-            contents.append({"role": "user", "parts": [types.Part.from_text(text=clean_content)]})
-        elif msg.startswith("Echo:"):
+
+        # OPTIMISATION 3 — Nettoyage léger de l'historique avant envoi :
+        # on retire les résidus de JSON brut des anciennes réponses Echo pour
+        # alléger le contexte sans toucher au contenu conversationnel utile.
+        if msg.startswith("Echo:"):
             try:
                 parsed = json.loads(clean_content)
                 clean_content = parsed.get("response", clean_content)
@@ -191,6 +199,10 @@ def build_gemini_contents(historique_reduit, image_b64, user_message, force_neut
             if force_neutral_style:
                 clean_content = "[Analyse technique archivee]"
             contents.append({"role": "model", "parts": [types.Part.from_text(text=clean_content)]})
+        elif msg.startswith("You:") or msg.startswith("Toi:"):
+            # Supprime les espaces multiples et retours à la ligne superflus
+            clean_content = re.sub(r'\s{3,}', ' ', clean_content).strip()
+            contents.append({"role": "user", "parts": [types.Part.from_text(text=clean_content)]})
 
     last_parts = []
     if image_b64:
@@ -259,6 +271,7 @@ def prepare_shared_context(data, source_override=None):
     force_neutral = len(selected_buttons) > 0 or source == "vitality"
     gemini_contents = build_gemini_contents(historique_ajuste, image_b64, user_message, force_neutral)
 
+    # OPTIMISATION 3 — Même nettoyage pour l'historique OpenAI
     messages_openai = [{"role": "system", "content": system_prompt}]
     for msg in historique_ajuste:
         if not isinstance(msg, str) or msg.startswith("__IMAGE__:"):
@@ -267,6 +280,7 @@ def prepare_shared_context(data, source_override=None):
         if "action limit reached" in clean_content.lower() or clean_content == "...":
             continue
         if msg.startswith("You:") or msg.startswith("Toi:"):
+            clean_content = re.sub(r'\s{3,}', ' ', clean_content).strip()
             messages_openai.append({"role": "user", "content": clean_content})
         elif msg.startswith("Echo:"):
             try:
@@ -288,31 +302,42 @@ def prepare_shared_context(data, source_override=None):
 
 # ── EXECUTEURS ────────────────────────────────────────────────────────────────
 def call_gemini(client, model_key, ctx):
+    """
+    OPTIMISATION 1 — température basse (0.2) pour les routes structurées JSON :
+    plus stable, plus rapide, élimine la majorité des crashs de parsing.
+    Le comportement narratif d'Echo est piloté par le system_prompt, pas la temp.
+    """
     return client.models.generate_content(
         model=MODELS[model_key],
         contents=ctx["gemini_contents"],
         config=types.GenerateContentConfig(
             system_instruction=ctx["system_prompt"],
-            max_output_tokens=ctx["output_tokens"]
+            max_output_tokens=ctx["output_tokens"],
+            temperature=0.2,
         )
     )
 
-def call_openai(client, model_key, ctx, temp=0.7, timeout=15.0):
+def call_openai(client, model_key, ctx, temp=0.3, timeout=15.0):
+    """
+    OPTIMISATION 1 — température réduite à 0.3 par défaut (était 0.7).
+    Seule la route /books surcharge cette valeur à 0.85 pour la créativité littéraire.
+    """
     model_name = MODELS[model_key]
-    # Cloudflare utilise /ai/run/<model> et non /v1/chat/completions
+
+    # OPTIMISATION 4 — Session persistante pour Cloudflare (Keep-Alive TLS)
     if model_name.startswith("@cf/"):
-        import requests
         cf_account = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
         cf_token   = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
         url = f"https://api.cloudflare.com/client/v4/accounts/{cf_account}/ai/run/{model_name}"
-        r = requests.post(
+        r = _cf_session.post(
             url,
-            json={"messages": ctx["messages_openai"][1:]},  # sans le system prompt
+            json={"messages": ctx["messages_openai"][1:]},
             headers={"Authorization": f"Bearer {cf_token}"},
             timeout=timeout
         )
         r.raise_for_status()
         return r.json()["result"]["response"]
+
     res = client.chat.completions.create(
         model=model_name,
         messages=ctx["messages_openai"],
@@ -348,10 +373,6 @@ def run_paid_cascade(ctx):
 
 # ── CASCADE FREE GÉNÉRIQUE ────────────────────────────────────────────────────
 def run_free_cascade(steps, ctx, parser=None):
-    """
-    steps = liste de (client, model_key)
-    Le dernier step est le filet payant — incrémente le compteur.
-    """
     if parser is None:
         parser = clean_and_parse_json
 
@@ -488,9 +509,9 @@ def chat():
             return jsonify(run_paid_cascade(ctx))
 
         steps = [
-            (client_gemini_free, "gemini_free_1"),   # 1. Gemini 3.1 Flash-Lite gratuit
-            (client_nvidia,      "kimi"),             # 2. Kimi K2.6 (NVIDIA)
-            (client_gemini_paid, "gemini_free_2"),    # 3. Filet payant
+            (client_gemini_free, "gemini_free_1"),
+            (client_nvidia,      "kimi"),
+            (client_gemini_paid, "gemini_free_2"),
         ]
         return jsonify(run_free_cascade(steps, ctx))
 
@@ -509,9 +530,9 @@ def home():
             return jsonify(run_paid_cascade(ctx))
 
         steps = [
-            (client_gemini_free, "gemini_free_2"),    # 1. Gemini 2.5 Flash-Lite gratuit
-            (client_github,      "deepseek"),         # 2. DeepSeek (GitHub)
-            (client_gemini_paid, "gemini_free_2"),    # 3. Filet payant
+            (client_gemini_free, "gemini_free_2"),
+            (client_github,      "deepseek"),
+            (client_gemini_paid, "gemini_free_2"),
         ]
         return jsonify(run_free_cascade(steps, ctx))
 
@@ -530,9 +551,9 @@ def history():
             return jsonify(run_paid_cascade(ctx))
 
         steps = [
-            (client_groq,        "compound"),         # 1. Groq Compound
-            (client_openrouter,  "nemotron"),         # 2. Nemotron 120B (OpenRouter)
-            (client_gemini_paid, "gemini_free_2"),    # 3. Filet payant
+            (client_groq,        "compound"),
+            (client_openrouter,  "nemotron"),
+            (client_gemini_paid, "gemini_free_2"),
         ]
         return jsonify(run_free_cascade(steps, ctx))
 
@@ -551,9 +572,9 @@ def vitality():
             return jsonify(run_paid_cascade(ctx))
 
         steps = [
-            (client_cloudflare,  "glm"),              # 1. GLM 5.2 (Cloudflare)
-            (client_groq,        "compound"),         # 2. Groq Compound
-            (client_gemini_paid, "gemini_free_2"),    # 3. Filet payant
+            (client_cloudflare,  "glm"),
+            (client_groq,        "compound"),
+            (client_gemini_paid, "gemini_free_2"),
         ]
         return jsonify(run_free_cascade(steps, ctx))
 
@@ -605,6 +626,7 @@ def books():
         gemini_history.append(types.Content(role="user", parts=[types.Part(text=message)]))
 
         def run_books_call(client, model_key):
+            # OPTIMISATION 1 — /books garde temperature=0.85 pour la créativité littéraire
             if client in (client_gemini_free, client_gemini_paid):
                 resp = client.models.generate_content(
                     model=MODELS[model_key],
@@ -624,6 +646,7 @@ def books():
                     elif msg.startswith("Echo: "):
                         openai_messages.append({"role": "assistant", "content": msg[6:]})
                 openai_messages.append({"role": "user", "content": message})
+                # /books : temperature créative maintenue à 0.85 intentionnellement
                 res = client.chat.completions.create(
                     model=MODELS[model_key],
                     messages=openai_messages,
@@ -632,7 +655,6 @@ def books():
                 )
                 return res.choices[0].message.content or ""
 
-        # Cascade books
         if tier in ("basic", "premium", "ultra", "founder"):
             paid_key = "gemini_paid_founder" if tier == "founder" else "gemini_paid_standard"
             try:
@@ -641,7 +663,6 @@ def books():
                 print(f"[BOOKS PAID] Echec {paid_key} ({e})")
                 full_text = ""
         else:
-            # Connected Free
             if get_failover_count() >= MAX_FREE_FAILOVERS:
                 return jsonify({"response": ERR_QUOTA["response"], "inject": False, "action": None})
 
@@ -689,7 +710,6 @@ def extract_horizon_result(query, ctx, attempt=1, max_attempts=3):
         "quels_sont_les_risques", "quelle_option_est_recommandee"
     ]
 
-    # Sélection du client/modèle selon la tentative
     if attempt == 1:
         client, model_key = client_gemini_free, "gemini_free_2"
     elif attempt == 2:
@@ -749,7 +769,6 @@ def horizon():
         ctx = prepare_shared_context(data, source_override="horizonweb")
 
         if ctx["user_tier"] != "connected_free":
-            # Paid : direct gemini paid sans boucle agentique
             tier = ctx["user_tier"]
             model_key = "gemini_paid_founder" if tier == "founder" else "gemini_paid_standard"
             try:
