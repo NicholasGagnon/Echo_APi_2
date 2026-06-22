@@ -223,7 +223,6 @@ def prepare_shared_context(data, source_override=None):
     user_message     = data.get("message", "")
     calendar_events  = data.get("calendarEvents", {})
     raw_history      = data.get("history", [])
-    memory_summary   = data.get("summary", "")
     source           = source_override if source_override else data.get("source", "chat").lower().strip()
     image_b64        = data.get("image", None)
     selected_buttons = data.get("selectedButtons", [])
@@ -262,18 +261,9 @@ def prepare_shared_context(data, source_override=None):
         current_calories=current_calories,
         current_cycle=current_cycle
     )
-    system_prompt = base_system_prompt
-
-if memory_summary:
-    system_prompt += (
-        "\n\nLONG TERM MEMORY\n"
-        "================\n"
-        f"{memory_summary}\n"
+    system_prompt = base_system_prompt + (
+        "\n\nCRITICAL SAFETY DIRECTIVE: Only trigger actions explicitly demanded in the LATEST message."
     )
-
-system_prompt += (
-    "\n\nCRITICAL SAFETY DIRECTIVE: Only trigger actions explicitly demanded in the LATEST message."
-)
 
     taille_memoire = 30 if user_tier in ["ultra", "founder"] else (15 if user_tier in ["basic", "premium"] else 5)
     output_tokens  = 4096 if user_tier in ["ultra", "founder"] else (2048 if user_tier in ["basic", "premium"] else 1024)
