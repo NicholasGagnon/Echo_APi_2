@@ -11,7 +11,6 @@ from google.genai import types
 from openai import OpenAI
 from dotenv import load_dotenv
 
-# Import du prompt système dynamique de l'application
 from prompts import generate_system_prompt
 
 load_dotenv()
@@ -98,7 +97,7 @@ def clean_and_parse_json(raw_text):
             return json.loads(match.group(0))
         except Exception: pass
 
-    raise ValueError("Le format extrait ne respecte pas un JSON valide.")
+    raise ValueError("Format JSON invalide ou absent.")
 
 def build_gemini_contents(historique_reduit, image_b64, user_message, force_neutral_style):
     contents = []
@@ -141,6 +140,7 @@ def prepare_shared_context(data, source_override=None):
     current_calories = data.get("currentCalories", [])
     current_cycle    = data.get("currentCycle", "mois")
     user_tier        = normalize_tier(data.get("userTier", "connected_free"))
+    lang             = data.get("lang", "fr").strip().lower()
 
     maintenant      = datetime.now()
     date_aujourdhui = maintenant.strftime("%A %d %B %Y")
@@ -161,13 +161,11 @@ def prepare_shared_context(data, source_override=None):
         print(f"[WARN] Calendrier: {e}")
         filtered_calendar = calendar_events
 
-    base_system_prompt = generate_system_prompt(
+    system_prompt = generate_system_prompt(
         source=source, selected_buttons=selected_buttons, date_aujourdhui=date_aujourdhui,
         annee_en_cours=annee_en_cours, user_tier=user_tier, filtered_calendar=filtered_calendar,
-        current_expenses=current_expenses, current_calories=current_calories, current_cycle=current_cycle
-    )
-    system_prompt = base_system_prompt + (
-        "\n\nCRITICAL SAFETY DIRECTIVE: Only trigger actions explicitly demanded in the LATEST message."
+        current_expenses=current_expenses, current_calories=current_calories, current_cycle=current_cycle,
+        lang=lang
     )
 
     taille_memoire = 30 if user_tier in ["ultra", "founder"] else (15 if user_tier in ["basic", "premium"] else 5)
@@ -217,60 +215,27 @@ def execute_openai_call(client, model, ctx, temp=0.7, timeout=7.0):
     return res.choices[0].message.content
 
 def extract_attributes_and_matrix(query, ctx, lang_target="fr", attempt=1, max_attempts=3):
-    """
-    Validation et exécution agentique strict d'HorizonWeb.
-    S'assure que la réponse finale est extrêmement riche en détails opérationnels concrets
-    (Horaires exacts, Heures d'ouverture, adresses, prix complets, versions)
-    et alignée sur la langue demandée sans verbiage philosophique.
-    """
     if attempt > max_attempts:
         fallback_msg = (
-            "Erreur de cohérence structurelle du signal." if lang_target == "fr"
-            else "Structural signal coherence error."
+            "Erreur d'extraction du sillage de recherche." if lang_target == "fr"
+            else "Search wake extraction error."
         )
         return {
+            "response": fallback_msg,
+            "attributes": ["erreur_coherence"],
             "matrix": {
-                "c_est_quoi": fallback_msg,
+                "c_est_quoi": "Erreur d'extraction structurelle.",
                 "est_ce_bon": "Le signal web est trop fragmenté pour être validé.",
-                "combien_ca_coute": "Non disponible / Not available.",
-                "est_ce_disponible": "Non disponible / Not available.",
+                "combien_ca_coute": "Non disponible.",
+                "est_ce_disponible": "Non disponible.",
                 "qu_en_pensent_les_gens": "Données incohérentes.",
                 "quelles_sont_les_alternatives": "Non disponible.",
                 "quels_sont_les_risques": "Instabilité détectée.",
-                "quelle_option_est_recommandee": "Echo a interrompu la boucle pour cause d'incohérence."
-            },
-            "attributes": ["erreur_coherence"]
+                "quelle_option_est_recommandee": "Incohérence persitante."
+            }
         }
 
-    # Injection du protocole d'extraction ultra-opérationnel
-    ctx["system_prompt"] += f"""
-
-[HORIZONWEB CORE PROTOCOL]
-You must absolutely output a valid JSON containing 'attributes' and 'matrix' keys in the requested language: '{lang_target}'.
-
-CRITICAL DIRECTIVE ON OPERATIONAL DETAILS:
-- ALWAYS extract extremely precise facts: exact HOURS of operation (heures d'ouverture), precise addresses, real net pricing (prix réel), direct versions, and conditions.
-- If you are analyzing a place, a restaurant, or a local service, finding the hours of operation and precise address is YOUR HIGHEST PRIORITY.
-- Cut all high-level philosophical prose, general introductions, marketing fluff or generalities. Give hard facts, real numbers, and precise operational field data.
-
-JSON SCHEMA REQUIREMENT (Translate the keys' contents, but keep the keys exactly as defined below in lowercase):
-{{
-  "attributes": ["attribute1", "attribute2", "attribute3"],
-  "matrix": {{
-    "c_est_quoi": "De quoi il s'agit de manière brève et nette (sans blabla).",
-    "est_ce_bon": "Évaluation de la qualité, de la performance et de la réputation de l'offre.",
-    "combien_ca_coute": "Tarifs réels, frais masqués et coûts d'accès.",
-    "est_ce_disponible": "Où le trouver, conditions d'accès physiques/numériques, HEURES D'OUVERTURE / HORAIRES (si applicable).",
-    "qu_en_pensent_les_gens": "Réalité du terrain : compilation des retours Reddit et forums spécialisés.",
-    "quelles_sont_les_alternatives": "Deux options concurrentes réelles et viables.",
-    "quels_sont_les_risques": "Contraintes réelles, limites, pièges ou défauts critiques.",
-    "quelle_option_est_recommandee": "Position claire, tranchée et argumentée d'Echo."
-  }}
-}}
-"""
-
     try:
-        # Cascade 1 : Essai avec Gemini Paid ou Gemini Free
         if ctx["user_tier"] == "connected_free":
             model = "gemini-3.1-flash-lite"
             client = client_gemini_free if client_gemini_free else client_gemini_paid
@@ -284,35 +249,33 @@ JSON SCHEMA REQUIREMENT (Translate the keys' contents, but keep the keys exactly
                 parsed_json = clean_and_parse_json(r.text)
                 return validate_and_format_horizon(parsed_json, query, ctx, lang_target, attempt, max_attempts)
             except Exception as e:
-                print(f"[HORIZON CASCADE] Échec Gemini ({e}). Bascule sur DeepSeek (GitHub)...")
+                print(f"[HORIZON WEB] Echec Gemini ({e}). Cascade vers GitHub...")
 
-        # Cascade 2 (Failover) : DeepSeek V3 (GitHub)
         if client_github:
             try:
                 res_raw = execute_openai_call(client_github, "deepseek/DeepSeek-V3-0324", ctx)
                 parsed_json = clean_and_parse_json(res_raw)
                 return validate_and_format_horizon(parsed_json, query, ctx, lang_target, attempt, max_attempts)
             except Exception as e:
-                print(f"[HORIZON CASCADE] Échec DeepSeek ({e}). Bascule sur Moonshot (Nvidia)...")
+                print(f"[HORIZON WEB] Echec DeepSeek ({e}). Cascade vers Nvidia...")
 
-        # Cascade 3 (Failover) : Moonshot Kimi (Nvidia)
         if client_nvidia:
             try:
                 res_raw = execute_openai_call(client_nvidia, "moonshotai/kimi-k2.6", ctx)
                 parsed_json = clean_and_parse_json(res_raw)
                 return validate_and_format_horizon(parsed_json, query, ctx, lang_target, attempt, max_attempts)
             except Exception as e:
-                print(f"[HORIZON CASCADE] Échec Moonshot ({e}).")
+                print(f"[HORIZON WEB] Echec Moonshot ({e}).")
 
-        raise ValueError("Aucun fournisseur d'IA n'est parvenu à traiter l'exploration Horizon.")
+        raise ValueError("Aucune IA n'a pu extraire de matrice valide.")
 
     except Exception as e:
-        print(f"[HORIZON AGENT] Exception critique à la tentative {attempt}: {e}")
+        print(f"[HORIZON AGENT] Erreur crash a la tentative {attempt}: {e}")
         return extract_attributes_and_matrix(query, ctx, lang_target, attempt + 1, max_attempts)
 
 def validate_and_format_horizon(parsed_json, query, ctx, lang_target, attempt, max_attempts):
-    if not isinstance(parsed_json, dict) or "matrix" not in parsed_json or "attributes" not in parsed_json:
-        print(f"[HORIZON AGENT] Tentative {attempt} échouée (JSON ou clés absentes).")
+    if not isinstance(parsed_json, dict) or "matrix" not in parsed_json or "response" not in parsed_json:
+        print(f"[HORIZON AGENT] Tentative {attempt} echouee (Structure de base manquante).")
         return extract_attributes_and_matrix(query, ctx, lang_target, attempt + 1, max_attempts)
 
     required_keys = [
@@ -320,9 +283,8 @@ def validate_and_format_horizon(parsed_json, query, ctx, lang_target, attempt, m
         "qu_en_pensent_les_gens", "quelles_sont_les_alternatives",
         "quels_sont_les_risques", "quelle_option_est_recommandee"
     ]
-    
     if not all(k in parsed_json["matrix"] for k in required_keys):
-        print(f"[HORIZON AGENT] Tentative {attempt} échouée (Champs manquants).")
+        print(f"[HORIZON AGENT] Tentative {attempt} echouee (Cles de matrice absentes).")
         return extract_attributes_and_matrix(query, ctx, lang_target, attempt + 1, max_attempts)
 
     return parsed_json
@@ -337,9 +299,7 @@ def horizon():
         if not query:
             return jsonify({"error": "L'intention d'exploration est vide."}), 400
 
-        data["message"] = f"Fais une recherche web complète et extrait tout sur : {query}"
-
-        # On active la source "horizonweb" pour charger le prompt HORIZON_CORE_PROMPT
+        data["message"] = f"Fais une recherche web complete sur : {query}"
         ctx = prepare_shared_context(data, source_override="horizonweb")
 
         result = extract_attributes_and_matrix(query, ctx, lang_target=lang_target)
@@ -348,94 +308,10 @@ def horizon():
     except Exception as e:
         print(f"Erreur critique sur la route /horizon: {e}")
         return jsonify({
-            "matrix": {"quelle_option_est_recommandee": "Système Horizon instable, l'axe n'a pas pu se stabiliser."},
+            "response": "Le systeme de recherche a rencontre une erreur.",
+            "matrix": {"quelle_option_est_recommandee": "Systeme Horizon instable."},
             "attributes": ["erreur_critique"]
         }), 500
-
-@app.route("/export", methods=["POST"])
-def export_route():
-    data   = request.get_json(silent=True) or {}
-    fmt    = (data.get("format") or "").lower().strip()
-    title  = (data.get("title")  or "Document Echo AI").strip()
-    html   = (data.get("html")   or "").strip()
-
-    if not html:
-        return jsonify({"error": "Contenu vide."}), 400
-
-    safe = "".join(c for c in title if c.isalnum() or c in " _-").strip().replace(" ", "_") or "document"
-
-    try:
-        if fmt == "txt":
-            txt = re.sub(r'<[^>]+>', '', html)
-            txt = txt.replace('&nbsp;', ' ').replace('&amp;', '&')
-            buf = io.BytesIO(txt.encode("utf-8"))
-            return send_file(buf, mimetype="text/plain", as_attachment=True, download_name=f"{safe}.txt")
-
-        elif fmt == "pdf":
-            try:
-                from xhtml2pdf import pisa
-                styled = f"""<html><head><meta charset="utf-8"><style>
-                body{{font-family:sans-serif;font-size:11pt;line-height:1.6;color:#18181b}}
-                h1{{font-size:22pt;border-bottom:1px solid #e4e4e7;padding-bottom:8px}}
-                p{{margin-bottom:12px;text-align:justify}}
-                </style></head><body><h1>{title}</h1>{html}</body></html>"""
-                buf = io.BytesIO()
-                pisa.CreatePDF(io.StringIO(styled), dest=buf)
-                buf.seek(0)
-                return send_file(buf, mimetype="application/pdf", as_attachment=True, download_name=f"{safe}.pdf")
-            except ImportError:
-                return jsonify({"error": "xhtml2pdf non installe."}), 503
-
-        elif fmt == "docx":
-            try:
-                from docx import Document
-                from docx.shared import Pt, RGBColor
-                from docx.enum.text import WD_ALIGN_PARAGRAPH
-                doc = Document()
-                t = doc.add_paragraph()
-                r = t.add_run(title)
-                r.font.size = Pt(24); r.font.bold = True
-                r.font.color.rgb = RGBColor(15, 23, 42)
-                clean = re.sub(r'<[^>]+>', '\n', html).replace('&nbsp;', ' ')
-                for line in clean.split('\n'):
-                    line = line.strip()
-                    if line:
-                        p = doc.add_paragraph()
-                        p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-                        run = p.add_run(line)
-                        run.font.size = Pt(11)
-                buf = io.BytesIO()
-                doc.save(buf); buf.seek(0)
-                return send_file(buf,
-                    mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    as_attachment=True, download_name=f"{safe}.docx")
-            except ImportError:
-                return jsonify({"error": "python-docx non installe."}), 503
-
-        elif fmt == "epub":
-            try:
-                from ebooklib import epub
-                book = epub.EpubBook()
-                book.set_identifier(f"echo-{int(datetime.now().timestamp())}")
-                book.set_title(title); book.set_language("fr"); book.add_author("Echo AI")
-                ch = epub.EpubHtml(title=title, file_name="ch1.xhtml", lang="fr")
-                ch.content = f"<html><body><h1>{title}</h1>{html}</body></html>"
-                book.add_item(ch)
-                book.toc = (epub.Link("ch1.xhtml", title, "ch1"),)
-                book.spine = ["nav", ch]
-                book.add_item(epub.EpubNav()); book.add_item(epub.EpubNcx())
-                buf = io.BytesIO()
-                epub.write_epub(buf, book, {}); buf.seek(0)
-                return send_file(buf, mimetype="application/epub+zip", as_attachment=True, download_name=f"{safe}.epub")
-            except ImportError:
-                return jsonify({"error": "EbookLib non installe."}), 503
-
-        else:
-            return jsonify({"error": f"Format '{fmt}' non supporte."}), 400
-
-    except Exception as e:
-        print(f"[EXPORT ERROR] {fmt}: {e}")
-        return jsonify({"error": str(e)}), 500
 
 @app.route("/chat", methods=["POST"])
 def chat():
@@ -549,7 +425,7 @@ def books():
                 full_text = resp.text or ""
                 return handle_books_response(full_text, wants_inject)
             except Exception as e:
-                print(f"[BOOKS CASCADE] Échec Gemini ({e}). Bascule sur DeepSeek (GitHub)...")
+                print(f"[BOOKS CASCADE] Echec Gemini ({e}). Cascade vers GitHub...")
 
         if client_github:
             try:
@@ -557,17 +433,9 @@ def books():
                 res_raw = execute_openai_call(client_github, "deepseek/DeepSeek-V3-0324", ctx_dummy)
                 return handle_books_response(res_raw, wants_inject)
             except Exception as e:
-                print(f"[BOOKS CASCADE] Échec DeepSeek ({e}). Bascule sur Moonshot (Nvidia)...")
+                print(f"[BOOKS CASCADE] Echec DeepSeek ({e}). Cascade vers Nvidia...")
 
-        if client_nvidia:
-            try:
-                ctx_dummy = {"messages_openrouter": [{"role": "system", "content": system_prompt}] + [{"role": "user", "content": message}]}
-                res_raw = execute_openai_call(client_nvidia, "moonshotai/kimi-k2.6", ctx_dummy)
-                return handle_books_response(res_raw, wants_inject)
-            except Exception as e:
-                print(f"[BOOKS CASCADE] Échec Moonshot ({e}).")
-
-        return jsonify({"response": "Studio d'écriture instable, réessayez !", "inject": False, "action": None}), 500
+        return jsonify({"response": "Studio d'ecriture instable.", "inject": False, "action": None}), 500
 
     except Exception as e:
         print(f"Erreur /books: {e}")
@@ -616,7 +484,7 @@ def home():
                 except Exception as e:
                     print(f"Echec filet home ({e})"); lock_model("gemini-2.5-flash-lite-home")
 
-            return jsonify({"action": None, "response": "Accueil surchargé, reessaie ! 😎"})
+            return jsonify({"action": None, "response": "Accueil surcharge, reessaie ! 😎"})
 
         else:
             try:
