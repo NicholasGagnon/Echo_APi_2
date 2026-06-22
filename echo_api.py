@@ -40,7 +40,7 @@ client_gemini_paid  = genai.Client(api_key=API_KEY_PAID)  if API_KEY_PAID  else 
 client_openrouter   = OpenAI(base_url=OPENROUTER_BASE_URL, api_key=OPENROUTER_API_KEY) if OPENROUTER_API_KEY else None
 client_github       = OpenAI(base_url=GITHUB_BASE_URL,     api_key=GITHUB_API_KEY)     if GITHUB_API_KEY     else None
 client_nvidia       = OpenAI(base_url=NVIDIA_BASE_URL,     api_key=NVIDIA_API_KEY)     if NVIDIA_API_KEY     else None
-client_groq         = OpenAI(base_url=GROQ_BASE_URL,        api_key=GROQ_API_KEY)        if GROQ_API_KEY       else None
+client_groq         = OpenAI(base_url=GROQ_BASE_URL,        api_key=GROQ_API_KEY)       if GROQ_API_KEY       else None
 client_cloudflare   = OpenAI(base_url=CLOUDFLARE_BASE_URL, api_key=CLOUDFLARE_API_TOKEN) if CLOUDFLARE_API_TOKEN else None
 
 # ── FILET DE SÉCURITÉ CONNECTED_FREE ─────────────────────────────────────────
@@ -232,79 +232,6 @@ def execute_openai_call(client, model, ctx, temp=0.7, timeout=7.0):
         temperature=temp, timeout=timeout
     )
     return res.choices[0].message.content
-
-# ── EXTRACTION AGENTIQUE (HORIZONWEB) ─────────────────────────────────────────
-def extract_attributes_and_matrix(query, ctx, attempt=1, max_attempts=3):
-    """
-    Boucle agentique d'HorizonWeb.
-    Applique les filtres en tâche de fond via le prompt système dédié,
-    détecte les attributs décisionnels et valide la structure des 8 piliers (Règle 10).
-    """
-    if attempt > max_attempts:
-        return {
-            "matrix": {
-                "c_est_quoi": "Erreur d'extraction structurelle.",
-                "est_ce_bon": "Le signal web est trop fragmenté pour être validé.",
-                "combien_ca_coute": "Non disponible.",
-                "est_ce_disponible": "Non disponible.",
-                "qu_en_pensent_les_gens": "Données incohérentes.",
-                "quelles_sont_les_alternatives": "Non disponible.",
-                "quels_sont_les_risques": "Instabilité du flux détectée.",
-                "quelle_option_est_recommandee": "Echo a interrompu la boucle pour cause d'incohérence persistante."
-            },
-            "attributes": ["erreur_coherence"]
-        }
-
-    horizon_directive = (
-        "\n\n[HORIZONWEB PROTOCOL]\n"
-        "Tu es en mode exploration extérieure. Tu dois obligatoirement renvoyer un objet JSON valide "
-        "contenant deux clés principales :\n"
-        "1) 'attributes': une liste de 3 à 5 mots-clés (en minuscules) représentant les critères décisionnels spécifiques détectés pour ce sujet précis.\n"
-        "2) 'matrix': un objet contenant exactement ces 8 clés :\n"
-        "   - 'c_est_quoi'\n"
-        "   - 'est_ce_bon'\n"
-        "   - 'combien_ca_coute'\n"
-        "   - 'est_ce_disponible'\n"
-        "   - 'qu_en_pensent_les_gens'\n"
-        "   - 'quelles_sont_les_alternatives'\n"
-        "   - 'quels_sont_les_risques'\n"
-        "   - 'quelle_option_est_recommandee'\n"
-        "Applique rigoureusement les 10 filtres universels (Source Primaire, Réalité Terrain, Coût Réel, etc.) pour épurer ton signal avant de remplir la matrice."
-    )
-
-    ctx["system_prompt"] += horizon_directive
-
-    try:
-        if ctx["user_tier"] == "connected_free":
-            model = "gemini-3.1-flash-lite"
-            client = client_gemini_free if client_gemini_free else client_gemini_paid
-        else:
-            model = "gemini-3.5-flash" if ctx["user_tier"] == "founder" else "gemini-3.1-flash-lite"
-            client = client_gemini_paid
-
-        r = execute_gemini_call(client, model, ctx)
-        raw_text = r.text
-
-        parsed_json = clean_and_parse_json(raw_text)
-
-        if not isinstance(parsed_json, dict) or "matrix" not in parsed_json or "attributes" not in parsed_json:
-            print(f"[HORIZON AGENT] Tentative {attempt} échouée (Structure invalide). Relancement...")
-            return extract_attributes_and_matrix(query, ctx, attempt + 1, max_attempts)
-
-        required_keys = [
-            "c_est_quoi", "est_ce_bon", "combien_ca_coute", "est_ce_disponible",
-            "qu_en_pensent_les_gens", "quelles_sont_les_alternatives",
-            "quels_sont_les_risques", "quelle_option_est_recommandee"
-        ]
-        if not all(k in parsed_json["matrix"] for k in required_keys):
-            print(f"[HORIZON AGENT] Tentative {attempt} échouée (Clés manquantes dans la matrice). Relancement...")
-            return extract_attributes_and_matrix(query, ctx, attempt + 1, max_attempts)
-
-        return parsed_json
-
-    except Exception as e:
-        print(f"[HORIZON AGENT] Erreur crash à la tentative {attempt}: {e}")
-        return extract_attributes_and_matrix(query, ctx, attempt + 1, max_attempts)
 
 # ── ROUTE /export (inline, pas d'import externe) ──────────────────────────────
 @app.route("/export", methods=["POST"])
@@ -612,38 +539,6 @@ def history():
     except Exception as e:
         print(f"Erreur /history: {e}")
         return jsonify({"action": None, "response": "Historique instable !"}), 500
-
-# ── ROUTE /horizon ────────────────────────────────────────────────────────────
-@app.route("/horizon", methods=["POST"])
-def horizon():
-    try:
-        data = request.json or {}
-        query = data.get("query", "").strip()
-
-        if not query:
-            return jsonify({"error": "L'intention d'exploration est vide."}), 400
-
-        data["message"] = f"Fais une recherche web complète et extrait tout sur : {query}"
-
-        ctx = prepare_shared_context(data, source_override="horizonweb")
-
-        if ctx["user_tier"] == "connected_free":
-            if get_failover_count() >= MAX_FREE_FAILOVERS:
-                return jsonify({
-                    "matrix": {"quelle_option_est_recommandee": "Ouf, mon sillage Horizon sature ! 😎"},
-                    "attributes": ["quota_atteint"]
-                })
-
-        result = extract_attributes_and_matrix(query, ctx)
-
-        return jsonify(result)
-
-    except Exception as e:
-        print(f"Erreur critique sur la route /horizon: {e}")
-        return jsonify({
-            "matrix": {"quelle_option_est_recommandee": "Système Horizon instable, l'axe n'a pas pu se stabiliser."},
-            "attributes": ["erreur_critique"]
-        }), 500
 
 
 if __name__ == "__main__":

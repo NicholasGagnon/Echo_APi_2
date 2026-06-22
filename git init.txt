@@ -1,12 +1,30 @@
 cd C:\Users\nicog\identity
 git add .
-git commit -m "🚀 Auto-deploy: Mise à jour système et quotas"
+git commit -m "🚀 Auto-deploy"
 git push origin main
 
 
 cd C:\projetvision\horloge-vivante
 git add .
-git commit -m "🚀 Auto-deploy: Sécurisation et mise à jour de la passerelle"
+git commit -m "🚀 Auto-deploy "
 git push origin main
 
 
+
+
+
+DO $$
+DECLARE uid uuid;
+BEGIN
+  SELECT id INTO uid FROM auth.users WHERE email = 'testfreeconnect@gmail.com';
+  DELETE FROM public.user_tokens WHERE id = uid;
+  DELETE FROM public.profiles WHERE id = uid;
+  DELETE FROM auth.users WHERE id = uid;
+END $$;
+
+
+vercel
+
+cd C:\projetvision\horloge-vivante
+git commit --allow-empty -m "force redeploy"
+git push origin main
