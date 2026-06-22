@@ -18,6 +18,22 @@ load_dotenv()
 app = Flask(__name__)
 CORS(app)
 
+# ── MODELES VALIDES — NE PAS MODIFIER SANS TESTER ────────────────────────────
+MODELS = {
+    # Gratuits
+    "gemini_free_1":    "gemini-3.1-flash-lite",
+    "gemini_free_2":    "gemini-2.5-flash-lite",
+    "deepseek":         "deepseek/DeepSeek-V3-0324",
+    "kimi":             "moonshotai/kimi-k2.6",
+    "ernie":            "baidu/ernie-4.5-vl-424b-preview:free",
+    "glm":              "glm-4-flash",
+    "compound":         "compound-beta",
+    # Payants
+    "gemini_paid_founder":  "gemini-3.5-flash",
+    "gemini_paid_ultra":    "gemini-3.1-flash-lite",
+    "gemini_paid_standard": "gemini-2.5-flash-lite",
+}
+
 # ── CLÉS D'API ────────────────────────────────────────────────────────────────
 API_KEY_FREE          = os.getenv("API_KEY_FREE", "").strip()
 API_KEY_PAID          = os.getenv("API_KEY_PAID", "").strip()
@@ -56,21 +72,21 @@ def increment_failover_count():
     GLOBAL_FAILOVER_MEMORY_COUNT += 1
     print(f"[FAILOVER FILET] {GLOBAL_FAILOVER_MEMORY_COUNT} / {MAX_FREE_FAILOVERS}")
 
-# ── GESTION DES LOCKS DE MODELES ─────────────────────────────────────────────
+# ── GESTION DES LOCKS DE MODELES (60s) ───────────────────────────────────────
 MODELS_LOCK_REGISTRY = {}
 
-def is_model_locked(model_name: str) -> bool:
-    lock_time = MODELS_LOCK_REGISTRY.get(model_name)
+def is_model_locked(model_key: str) -> bool:
+    lock_time = MODELS_LOCK_REGISTRY.get(model_key)
     if lock_time:
         if datetime.now() < lock_time:
             return True
         else:
-            del MODELS_LOCK_REGISTRY[model_name]
+            del MODELS_LOCK_REGISTRY[model_key]
     return False
 
-def lock_model(model_name: str):
-    MODELS_LOCK_REGISTRY[model_name] = datetime.now() + timedelta(seconds=60)
-    print(f"[LOCK] {model_name} hors circuit 60s.")
+def lock_model(model_key: str):
+    MODELS_LOCK_REGISTRY[model_key] = datetime.now() + timedelta(seconds=60)
+    print(f"[LOCK] {model_key} hors circuit 60s.")
 
 # ── NORMALISATION DU TIER ─────────────────────────────────────────────────────
 VALID_TIERS = {"connected_free", "basic", "premium", "ultra", "founder"}
@@ -78,12 +94,22 @@ VALID_TIERS = {"connected_free", "basic", "premium", "ultra", "founder"}
 def normalize_tier(raw: str) -> str:
     cleaned = (raw or "").lower().strip()
     if cleaned in VALID_TIERS: return cleaned
-    if cleaned == "free": return "connected_free"
-    if "founder" in cleaned: return "founder"
-    if "ultra"   in cleaned: return "ultra"
-    if "premium" in cleaned: return "premium"
-    if "basic"   in cleaned: return "basic"
+    if cleaned == "free":      return "connected_free"
+    if "founder" in cleaned:   return "founder"
+    if "ultra"   in cleaned:   return "ultra"
+    if "premium" in cleaned:   return "premium"
+    if "basic"   in cleaned:   return "basic"
     return "connected_free"
+
+# ── MESSAGES D'ERREUR UTILISATEUR ────────────────────────────────────────────
+ERR_QUOTA    = {"action": None, "response": "Le service est temporairement saturé. Réessaie dans quelques instants."}
+ERR_FINAL    = {"action": None, "response": "Tous les serveurs sont momentanément indisponibles. Réessaie dans 1 minute."}
+ERR_CRASH    = {"action": None, "response": "Une erreur inattendue s'est produite. Réessaie dans quelques secondes."}
+ERR_HORIZON  = {
+    "response": "Le moteur de recherche est temporairement indisponible. Réessaie dans quelques instants.",
+    "attributes": [],
+    "matrix": None
+}
 
 # ── JSON PARSER ───────────────────────────────────────────────────────────────
 def clean_and_parse_json(raw_text):
@@ -119,7 +145,6 @@ def clean_and_parse_json(raw_text):
 
     raise ValueError("Reponse vide.")
 
-# ── JSON PARSER HORIZON (clés différentes) ────────────────────────────────────
 def clean_and_parse_horizon_json(raw_text):
     text = raw_text.strip()
     if text.startswith("```json"): text = text[7:]
@@ -233,7 +258,7 @@ def prepare_shared_context(data, source_override=None):
     force_neutral = len(selected_buttons) > 0 or source == "vitality"
     gemini_contents = build_gemini_contents(historique_ajuste, image_b64, user_message, force_neutral)
 
-    messages_openrouter = [{"role": "system", "content": system_prompt}]
+    messages_openai = [{"role": "system", "content": system_prompt}]
     for msg in historique_ajuste:
         if not isinstance(msg, str) or msg.startswith("__IMAGE__:"):
             continue
@@ -241,29 +266,29 @@ def prepare_shared_context(data, source_override=None):
         if "action limit reached" in clean_content.lower() or clean_content == "...":
             continue
         if msg.startswith("You:") or msg.startswith("Toi:"):
-            messages_openrouter.append({"role": "user", "content": clean_content})
+            messages_openai.append({"role": "user", "content": clean_content})
         elif msg.startswith("Echo:"):
             try:
                 parsed = json.loads(clean_content)
                 clean_content = parsed.get("response", clean_content)
             except Exception:
                 pass
-            messages_openrouter.append({"role": "assistant", "content": clean_content})
+            messages_openai.append({"role": "assistant", "content": clean_content})
     if user_message:
-        messages_openrouter.append({"role": "user", "content": user_message})
+        messages_openai.append({"role": "user", "content": user_message})
 
     return {
         "system_prompt": system_prompt,
         "output_tokens": output_tokens,
         "gemini_contents": gemini_contents,
-        "messages_openrouter": messages_openrouter,
+        "messages_openai": messages_openai,
         "user_tier": user_tier,
     }
 
 # ── EXECUTEURS ────────────────────────────────────────────────────────────────
-def execute_gemini_call(client, model, ctx):
+def call_gemini(client, model_key, ctx):
     return client.models.generate_content(
-        model=model,
+        model=MODELS[model_key],
         contents=ctx["gemini_contents"],
         config=types.GenerateContentConfig(
             system_instruction=ctx["system_prompt"],
@@ -271,22 +296,81 @@ def execute_gemini_call(client, model, ctx):
         )
     )
 
-def execute_openai_call(client, model, ctx, temp=0.7, timeout=7.0):
+def call_openai(client, model_key, ctx, temp=0.7, timeout=15.0):
     res = client.chat.completions.create(
-        model=model,
-        messages=ctx["messages_openrouter"],
+        model=MODELS[model_key],
+        messages=ctx["messages_openai"],
         temperature=temp,
         timeout=timeout
     )
     return res.choices[0].message.content
 
+# ── CASCADE PAID ──────────────────────────────────────────────────────────────
+def run_paid_cascade(ctx):
+    tier = ctx["user_tier"]
+
+    if tier == "founder":
+        primary, fallback = "gemini_paid_founder", "gemini_paid_standard"
+    elif tier == "ultra":
+        primary, fallback = "gemini_paid_ultra", "gemini_paid_standard"
+    else:
+        primary, fallback = "gemini_paid_standard", "gemini_paid_ultra"
+
+    try:
+        r = call_gemini(client_gemini_paid, primary, ctx)
+        return clean_and_parse_json(r.text)
+    except Exception as e:
+        print(f"[PAID] Echec {primary} ({e}), bascule {fallback}")
+
+    try:
+        r = call_gemini(client_gemini_paid, fallback, ctx)
+        return clean_and_parse_json(r.text)
+    except Exception as e:
+        print(f"[PAID] Echec {fallback} ({e})")
+
+    return ERR_FINAL
+
+# ── CASCADE FREE GÉNÉRIQUE ────────────────────────────────────────────────────
+def run_free_cascade(steps, ctx, parser=None):
+    """
+    steps = liste de (client, model_key)
+    Le dernier step est le filet payant — incrémente le compteur.
+    """
+    if parser is None:
+        parser = clean_and_parse_json
+
+    if get_failover_count() >= MAX_FREE_FAILOVERS:
+        return ERR_QUOTA
+
+    for i, (client, model_key) in enumerate(steps):
+        if client is None:
+            continue
+        if is_model_locked(model_key):
+            continue
+        is_last = (i == len(steps) - 1)
+        try:
+            if client in (client_gemini_free, client_gemini_paid):
+                r = call_gemini(client, model_key, ctx)
+                result = parser(r.text)
+            else:
+                r = call_openai(client, model_key, ctx)
+                result = parser(r)
+            if is_last:
+                increment_failover_count()
+            return result
+        except Exception as e:
+            print(f"[FREE] Echec {model_key} ({e})")
+            lock_model(model_key)
+
+    return ERR_FINAL
+
 # ── ROUTE /export ─────────────────────────────────────────────────────────────
 @app.route("/export", methods=["POST"])
 def export_route():
-    data = request.get_json(silent=True) or {}
-    fmt  = (data.get("format") or "").lower().strip()
-    title = (data.get("title") or "Document Echo AI").strip()
-    html  = (data.get("html") or "").strip()
+    data  = request.get_json(silent=True) or {}
+    fmt   = (data.get("format") or "").lower().strip()
+    title = (data.get("title")  or "Document Echo AI").strip()
+    html  = (data.get("html")   or "").strip()
 
     if not html:
         return jsonify({"error": "Contenu vide."}), 400
@@ -382,54 +466,84 @@ def export_route():
 def chat():
     try:
         data = request.json or {}
-        ctx = prepare_shared_context(data, source_override="chat")
+        ctx  = prepare_shared_context(data, source_override="chat")
 
-        if ctx["user_tier"] == "connected_free":
-            if get_failover_count() >= MAX_FREE_FAILOVERS:
-                return jsonify({"action": None, "response": "Ouf, mon sillage sature ! 😎"})
+        if ctx["user_tier"] != "connected_free":
+            return jsonify(run_paid_cascade(ctx))
 
-            model_1 = "gemini-2.0-flash-lite"
-            if client_gemini_free and not is_model_locked(model_1):
-                try:
-                    r = execute_gemini_call(client_gemini_free, model_1, ctx)
-                    return jsonify(clean_and_parse_json(r.text))
-                except Exception as e:
-                    print(f"Echec {model_1} ({e})")
-                    lock_model(model_1)
-
-            model_2 = "gemini-2.5-flash-lite"
-            if client_gemini_free and not is_model_locked(model_2):
-                try:
-                    r = execute_gemini_call(client_gemini_free, model_2, ctx)
-                    return jsonify(clean_and_parse_json(r.text))
-                except Exception as e:
-                    print(f"Echec {model_2} ({e})")
-                    lock_model(model_2)
-
-            if client_gemini_paid and not is_model_locked("gemini-2.5-flash-lite-paid"):
-                try:
-                    r = execute_gemini_call(client_gemini_paid, "gemini-2.5-flash-lite", ctx)
-                    increment_failover_count()
-                    return jsonify(clean_and_parse_json(r.text))
-                except Exception as e:
-                    print(f"Echec filet ({e})")
-                    lock_model("gemini-2.5-flash-lite-paid")
-
-            return jsonify({"action": None, "response": "Sillage sature, reessaie ! 😎"})
-
-        else:
-            target = "gemini-2.0-flash" if ctx["user_tier"] == "founder" else "gemini-2.5-flash-lite"
-            try:
-                r = execute_gemini_call(client_gemini_paid, target, ctx)
-                return jsonify(clean_and_parse_json(r.text))
-            except Exception as e:
-                print(f"Echec {target} ({e})")
-                r = execute_gemini_call(client_gemini_paid, "gemini-2.5-flash-lite", ctx)
-                return jsonify(clean_and_parse_json(r.text))
+        steps = [
+            (client_gemini_free, "gemini_free_1"),   # 1. Gemini 3.1 Flash-Lite gratuit
+            (client_nvidia,      "kimi"),             # 2. Kimi K2.6
+            (client_gemini_paid, "gemini_free_2"),    # 3. Filet payant
+        ]
+        return jsonify(run_free_cascade(steps, ctx))
 
     except Exception as e:
         print(f"Erreur /chat: {e}")
-        return jsonify({"action": None, "response": "Systeme instable, reessaie !"}), 500
+        return jsonify(ERR_CRASH), 500
+
+# ── ROUTE /home ───────────────────────────────────────────────────────────────
+@app.route("/home", methods=["POST"])
+def home():
+    try:
+        data = request.json or {}
+        ctx  = prepare_shared_context(data, source_override="home")
+
+        if ctx["user_tier"] != "connected_free":
+            return jsonify(run_paid_cascade(ctx))
+
+        steps = [
+            (client_gemini_free, "gemini_free_2"),    # 1. Gemini 2.5 Flash-Lite gratuit
+            (client_openrouter,  "ernie"),            # 2. Ernie 4.5
+            (client_gemini_paid, "gemini_free_2"),    # 3. Filet payant
+        ]
+        return jsonify(run_free_cascade(steps, ctx))
+
+    except Exception as e:
+        print(f"Erreur /home: {e}")
+        return jsonify(ERR_CRASH), 500
+
+# ── ROUTE /history ────────────────────────────────────────────────────────────
+@app.route("/history", methods=["POST"])
+def history():
+    try:
+        data = request.json or {}
+        ctx  = prepare_shared_context(data, source_override="history")
+
+        if ctx["user_tier"] != "connected_free":
+            return jsonify(run_paid_cascade(ctx))
+
+        steps = [
+            (client_groq,        "compound"),         # 1. Groq Compound
+            (client_cloudflare,  "glm"),              # 2. GLM 4.7 Flash
+            (client_gemini_paid, "gemini_free_2"),    # 3. Filet payant
+        ]
+        return jsonify(run_free_cascade(steps, ctx))
+
+    except Exception as e:
+        print(f"Erreur /history: {e}")
+        return jsonify(ERR_CRASH), 500
+
+# ── ROUTE /vitality ───────────────────────────────────────────────────────────
+@app.route("/vitality", methods=["POST"])
+def vitality():
+    try:
+        data = request.json or {}
+        ctx  = prepare_shared_context(data, source_override="vitality")
+
+        if ctx["user_tier"] != "connected_free":
+            return jsonify(run_paid_cascade(ctx))
+
+        steps = [
+            (client_cloudflare,  "glm"),              # 1. GLM 4.7 Flash
+            (client_groq,        "compound"),         # 2. Groq Compound
+            (client_gemini_paid, "gemini_free_2"),    # 3. Filet payant
+        ]
+        return jsonify(run_free_cascade(steps, ctx))
+
+    except Exception as e:
+        print(f"Erreur /vitality: {e}")
+        return jsonify(ERR_CRASH), 500
 
 # ── ROUTE /books ──────────────────────────────────────────────────────────────
 @app.route("/books", methods=["POST"])
@@ -474,22 +588,67 @@ def books():
                 gemini_history.append(types.Content(role="model", parts=[types.Part(text=msg[6:])]))
         gemini_history.append(types.Content(role="user", parts=[types.Part(text=message)]))
 
-        client = client_gemini_paid if tier in ("premium", "ultra", "founder") else client_gemini_free
-        model  = "gemini-2.0-flash" if tier in ("premium", "ultra", "founder") else "gemini-2.0-flash-lite"
-        if client is None:
-            client = client_gemini_paid
-            model  = "gemini-2.0-flash-lite"
+        def run_books_call(client, model_key):
+            if client in (client_gemini_free, client_gemini_paid):
+                resp = client.models.generate_content(
+                    model=MODELS[model_key],
+                    contents=gemini_history,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_prompt,
+                        max_output_tokens=1200,
+                        temperature=0.85,
+                    )
+                )
+                return resp.text or ""
+            else:
+                openai_messages = [{"role": "system", "content": system_prompt}]
+                for msg in history[-10:]:
+                    if msg.startswith("You: "):
+                        openai_messages.append({"role": "user", "content": msg[5:]})
+                    elif msg.startswith("Echo: "):
+                        openai_messages.append({"role": "assistant", "content": msg[6:]})
+                openai_messages.append({"role": "user", "content": message})
+                res = client.chat.completions.create(
+                    model=MODELS[model_key],
+                    messages=openai_messages,
+                    temperature=0.85,
+                    timeout=15.0
+                )
+                return res.choices[0].message.content or ""
 
-        resp = client.models.generate_content(
-            model=model,
-            contents=gemini_history,
-            config=types.GenerateContentConfig(
-                system_instruction=system_prompt,
-                max_output_tokens=1200,
-                temperature=0.85,
-            )
-        )
-        full_text = resp.text or ""
+        # Cascade books
+        if tier in ("basic", "premium", "ultra", "founder"):
+            paid_key = "gemini_paid_founder" if tier == "founder" else "gemini_paid_standard"
+            try:
+                full_text = run_books_call(client_gemini_paid, paid_key)
+            except Exception as e:
+                print(f"[BOOKS PAID] Echec {paid_key} ({e})")
+                full_text = ""
+        else:
+            # Connected Free
+            if get_failover_count() >= MAX_FREE_FAILOVERS:
+                return jsonify({"response": ERR_QUOTA["response"], "inject": False, "action": None})
+
+            full_text = ""
+            books_steps = [
+                (client_openrouter, "ernie"),
+                (client_github,     "deepseek"),
+                (client_gemini_paid, "gemini_free_2"),
+            ]
+            for i, (client, model_key) in enumerate(books_steps):
+                if client is None or is_model_locked(model_key):
+                    continue
+                try:
+                    full_text = run_books_call(client, model_key)
+                    if i == len(books_steps) - 1:
+                        increment_failover_count()
+                    break
+                except Exception as e:
+                    print(f"[BOOKS FREE] Echec {model_key} ({e})")
+                    lock_model(model_key)
+
+        if not full_text:
+            return jsonify({"response": ERR_FINAL["response"], "inject": False, "action": None})
 
         if wants_inject and "<<<INJECT_TEXT>>>" in full_text:
             parts      = full_text.split("<<<INJECT_TEXT>>>")
@@ -501,164 +660,59 @@ def books():
 
     except Exception as e:
         print(f"Erreur /books: {e}")
-        return jsonify({"response": "Studio instable, reessaie !", "inject": False, "action": None}), 500
-
-# ── ROUTE /home ───────────────────────────────────────────────────────────────
-@app.route("/home", methods=["POST"])
-def home():
-    try:
-        data = request.json or {}
-        ctx = prepare_shared_context(data, source_override="home")
-
-        if ctx["user_tier"] == "connected_free":
-            if get_failover_count() >= MAX_FREE_FAILOVERS:
-                return jsonify({"action": None, "response": "Sillage d'accueil au repos ! 😎"})
-
-            model_1 = "deepseek/DeepSeek-V3-0324"
-            if client_github and not is_model_locked(model_1):
-                try:
-                    res = execute_openai_call(client_github, model_1, ctx)
-                    return jsonify(clean_and_parse_json(res))
-                except Exception as e:
-                    print(f"Echec {model_1} ({e})")
-                    lock_model(model_1)
-
-            model_2 = "moonshotai/kimi-k2.6"
-            if client_nvidia and not is_model_locked(model_2):
-                try:
-                    res = execute_openai_call(client_nvidia, model_2, ctx)
-                    return jsonify(clean_and_parse_json(res))
-                except Exception as e:
-                    print(f"Echec {model_2} ({e})")
-                    lock_model(model_2)
-
-            if client_gemini_paid and not is_model_locked("gemini-2.5-flash-lite-home"):
-                try:
-                    r = execute_gemini_call(client_gemini_paid, "gemini-2.5-flash-lite", ctx)
-                    increment_failover_count()
-                    return jsonify(clean_and_parse_json(r.text))
-                except Exception as e:
-                    print(f"Echec filet home ({e})")
-                    lock_model("gemini-2.5-flash-lite-home")
-
-            return jsonify({"action": None, "response": "Accueil surcharge, reessaie ! 😎"})
-
-        else:
-            try:
-                r = execute_gemini_call(client_gemini_paid, "gemini-2.5-flash-lite", ctx)
-                return jsonify(clean_and_parse_json(r.text))
-            except Exception as e:
-                print(f"Echec home paid ({e})")
-                return jsonify({"action": None, "response": "Accueil instable, reessaie !"}), 500
-
-    except Exception as e:
-        print(f"Erreur /home: {e}")
-        return jsonify({"action": None, "response": "Accueil instable !"}), 500
-
-# ── ROUTE /history ────────────────────────────────────────────────────────────
-@app.route("/history", methods=["POST"])
-def history():
-    try:
-        data = request.json or {}
-        ctx = prepare_shared_context(data, source_override="history")
-
-        if ctx["user_tier"] == "connected_free":
-            if get_failover_count() >= MAX_FREE_FAILOVERS:
-                return jsonify({"action": None, "response": "Archives inaccessibles ! 😎"})
-
-            model_1 = "groq/compound"
-            if client_groq and not is_model_locked(model_1):
-                try:
-                    res = execute_openai_call(client_groq, model_1, ctx)
-                    return jsonify(clean_and_parse_json(res))
-                except Exception as e:
-                    print(f"Echec {model_1} ({e})")
-                    lock_model(model_1)
-
-            model_2 = "moonshotai/kimi-k2.6"
-            if client_nvidia and not is_model_locked(model_2):
-                try:
-                    res = execute_openai_call(client_nvidia, model_2, ctx)
-                    return jsonify(clean_and_parse_json(res))
-                except Exception as e:
-                    print(f"Echec {model_2} ({e})")
-                    lock_model(model_2)
-
-            if client_gemini_paid and not is_model_locked("gemini-2.5-flash-lite-history"):
-                try:
-                    r = execute_gemini_call(client_gemini_paid, "gemini-2.5-flash-lite", ctx)
-                    increment_failover_count()
-                    return jsonify(clean_and_parse_json(r.text))
-                except Exception as e:
-                    print(f"Echec filet history ({e})")
-                    lock_model("gemini-2.5-flash-lite-history")
-
-            return jsonify({"action": None, "response": "Historique sature, reessaie ! 😎"})
-
-        else:
-            try:
-                r = execute_gemini_call(client_gemini_paid, "gemini-2.5-flash-lite", ctx)
-                return jsonify(clean_and_parse_json(r.text))
-            except Exception as e:
-                print(f"Echec history paid ({e})")
-                return jsonify({"action": None, "response": "Historique instable !"}), 500
-
-    except Exception as e:
-        print(f"Erreur /history: {e}")
-        return jsonify({"action": None, "response": "Historique instable !"}), 500
+        return jsonify({"response": ERR_CRASH["response"], "inject": False, "action": None}), 500
 
 # ── ROUTE /horizon ────────────────────────────────────────────────────────────
 def extract_horizon_result(query, ctx, attempt=1, max_attempts=3):
     if attempt > max_attempts:
-        return {
-            "response": "Le signal web est trop fragmenté pour être validé après plusieurs tentatives.",
-            "attributes": ["erreur_coherence"],
-            "matrix": {
-                "c_est_quoi": "Erreur d'extraction structurelle.",
-                "est_ce_bon": "Signal trop fragmenté.",
-                "combien_ca_coute": "Non disponible.",
-                "est_ce_disponible": "Non disponible.",
-                "qu_en_pensent_les_gens": "Données incohérentes.",
-                "quelles_sont_les_alternatives": "Non disponible.",
-                "quels_sont_les_risques": "Instabilité du flux détectée.",
-                "quelle_option_est_recommandee": "Echo a interrompu la boucle pour cause d'incohérence persistante."
-            }
-        }
+        return ERR_HORIZON
+
+    required_matrix_keys = [
+        "c_est_quoi", "est_ce_bon", "combien_ca_coute", "est_ce_disponible",
+        "qu_en_pensent_les_gens", "quelles_sont_les_alternatives",
+        "quels_sont_les_risques", "quelle_option_est_recommandee"
+    ]
+
+    # Sélection du client/modèle selon la tentative
+    if attempt == 1:
+        client, model_key = client_gemini_free, "gemini_free_2"
+    elif attempt == 2:
+        client, model_key = client_github, "deepseek"
+    else:
+        client, model_key = client_gemini_paid, "gemini_free_2"
+
+    if client is None or (attempt < 3 and is_model_locked(model_key)):
+        return extract_horizon_result(query, ctx, attempt + 1, max_attempts)
 
     try:
-        if ctx["user_tier"] == "connected_free":
-            client = client_gemini_free if client_gemini_free else client_gemini_paid
-            model  = "gemini-2.5-flash-lite"
-        elif ctx["user_tier"] == "founder":
-            client = client_gemini_paid
-            model  = "gemini-2.0-flash"
+        if client in (client_gemini_free, client_gemini_paid):
+            r = call_gemini(client, model_key, ctx)
+            parsed = clean_and_parse_horizon_json(r.text)
         else:
-            client = client_gemini_paid
-            model  = "gemini-2.5-flash-lite"
-
-        r = execute_gemini_call(client, model, ctx)
-        parsed = clean_and_parse_horizon_json(r.text)
-
-        required_matrix_keys = [
-            "c_est_quoi", "est_ce_bon", "combien_ca_coute", "est_ce_disponible",
-            "qu_en_pensent_les_gens", "quelles_sont_les_alternatives",
-            "quels_sont_les_risques", "quelle_option_est_recommandee"
-        ]
+            r = call_openai(client, model_key, ctx)
+            parsed = clean_and_parse_horizon_json(r)
 
         has_response   = "response" in parsed and parsed["response"]
         has_attributes = "attributes" in parsed and isinstance(parsed["attributes"], list)
-        has_matrix     = "matrix" in parsed and isinstance(parsed["matrix"], dict) and all(
-            k in parsed["matrix"] for k in required_matrix_keys
+        has_matrix     = (
+            "matrix" in parsed
+            and isinstance(parsed["matrix"], dict)
+            and all(k in parsed["matrix"] for k in required_matrix_keys)
         )
 
         if not has_response or not has_attributes or not has_matrix:
-            print(f"[HORIZON AGENT] Tentative {attempt} - structure incomplete. Relancement...")
+            print(f"[HORIZON] Tentative {attempt} - structure incomplete. Relancement...")
+            lock_model(model_key)
             return extract_horizon_result(query, ctx, attempt + 1, max_attempts)
+
+        if attempt == 3:
+            increment_failover_count()
 
         return parsed
 
     except Exception as e:
-        print(f"[HORIZON AGENT] Erreur tentative {attempt}: {e}")
+        print(f"[HORIZON] Erreur tentative {attempt} ({model_key}): {e}")
+        lock_model(model_key)
         return extract_horizon_result(query, ctx, attempt + 1, max_attempts)
 
 
@@ -678,24 +732,26 @@ def horizon():
 
         ctx = prepare_shared_context(data, source_override="horizonweb")
 
-        if ctx["user_tier"] == "connected_free":
-            if get_failover_count() >= MAX_FREE_FAILOVERS:
-                return jsonify({
-                    "response": "Ouf, mon sillage Horizon sature ! 😎",
-                    "attributes": ["quota_atteint"],
-                    "matrix": None
-                })
+        if ctx["user_tier"] != "connected_free":
+            # Paid : direct gemini paid sans boucle agentique
+            tier = ctx["user_tier"]
+            model_key = "gemini_paid_founder" if tier == "founder" else "gemini_paid_standard"
+            try:
+                r = call_gemini(client_gemini_paid, model_key, ctx)
+                return jsonify(clean_and_parse_horizon_json(r.text))
+            except Exception as e:
+                print(f"[HORIZON PAID] Echec ({e})")
+                return jsonify(ERR_HORIZON), 500
+
+        if get_failover_count() >= MAX_FREE_FAILOVERS:
+            return jsonify(ERR_QUOTA)
 
         result = extract_horizon_result(query, ctx)
         return jsonify(result)
 
     except Exception as e:
         print(f"Erreur critique /horizon: {e}")
-        return jsonify({
-            "response": "Systeme Horizon instable, l'axe n'a pas pu se stabiliser.",
-            "attributes": ["erreur_critique"],
-            "matrix": None
-        }), 500
+        return jsonify(ERR_HORIZON), 500
 
 
 if __name__ == "__main__":
