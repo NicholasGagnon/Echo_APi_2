@@ -11,6 +11,7 @@ from google.genai import types
 from openai import OpenAI
 from dotenv import load_dotenv
 
+# Import du prompt système dynamique de l'application
 from prompts import generate_system_prompt
 
 load_dotenv()
@@ -85,7 +86,7 @@ def normalize_tier(raw: str) -> str:
     if "basic"   in cleaned: return "basic"
     return "connected_free"
 
-# ── JSON PARSER ───────────────────────────────────────────────────────────────
+# ── PARSEUR JSON UNIVERSEL ET SÉCURISÉ ────────────────────────────────────────
 def clean_and_parse_json(raw_text):
     text = raw_text.strip()
     if text.startswith("```json"): text = text[7:]
@@ -94,25 +95,17 @@ def clean_and_parse_json(raw_text):
     text = text.strip()
 
     try:
-        parsed = json.loads(text)
-        if isinstance(parsed, dict) and "response" in parsed: return parsed
+        return json.loads(text)
     except Exception: pass
 
+    # Recherche d'un bloc JSON par regex si le formatage contient du texte parasite
     match = re.search(r'\{.*\}', text, re.DOTALL)
     if match:
         try:
-            parsed = json.loads(match.group(0))
-            if isinstance(parsed, dict) and "response" in parsed: return parsed
+            return json.loads(match.group(0))
         except Exception: pass
 
-    if text:
-        clean_response = text
-        if '"response":' in text:
-            res_match = re.search(r'"response"\s*:\s*"([^"]+)"', text)
-            if res_match: clean_response = res_match.group(1)
-        return {"action": None, "response": clean_response}
-
-    raise ValueError("Reponse vide.")
+    raise ValueError("Le format extrait ne respecte pas un JSON valide.")
 
 # ── BUILD GEMINI CONTENTS ─────────────────────────────────────────────────────
 def build_gemini_contents(historique_reduit, image_b64, user_message, force_neutral_style):
@@ -233,17 +226,17 @@ def execute_openai_call(client, model, ctx, temp=0.7, timeout=7.0):
     )
     return res.choices[0].message.content
 
-# ── EXTRACTION AGENTIQUE (HORIZONWEB) ─────────────────────────────────────────
+# ── BOUCLE AGENTIQUE UNIVERSELLE HORIZON (AVEC CASCADES) ───────────────────────
 def extract_attributes_and_matrix(query, ctx, attempt=1, max_attempts=3):
     """
-    Boucle agentique d'HorizonWeb.
-    Applique les filtres en tâche de fond via le prompt système dédié,
-    détecte les attributs décisionnels et valide la structure des 8 piliers (Règle 10).
+    Validation et exécution agentique strict d'HorizonWeb (Règle 10).
+    En cas de format ou de clés manquantes, elle réexécute automatiquement l'appel.
+    Si Gemini Paid/Free échoue, elle bascule automatiquement sur les modèles alternatifs (GitHub/Nvidia).
     """
     if attempt > max_attempts:
         return {
             "matrix": {
-                "c_est_quoi": "Erreur d'extraction structurelle.",
+                "c_est_quoi": "Erreur de coherence structurelle persistante du signal.",
                 "est_ce_bon": "Le signal web est trop fragmenté pour être validé.",
                 "combien_ca_coute": "Non disponible.",
                 "est_ce_disponible": "Non disponible.",
@@ -255,26 +248,8 @@ def extract_attributes_and_matrix(query, ctx, attempt=1, max_attempts=3):
             "attributes": ["erreur_coherence"]
         }
 
-    horizon_directive = (
-        "\n\n[HORIZONWEB PROTOCOL]\n"
-        "Tu es en mode exploration extérieure. Tu dois obligatoirement renvoyer un objet JSON valide "
-        "contenant deux clés principales :\n"
-        "1) 'attributes': une liste de 3 à 5 mots-clés (en minuscules) représentant les critères décisionnels spécifiques détectés pour ce sujet précis.\n"
-        "2) 'matrix': un objet contenant exactement ces 8 clés :\n"
-        "   - 'c_est_quoi'\n"
-        "   - 'est_ce_bon'\n"
-        "   - 'combien_ca_coute'\n"
-        "   - 'est_ce_disponible'\n"
-        "   - 'qu_en_pensent_les_gens'\n"
-        "   - 'quelles_sont_les_alternatives'\n"
-        "   - 'quels_sont_les_risques'\n"
-        "   - 'quelle_option_est_recommandee'\n"
-        "Applique rigoureusement les 10 filtres universels (Source Primaire, Réalité Terrain, Coût Réel, etc.) pour épurer ton signal avant de remplir la matrice."
-    )
-
-    ctx["system_prompt"] += horizon_directive
-
     try:
+        # Cascade 1 : Essai avec Gemini Paid ou Gemini Free
         if ctx["user_tier"] == "connected_free":
             model = "gemini-3.1-flash-lite"
             client = client_gemini_free if client_gemini_free else client_gemini_paid
@@ -282,31 +257,83 @@ def extract_attributes_and_matrix(query, ctx, attempt=1, max_attempts=3):
             model = "gemini-3.5-flash" if ctx["user_tier"] == "founder" else "gemini-3.1-flash-lite"
             client = client_gemini_paid
 
-        r = execute_gemini_call(client, model, ctx)
-        raw_text = r.text
+        if client:
+            try:
+                r = execute_gemini_call(client, model, ctx)
+                parsed_json = clean_and_parse_json(r.text)
+                return validate_and_format_horizon(parsed_json, query, ctx, attempt, max_attempts)
+            except Exception as e:
+                print(f"[HORIZON CASCADE] Échec Gemini ({e}). Bascule sur DeepSeek (GitHub)...")
 
-        parsed_json = clean_and_parse_json(raw_text)
+        # Cascade 2 (Failover) : DeepSeek V3 (GitHub)
+        if client_github:
+            try:
+                res_raw = execute_openai_call(client_github, "deepseek/DeepSeek-V3-0324", ctx)
+                parsed_json = clean_and_parse_json(res_raw)
+                return validate_and_format_horizon(parsed_json, query, ctx, attempt, max_attempts)
+            except Exception as e:
+                print(f"[HORIZON CASCADE] Échec DeepSeek ({e}). Bascule sur Moonshot (Nvidia)...")
 
-        if not isinstance(parsed_json, dict) or "matrix" not in parsed_json or "attributes" not in parsed_json:
-            print(f"[HORIZON AGENT] Tentative {attempt} échouée (Structure invalide). Relancement...")
-            return extract_attributes_and_matrix(query, ctx, attempt + 1, max_attempts)
+        # Cascade 3 (Failover) : Moonshot Kimi (Nvidia)
+        if client_nvidia:
+            try:
+                res_raw = execute_openai_call(client_nvidia, "moonshotai/kimi-k2.6", ctx)
+                parsed_json = clean_and_parse_json(res_raw)
+                return validate_and_format_horizon(parsed_json, query, ctx, attempt, max_attempts)
+            except Exception as e:
+                print(f"[HORIZON CASCADE] Échec Moonshot ({e}).")
 
-        required_keys = [
-            "c_est_quoi", "est_ce_bon", "combien_ca_coute", "est_ce_disponible",
-            "qu_en_pensent_les_gens", "quelles_sont_les_alternatives",
-            "quels_sont_les_risques", "quelle_option_est_recommandee"
-        ]
-        if not all(k in parsed_json["matrix"] for k in required_keys):
-            print(f"[HORIZON AGENT] Tentative {attempt} échouée (Clés manquantes dans la matrice). Relancement...")
-            return extract_attributes_and_matrix(query, ctx, attempt + 1, max_attempts)
-
-        return parsed_json
+        # Fallback ultime
+        raise ValueError("Aucun fournisseur d'IA n'est parvenu à traiter l'exploration Horizon.")
 
     except Exception as e:
-        print(f"[HORIZON AGENT] Erreur crash à la tentative {attempt}: {e}")
+        print(f"[HORIZON AGENT] Exception critique à la tentative {attempt}: {e}")
         return extract_attributes_and_matrix(query, ctx, attempt + 1, max_attempts)
 
-# ── ROUTE /export (inline, pas d'import externe) ──────────────────────────────
+def validate_and_format_horizon(parsed_json, query, ctx, attempt, max_attempts):
+    if not isinstance(parsed_json, dict) or "matrix" not in parsed_json or "attributes" not in parsed_json:
+        print(f"[HORIZON AGENT] Tentative {attempt} échouée (JSON ou clés absentes).")
+        return extract_attributes_and_matrix(query, ctx, attempt + 1, max_attempts)
+
+    required_keys = [
+        "c_est_quoi", "est_ce_bon", "combien_ca_coute", "est_ce_disponible",
+        "qu_en_pensent_les_gens", "quelles_sont_les_alternatives",
+        "quels_sont_les_risques", "quelle_option_est_recommandee"
+    ]
+    
+    # Validation d'intégrité de la Matrice Universelle
+    if not all(k in parsed_json["matrix"] for k in required_keys):
+        print(f"[HORIZON AGENT] Tentative {attempt} échouée (Champs manquants).")
+        return extract_attributes_and_matrix(query, ctx, attempt + 1, max_attempts)
+
+    return parsed_json
+
+# ── ROUTE /horizon ────────────────────────────────────────────────────────────
+@app.route("/horizon", methods=["POST"])
+def horizon():
+    try:
+        data = request.json or {}
+        query = data.get("query", "").strip()
+
+        if not query:
+            return jsonify({"error": "L'intention d'exploration est vide."}), 400
+
+        data["message"] = f"Fais une recherche web complète et extrait tout sur : {query}"
+
+        # On active la source "horizonweb" pour charger le prompt HORIZON_CORE_PROMPT
+        ctx = prepare_shared_context(data, source_override="horizonweb")
+
+        result = extract_attributes_and_matrix(query, ctx)
+        return jsonify(result)
+
+    except Exception as e:
+        print(f"Erreur critique sur la route /horizon: {e}")
+        return jsonify({
+            "matrix": {"quelle_option_est_recommandee": "Système Horizon instable, l'axe n'a pas pu se stabiliser."},
+            "attributes": ["erreur_critique"]
+        }), 500
+
+# ── ROUTE /export ─────────────────────────────────────────────────────────────
 @app.route("/export", methods=["POST"])
 def export_route():
     data   = request.get_json(silent=True) or {}
@@ -444,7 +471,7 @@ def chat():
         print(f"Erreur /chat: {e}")
         return jsonify({"action": None, "response": "Systeme instable, reessaie !"}), 500
 
-# ── ROUTE /books ──────────────────────────────────────────────────────────────
+# ── ROUTE /books (AVEC CASCADE INTEGRALE RESILIENTE) ──────────────────────────
 @app.route("/books", methods=["POST"])
 def books():
     try:
@@ -481,39 +508,66 @@ def books():
 
         gemini_history = []
         for msg in history[-10:]:
-            if msg.startswith("You: "):
-                gemini_history.append(types.Content(role="user",  parts=[types.Part(text=msg[5:])]))
+            if msg.startswith("You: ") or msg.startswith("Toi: "):
+                gemini_history.append(types.Content(role="user",  parts=[types.Part.from_text(text=msg[5:])]))
             elif msg.startswith("Echo: "):
-                gemini_history.append(types.Content(role="model", parts=[types.Part(text=msg[6:])]))
-        gemini_history.append(types.Content(role="user", parts=[types.Part(text=message)]))
+                gemini_history.append(types.Content(role="model", parts=[types.Part.from_text(text=msg[6:])]))
+        gemini_history.append(types.Content(role="user", parts=[types.Part.from_text(text=message)]))
 
+        # Cascade 1 : Gemini Paid ou Free
         client = client_gemini_paid if tier in ("premium", "ultra", "founder") else client_gemini_free
         model  = "gemini-2.0-flash" if tier in ("premium", "ultra", "founder") else "gemini-2.0-flash-lite"
         if client is None:
             client = client_gemini_paid
             model  = "gemini-2.0-flash-lite"
 
-        resp      = client.models.generate_content(
-            model=model, contents=gemini_history,
-            config=types.GenerateContentConfig(
-                system_instruction=system_prompt,
-                max_output_tokens=1200,
-                temperature=0.85,
-            )
-        )
-        full_text = resp.text or ""
+        if client:
+            try:
+                resp = client.models.generate_content(
+                    model=model, contents=gemini_history,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_prompt,
+                        max_output_tokens=1200,
+                        temperature=0.85,
+                    )
+                )
+                full_text = resp.text or ""
+                return handle_books_response(full_text, wants_inject)
+            except Exception as e:
+                print(f"[BOOKS CASCADE] Échec Gemini ({e}). Bascule sur DeepSeek (GitHub)...")
 
-        if wants_inject and "<<<INJECT_TEXT>>>" in full_text:
-            parts      = full_text.split("<<<INJECT_TEXT>>>")
-            response   = parts[0].strip()
-            inject_raw = parts[1].split("<<<END_INJECT>>>")[0].strip() if len(parts) > 1 else ""
-            return jsonify({"response": response or "Voici le passage.", "inject": True, "inject_text": inject_raw, "action": None})
+        # Cascade 2 : DeepSeek (GitHub)
+        if client_github:
+            try:
+                ctx_dummy = {"messages_openrouter": [{"role": "system", "content": system_prompt}] + [{"role": "user", "content": message}]}
+                res_raw = execute_openai_call(client_github, "deepseek/DeepSeek-V3-0324", ctx_dummy)
+                return handle_books_response(res_raw, wants_inject)
+            except Exception as e:
+                print(f"[BOOKS CASCADE] Échec DeepSeek ({e}). Bascule sur Moonshot (Nvidia)...")
 
-        return jsonify({"response": full_text, "inject": False, "action": None})
+        # Cascade 3 : Nvidia Kimi
+        if client_nvidia:
+            try:
+                ctx_dummy = {"messages_openrouter": [{"role": "system", "content": system_prompt}] + [{"role": "user", "content": message}]}
+                res_raw = execute_openai_call(client_nvidia, "moonshotai/kimi-k2.6", ctx_dummy)
+                return handle_books_response(res_raw, wants_inject)
+            except Exception as e:
+                print(f"[BOOKS CASCADE] Échec Moonshot ({e}).")
+
+        return jsonify({"response": "Studio d'écriture instable, réessayez !", "inject": False, "action": None}), 500
 
     except Exception as e:
         print(f"Erreur /books: {e}")
         return jsonify({"response": "Studio instable, reessaie !", "inject": False, "action": None}), 500
+
+def handle_books_response(full_text, wants_inject):
+    if wants_inject and "<<<INJECT_TEXT>>>" in full_text:
+        parts      = full_text.split("<<<INJECT_TEXT>>>")
+        response   = parts[0].strip()
+        inject_raw = parts[1].split("<<<END_INJECT>>>")[0].strip() if len(parts) > 1 else ""
+        return jsonify({"response": response or "Voici le passage.", "inject": True, "inject_text": inject_raw, "action": None})
+
+    return jsonify({"response": full_text, "inject": False, "action": None})
 
 # ── ROUTE /home ───────────────────────────────────────────────────────────────
 @app.route("/home", methods=["POST"])
@@ -612,38 +666,6 @@ def history():
     except Exception as e:
         print(f"Erreur /history: {e}")
         return jsonify({"action": None, "response": "Historique instable !"}), 500
-
-# ── ROUTE /horizon ────────────────────────────────────────────────────────────
-@app.route("/horizon", methods=["POST"])
-def horizon():
-    try:
-        data = request.json or {}
-        query = data.get("query", "").strip()
-
-        if not query:
-            return jsonify({"error": "L'intention d'exploration est vide."}), 400
-
-        data["message"] = f"Fais une recherche web complète et extrait tout sur : {query}"
-
-        ctx = prepare_shared_context(data, source_override="horizonweb")
-
-        if ctx["user_tier"] == "connected_free":
-            if get_failover_count() >= MAX_FREE_FAILOVERS:
-                return jsonify({
-                    "matrix": {"quelle_option_est_recommandee": "Ouf, mon sillage Horizon sature ! 😎"},
-                    "attributes": ["quota_atteint"]
-                })
-
-        result = extract_attributes_and_matrix(query, ctx)
-
-        return jsonify(result)
-
-    except Exception as e:
-        print(f"Erreur critique sur la route /horizon: {e}")
-        return jsonify({
-            "matrix": {"quelle_option_est_recommandee": "Système Horizon instable, l'axe n'a pas pu se stabiliser."},
-            "attributes": ["erreur_critique"]
-        }), 500
 
 
 if __name__ == "__main__":
