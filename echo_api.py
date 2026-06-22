@@ -19,7 +19,6 @@ load_dotenv()
 app = Flask(__name__)
 CORS(app)
 
-# ── CLÉS D'API ────────────────────────────────────────────────────────────────
 API_KEY_FREE          = os.getenv("API_KEY_FREE", "").strip()
 API_KEY_PAID          = os.getenv("API_KEY_PAID", "").strip()
 OPENROUTER_API_KEY    = os.getenv("OPENROUTER_API_KEY", "").strip()
@@ -35,7 +34,6 @@ NVIDIA_BASE_URL     = "https://integrate.api.nvidia.com/v1"
 GROQ_BASE_URL       = "https://api.groq.com/openai/v1"
 CLOUDFLARE_BASE_URL = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/v1"
 
-# ── CLIENTS ───────────────────────────────────────────────────────────────────
 client_gemini_free  = genai.Client(api_key=API_KEY_FREE)  if API_KEY_FREE  else None
 client_gemini_paid  = genai.Client(api_key=API_KEY_PAID)  if API_KEY_PAID  else None
 client_openrouter   = OpenAI(base_url=OPENROUTER_BASE_URL, api_key=OPENROUTER_API_KEY) if OPENROUTER_API_KEY else None
@@ -44,7 +42,6 @@ client_nvidia       = OpenAI(base_url=NVIDIA_BASE_URL,     api_key=NVIDIA_API_KE
 client_groq         = OpenAI(base_url=GROQ_BASE_URL,        api_key=GROQ_API_KEY)        if GROQ_API_KEY       else None
 client_cloudflare   = OpenAI(base_url=CLOUDFLARE_BASE_URL, api_key=CLOUDFLARE_API_TOKEN) if CLOUDFLARE_API_TOKEN else None
 
-# ── FILET DE SÉCURITÉ CONNECTED_FREE ─────────────────────────────────────────
 GLOBAL_FAILOVER_MEMORY_COUNT = 0
 MAX_FREE_FAILOVERS = 200
 
@@ -57,7 +54,6 @@ def increment_failover_count():
     GLOBAL_FAILOVER_MEMORY_COUNT += 1
     print(f"[FAILOVER FILET] {GLOBAL_FAILOVER_MEMORY_COUNT} / {MAX_FREE_FAILOVERS}")
 
-# ── GESTION DES LOCKS DE MODELES ─────────────────────────────────────────────
 MODELS_LOCK_REGISTRY = {}
 
 def is_model_locked(model_name: str) -> bool:
@@ -73,7 +69,6 @@ def lock_model(model_name: str):
     MODELS_LOCK_REGISTRY[model_name] = datetime.now() + timedelta(seconds=60)
     print(f"[LOCK] {model_name} hors circuit 60s.")
 
-# ── NORMALISATION DU TIER ─────────────────────────────────────────────────────
 VALID_TIERS = {"connected_free", "basic", "premium", "ultra", "founder"}
 
 def normalize_tier(raw: str) -> str:
@@ -86,7 +81,6 @@ def normalize_tier(raw: str) -> str:
     if "basic"   in cleaned: return "basic"
     return "connected_free"
 
-# ── PARSEUR JSON UNIVERSEL ET SÉCURISÉ ────────────────────────────────────────
 def clean_and_parse_json(raw_text):
     text = raw_text.strip()
     if text.startswith("```json"): text = text[7:]
@@ -98,7 +92,6 @@ def clean_and_parse_json(raw_text):
         return json.loads(text)
     except Exception: pass
 
-    # Recherche d'un bloc JSON par regex si le formatage contient du texte parasite
     match = re.search(r'\{.*\}', text, re.DOTALL)
     if match:
         try:
@@ -107,7 +100,6 @@ def clean_and_parse_json(raw_text):
 
     raise ValueError("Le format extrait ne respecte pas un JSON valide.")
 
-# ── BUILD GEMINI CONTENTS ─────────────────────────────────────────────────────
 def build_gemini_contents(historique_reduit, image_b64, user_message, force_neutral_style):
     contents = []
     for msg in historique_reduit:
@@ -138,7 +130,6 @@ def build_gemini_contents(historique_reduit, image_b64, user_message, force_neut
     contents.append({"role": "user", "parts": last_parts})
     return contents
 
-# ── PREPARE SHARED CONTEXT ────────────────────────────────────────────────────
 def prepare_shared_context(data, source_override=None):
     user_message     = data.get("message", "")
     calendar_events  = data.get("calendarEvents", {})
@@ -209,7 +200,6 @@ def prepare_shared_context(data, source_override=None):
         "user_tier": user_tier,
     }
 
-# ── EXECUTEURS ────────────────────────────────────────────────────────────────
 def execute_gemini_call(client, model, ctx):
     return client.models.generate_content(
         model=model, contents=ctx["gemini_contents"],
@@ -226,27 +216,58 @@ def execute_openai_call(client, model, ctx, temp=0.7, timeout=7.0):
     )
     return res.choices[0].message.content
 
-# ── BOUCLE AGENTIQUE UNIVERSELLE HORIZON (AVEC CASCADES) ───────────────────────
-def extract_attributes_and_matrix(query, ctx, attempt=1, max_attempts=3):
+def extract_attributes_and_matrix(query, ctx, lang_target="fr", attempt=1, max_attempts=3):
     """
-    Validation et exécution agentique strict d'HorizonWeb (Règle 10).
-    En cas de format ou de clés manquantes, elle réexécute automatiquement l'appel.
-    Si Gemini Paid/Free échoue, elle bascule automatiquement sur les modèles alternatifs (GitHub/Nvidia).
+    Validation et exécution agentique strict d'HorizonWeb.
+    S'assure que la réponse finale est extrêmement riche en détails opérationnels concrets
+    (Horaires exacts, Heures d'ouverture, adresses, prix complets, versions)
+    et alignée sur la langue demandée sans verbiage philosophique.
     """
     if attempt > max_attempts:
+        fallback_msg = (
+            "Erreur de cohérence structurelle du signal." if lang_target == "fr"
+            else "Structural signal coherence error."
+        )
         return {
             "matrix": {
-                "c_est_quoi": "Erreur de coherence structurelle persistante du signal.",
+                "c_est_quoi": fallback_msg,
                 "est_ce_bon": "Le signal web est trop fragmenté pour être validé.",
-                "combien_ca_coute": "Non disponible.",
-                "est_ce_disponible": "Non disponible.",
+                "combien_ca_coute": "Non disponible / Not available.",
+                "est_ce_disponible": "Non disponible / Not available.",
                 "qu_en_pensent_les_gens": "Données incohérentes.",
                 "quelles_sont_les_alternatives": "Non disponible.",
-                "quels_sont_les_risques": "Instabilité du flux détectée.",
-                "quelle_option_est_recommandee": "Echo a interrompu la boucle pour cause d'incohérence persistante."
+                "quels_sont_les_risques": "Instabilité détectée.",
+                "quelle_option_est_recommandee": "Echo a interrompu la boucle pour cause d'incohérence."
             },
             "attributes": ["erreur_coherence"]
         }
+
+    # Injection du protocole d'extraction ultra-opérationnel
+    ctx["system_prompt"] += f"""
+
+[HORIZONWEB CORE PROTOCOL]
+You must absolutely output a valid JSON containing 'attributes' and 'matrix' keys in the requested language: '{lang_target}'.
+
+CRITICAL DIRECTIVE ON OPERATIONAL DETAILS:
+- ALWAYS extract extremely precise facts: exact HOURS of operation (heures d'ouverture), precise addresses, real net pricing (prix réel), direct versions, and conditions.
+- If you are analyzing a place, a restaurant, or a local service, finding the hours of operation and precise address is YOUR HIGHEST PRIORITY.
+- Cut all high-level philosophical prose, general introductions, marketing fluff or generalities. Give hard facts, real numbers, and precise operational field data.
+
+JSON SCHEMA REQUIREMENT (Translate the keys' contents, but keep the keys exactly as defined below in lowercase):
+{{
+  "attributes": ["attribute1", "attribute2", "attribute3"],
+  "matrix": {{
+    "c_est_quoi": "De quoi il s'agit de manière brève et nette (sans blabla).",
+    "est_ce_bon": "Évaluation de la qualité, de la performance et de la réputation de l'offre.",
+    "combien_ca_coute": "Tarifs réels, frais masqués et coûts d'accès.",
+    "est_ce_disponible": "Où le trouver, conditions d'accès physiques/numériques, HEURES D'OUVERTURE / HORAIRES (si applicable).",
+    "qu_en_pensent_les_gens": "Réalité du terrain : compilation des retours Reddit et forums spécialisés.",
+    "quelles_sont_les_alternatives": "Deux options concurrentes réelles et viables.",
+    "quels_sont_les_risques": "Contraintes réelles, limites, pièges ou défauts critiques.",
+    "quelle_option_est_recommandee": "Position claire, tranchée et argumentée d'Echo."
+  }}
+}}
+"""
 
     try:
         # Cascade 1 : Essai avec Gemini Paid ou Gemini Free
@@ -261,7 +282,7 @@ def extract_attributes_and_matrix(query, ctx, attempt=1, max_attempts=3):
             try:
                 r = execute_gemini_call(client, model, ctx)
                 parsed_json = clean_and_parse_json(r.text)
-                return validate_and_format_horizon(parsed_json, query, ctx, attempt, max_attempts)
+                return validate_and_format_horizon(parsed_json, query, ctx, lang_target, attempt, max_attempts)
             except Exception as e:
                 print(f"[HORIZON CASCADE] Échec Gemini ({e}). Bascule sur DeepSeek (GitHub)...")
 
@@ -270,7 +291,7 @@ def extract_attributes_and_matrix(query, ctx, attempt=1, max_attempts=3):
             try:
                 res_raw = execute_openai_call(client_github, "deepseek/DeepSeek-V3-0324", ctx)
                 parsed_json = clean_and_parse_json(res_raw)
-                return validate_and_format_horizon(parsed_json, query, ctx, attempt, max_attempts)
+                return validate_and_format_horizon(parsed_json, query, ctx, lang_target, attempt, max_attempts)
             except Exception as e:
                 print(f"[HORIZON CASCADE] Échec DeepSeek ({e}). Bascule sur Moonshot (Nvidia)...")
 
@@ -279,21 +300,20 @@ def extract_attributes_and_matrix(query, ctx, attempt=1, max_attempts=3):
             try:
                 res_raw = execute_openai_call(client_nvidia, "moonshotai/kimi-k2.6", ctx)
                 parsed_json = clean_and_parse_json(res_raw)
-                return validate_and_format_horizon(parsed_json, query, ctx, attempt, max_attempts)
+                return validate_and_format_horizon(parsed_json, query, ctx, lang_target, attempt, max_attempts)
             except Exception as e:
                 print(f"[HORIZON CASCADE] Échec Moonshot ({e}).")
 
-        # Fallback ultime
         raise ValueError("Aucun fournisseur d'IA n'est parvenu à traiter l'exploration Horizon.")
 
     except Exception as e:
         print(f"[HORIZON AGENT] Exception critique à la tentative {attempt}: {e}")
-        return extract_attributes_and_matrix(query, ctx, attempt + 1, max_attempts)
+        return extract_attributes_and_matrix(query, ctx, lang_target, attempt + 1, max_attempts)
 
-def validate_and_format_horizon(parsed_json, query, ctx, attempt, max_attempts):
+def validate_and_format_horizon(parsed_json, query, ctx, lang_target, attempt, max_attempts):
     if not isinstance(parsed_json, dict) or "matrix" not in parsed_json or "attributes" not in parsed_json:
         print(f"[HORIZON AGENT] Tentative {attempt} échouée (JSON ou clés absentes).")
-        return extract_attributes_and_matrix(query, ctx, attempt + 1, max_attempts)
+        return extract_attributes_and_matrix(query, ctx, lang_target, attempt + 1, max_attempts)
 
     required_keys = [
         "c_est_quoi", "est_ce_bon", "combien_ca_coute", "est_ce_disponible",
@@ -301,19 +321,18 @@ def validate_and_format_horizon(parsed_json, query, ctx, attempt, max_attempts):
         "quels_sont_les_risques", "quelle_option_est_recommandee"
     ]
     
-    # Validation d'intégrité de la Matrice Universelle
     if not all(k in parsed_json["matrix"] for k in required_keys):
         print(f"[HORIZON AGENT] Tentative {attempt} échouée (Champs manquants).")
-        return extract_attributes_and_matrix(query, ctx, attempt + 1, max_attempts)
+        return extract_attributes_and_matrix(query, ctx, lang_target, attempt + 1, max_attempts)
 
     return parsed_json
 
-# ── ROUTE /horizon ────────────────────────────────────────────────────────────
 @app.route("/horizon", methods=["POST"])
 def horizon():
     try:
         data = request.json or {}
         query = data.get("query", "").strip()
+        lang_target = data.get("lang", "fr").strip().lower()
 
         if not query:
             return jsonify({"error": "L'intention d'exploration est vide."}), 400
@@ -323,7 +342,7 @@ def horizon():
         # On active la source "horizonweb" pour charger le prompt HORIZON_CORE_PROMPT
         ctx = prepare_shared_context(data, source_override="horizonweb")
 
-        result = extract_attributes_and_matrix(query, ctx)
+        result = extract_attributes_and_matrix(query, ctx, lang_target=lang_target)
         return jsonify(result)
 
     except Exception as e:
@@ -333,7 +352,6 @@ def horizon():
             "attributes": ["erreur_critique"]
         }), 500
 
-# ── ROUTE /export ─────────────────────────────────────────────────────────────
 @app.route("/export", methods=["POST"])
 def export_route():
     data   = request.get_json(silent=True) or {}
@@ -419,7 +437,6 @@ def export_route():
         print(f"[EXPORT ERROR] {fmt}: {e}")
         return jsonify({"error": str(e)}), 500
 
-# ── ROUTE /chat ───────────────────────────────────────────────────────────────
 @app.route("/chat", methods=["POST"])
 def chat():
     try:
@@ -471,7 +488,6 @@ def chat():
         print(f"Erreur /chat: {e}")
         return jsonify({"action": None, "response": "Systeme instable, reessaie !"}), 500
 
-# ── ROUTE /books (AVEC CASCADE INTEGRALE RESILIENTE) ──────────────────────────
 @app.route("/books", methods=["POST"])
 def books():
     try:
@@ -514,7 +530,6 @@ def books():
                 gemini_history.append(types.Content(role="model", parts=[types.Part.from_text(text=msg[6:])]))
         gemini_history.append(types.Content(role="user", parts=[types.Part.from_text(text=message)]))
 
-        # Cascade 1 : Gemini Paid ou Free
         client = client_gemini_paid if tier in ("premium", "ultra", "founder") else client_gemini_free
         model  = "gemini-2.0-flash" if tier in ("premium", "ultra", "founder") else "gemini-2.0-flash-lite"
         if client is None:
@@ -536,7 +551,6 @@ def books():
             except Exception as e:
                 print(f"[BOOKS CASCADE] Échec Gemini ({e}). Bascule sur DeepSeek (GitHub)...")
 
-        # Cascade 2 : DeepSeek (GitHub)
         if client_github:
             try:
                 ctx_dummy = {"messages_openrouter": [{"role": "system", "content": system_prompt}] + [{"role": "user", "content": message}]}
@@ -545,7 +559,6 @@ def books():
             except Exception as e:
                 print(f"[BOOKS CASCADE] Échec DeepSeek ({e}). Bascule sur Moonshot (Nvidia)...")
 
-        # Cascade 3 : Nvidia Kimi
         if client_nvidia:
             try:
                 ctx_dummy = {"messages_openrouter": [{"role": "system", "content": system_prompt}] + [{"role": "user", "content": message}]}
@@ -562,14 +575,13 @@ def books():
 
 def handle_books_response(full_text, wants_inject):
     if wants_inject and "<<<INJECT_TEXT>>>" in full_text:
-        parts      = full_text.split("<<<INJECT_TEXT>>>")
-        response   = parts[0].strip()
+        parts = full_text.split("<<<INJECT_TEXT>>>")
+        response = parts[0].strip()
         inject_raw = parts[1].split("<<<END_INJECT>>>")[0].strip() if len(parts) > 1 else ""
         return jsonify({"response": response or "Voici le passage.", "inject": True, "inject_text": inject_raw, "action": None})
 
     return jsonify({"response": full_text, "inject": False, "action": None})
 
-# ── ROUTE /home ───────────────────────────────────────────────────────────────
 @app.route("/home", methods=["POST"])
 def home():
     try:
@@ -618,7 +630,6 @@ def home():
         print(f"Erreur /home: {e}")
         return jsonify({"action": None, "response": "Accueil instable !"}), 500
 
-# ── ROUTE /history ────────────────────────────────────────────────────────────
 @app.route("/history", methods=["POST"])
 def history():
     try:
