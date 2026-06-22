@@ -20,14 +20,15 @@ CORS(app)
 
 # ── MODELES VALIDES — NE PAS MODIFIER SANS TESTER ────────────────────────────
 MODELS = {
-    # Gratuits
+    # Gratuits Gemini
     "gemini_free_1":    "gemini-3.1-flash-lite",
     "gemini_free_2":    "gemini-2.5-flash-lite",
-    "deepseek":         "deepseek/DeepSeek-V3-0324",
-    "kimi":             "moonshotai/kimi-k2.6",
-    "ernie":            "baidu/ernie-4.5-vl-424b-preview:free",
-    "glm":              "glm-4-flash",
-    "compound":         "compound-beta",
+    # Gratuits tiers
+    "deepseek":         "deepseek/DeepSeek-V3-0324",        # GitHub
+    "kimi":             "moonshotai/kimi-k2.6",              # NVIDIA
+    "nemotron":         "nvidia/nemotron-3-super-120b-a12b:free",  # OpenRouter
+    "glm":              "@cf/zai-org/glm-5.2",              # Cloudflare
+    "compound":         "compound-beta",                     # Groq
     # Payants
     "gemini_paid_founder":  "gemini-3.5-flash",
     "gemini_paid_ultra":    "gemini-3.1-flash-lite",
@@ -297,8 +298,23 @@ def call_gemini(client, model_key, ctx):
     )
 
 def call_openai(client, model_key, ctx, temp=0.7, timeout=15.0):
+    model_name = MODELS[model_key]
+    # Cloudflare utilise /ai/run/<model> et non /v1/chat/completions
+    if model_name.startswith("@cf/"):
+        import requests
+        cf_account = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
+        cf_token   = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
+        url = f"https://api.cloudflare.com/client/v4/accounts/{cf_account}/ai/run/{model_name}"
+        r = requests.post(
+            url,
+            json={"messages": ctx["messages_openai"][1:]},  # sans le system prompt
+            headers={"Authorization": f"Bearer {cf_token}"},
+            timeout=timeout
+        )
+        r.raise_for_status()
+        return r.json()["result"]["response"]
     res = client.chat.completions.create(
-        model=MODELS[model_key],
+        model=model_name,
         messages=ctx["messages_openai"],
         temperature=temp,
         timeout=timeout
@@ -473,7 +489,7 @@ def chat():
 
         steps = [
             (client_gemini_free, "gemini_free_1"),   # 1. Gemini 3.1 Flash-Lite gratuit
-            (client_nvidia,      "kimi"),             # 2. Kimi K2.6
+            (client_nvidia,      "kimi"),             # 2. Kimi K2.6 (NVIDIA)
             (client_gemini_paid, "gemini_free_2"),    # 3. Filet payant
         ]
         return jsonify(run_free_cascade(steps, ctx))
@@ -494,7 +510,7 @@ def home():
 
         steps = [
             (client_gemini_free, "gemini_free_2"),    # 1. Gemini 2.5 Flash-Lite gratuit
-            (client_openrouter,  "ernie"),            # 2. Ernie 4.5
+            (client_github,      "deepseek"),         # 2. DeepSeek (GitHub)
             (client_gemini_paid, "gemini_free_2"),    # 3. Filet payant
         ]
         return jsonify(run_free_cascade(steps, ctx))
@@ -515,7 +531,7 @@ def history():
 
         steps = [
             (client_groq,        "compound"),         # 1. Groq Compound
-            (client_cloudflare,  "glm"),              # 2. GLM 4.7 Flash
+            (client_openrouter,  "nemotron"),         # 2. Nemotron 120B (OpenRouter)
             (client_gemini_paid, "gemini_free_2"),    # 3. Filet payant
         ]
         return jsonify(run_free_cascade(steps, ctx))
@@ -535,7 +551,7 @@ def vitality():
             return jsonify(run_paid_cascade(ctx))
 
         steps = [
-            (client_cloudflare,  "glm"),              # 1. GLM 4.7 Flash
+            (client_cloudflare,  "glm"),              # 1. GLM 5.2 (Cloudflare)
             (client_groq,        "compound"),         # 2. Groq Compound
             (client_gemini_paid, "gemini_free_2"),    # 3. Filet payant
         ]
@@ -631,8 +647,8 @@ def books():
 
             full_text = ""
             books_steps = [
-                (client_openrouter, "ernie"),
-                (client_github,     "deepseek"),
+                (client_nvidia,      "kimi"),
+                (client_github,      "deepseek"),
                 (client_gemini_paid, "gemini_free_2"),
             ]
             for i, (client, model_key) in enumerate(books_steps):
