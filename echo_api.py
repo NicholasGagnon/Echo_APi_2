@@ -153,37 +153,7 @@ def clean_and_parse_horizon_json(raw_text):
             pass
     return {"response": text, "attributes": [], "matrix": None}
 
-def detect_horizon_hallucinations(parsed) -> bool:
-    """
-    Analyse la réponse pour détecter des patterns d'hallucinations typiques d'un LLM sous pression.
-    Retourne True si la réponse contient des données suspectes de triche.
-    """
-    response_text = parsed.get("response", "")
-    if not response_text:
-        return False
-
-    # 1. Détection des faux patterns d'URLs construites à la volée (ex: chalet + nom + .com)
-    # Si on trouve plusieurs urls suspectes construites exactement sur le modèle de domaines jetables
-    urls = re.findall(r'www\.[a-z0-9\-]+\.com', response_text.lower())
-    suspicious_domains = ["concept", "evasion", "serenite", "refuge", "vallee", "sommet", "foret"]
-    sus_count = sum(1 for url in urls if any(sus in url for sus in suspicious_domains))
-    if sus_count >= 3:
-        print(f"[VALIDATOR] Hallucination détectée : {sus_count} URLs génériques suspectes.")
-        return True
-
-    # 2. Détection de suites de prix trop parfaites (arithmétique suspecte)
-    # Cherche les chiffres suivis de $ ou € (ex: 180$, 190$, 200$)
-    prices = [int(p) for p in re.findall(r'(\d+)\s*[\$€]', response_text)]
-    if len(prices) >= 4:
-        # Calcule les écarts entre les prix successifs
-        diffs = [prices[i+1] - prices[i] for i in range(len(prices)-1)]
-        # Si tous les écarts sont exactement identiques (ex: progression constante de +10$ ou +20$)
-        if len(set(diffs)) == 1 and diffs[0] in [10, 20, 50]:
-            print(f"[VALIDATOR] Hallucination détectée : Suite de prix artificielle ({diffs[0]} d'écart constant).")
-            return True
-
-    return False
-
+def build_gemini_contents(historique_reduit, image_b64, user_message, force_neutral_style):
     contents = []
     for msg in historique_reduit:
         if not isinstance(msg, str) or msg.startswith("__IMAGE__:"):
@@ -675,7 +645,6 @@ def extract_horizon_result(query, ctx, attempt=1, max_attempts=3):
         else:
             r      = call_openai(client, model_key, ctx, temp=0.1, timeout=float(timeout))
             parsed = clean_and_parse_horizon_json(r)
-        
         has_response   = "response"   in parsed and parsed["response"]
         has_attributes = "attributes" in parsed and isinstance(parsed["attributes"], list)
         has_matrix     = (
@@ -683,16 +652,10 @@ def extract_horizon_result(query, ctx, attempt=1, max_attempts=3):
             and isinstance(parsed["matrix"], dict)
             and all(k in parsed["matrix"] for k in required_matrix_keys)
         )
-        
-        # On passe la réponse dans notre filtre anti-triche
-        is_hallucinated = detect_horizon_hallucinations(parsed) if (has_response and attempt < len(horizon_steps)) else False
-
-        if not has_response or not has_attributes or not has_matrix or is_hallucinated:
-            reason = "hallucination détectée" if is_hallucinated else "structure incomplète"
-            print(f"[HORIZON] Tentative {attempt} rejetée ({reason}). Verrouillage de {model_key}.")
+        if not has_response or not has_attributes or not has_matrix:
+            print(f"[HORIZON] Tentative {attempt} - structure incomplete.")
             lock_model(model_key)
             return extract_horizon_result(query, ctx, attempt + 1, max_attempts)
-            
         if attempt == len(horizon_steps):
             increment_failover_count()
         return parsed
