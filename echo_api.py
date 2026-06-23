@@ -186,105 +186,260 @@ def build_gemini_contents(historique_reduit, image_b64, user_message, force_neut
     contents.append({"role": "user", "parts": last_parts})
     return contents
 
-def extract_horizon_result(query, ctx, attempt=1, max_attempts=3):
-    if attempt > max_attempts:
-        return ERR_HORIZON
-        
-    # Liste des clés obligatoires demandées par le front-end pour la matrice Horizon
-    required_matrix_keys = [
-        "c_est_quoi", "est_ce_bon", "combien_ca_coute", "est_ce_disponible",
-        "qu_en_pensent_les_gens", "quelles_sont_les_alternatives",
-        "quels_sont_les_risques", "quelle_option_est_recommandee"
-    ]
-    
-    # Nouvelle cascade configurée selon tes directives
-    horizon_steps = [
-        (client_nvidia,      "kimi",                 20),  # Kimi Free (via NVIDIA) - 20s
-        (client_cloudflare,  "glm",                  20),  # GLM Free (via Cloudflare) - 20s
-        (client_gemini_paid, "gemini_paid_standard", 25),  # Gemini 2.5 Flash Lite Paid - 25s
-    ]
-    
-    if attempt > len(horizon_steps):
-        return ERR_HORIZON
-        
-    client, model_key, timeout = horizon_steps[attempt - 1]
-    
-    # Si le client n'est pas configuré ou si le modèle est temporairement verrouillé
-    if client is None or (attempt < len(horizon_steps) and is_model_locked(model_key)):
-        return extract_horizon_result(query, ctx, attempt + 1, max_attempts)
-        
-    try:
-        # Appel API selon le SDK requis
-        if client in (client_gemini_free, client_gemini_paid):
-            r = call_gemini(client, model_key, ctx, timeout=timeout)
-            parsed = clean_and_parse_horizon_json(r.text)
-        else:
-            r = call_openai(client, model_key, ctx, temp=0.1, timeout=float(timeout))
-            parsed = clean_and_parse_horizon_json(r)
-            
-        # Validation stricte de la structure JSON attendue
-        has_response   = "response"   in parsed and parsed["response"]
-        has_attributes = "attributes" in parsed and isinstance(parsed["attributes"], list)
-        has_matrix     = (
-            "matrix" in parsed
-            and isinstance(parsed["matrix"], dict)
-            and all(k in parsed["matrix"] for k in required_matrix_keys)
-        )
-        
-        if not has_response or not has_attributes or not has_matrix:
-            print(f"[HORIZON] Tentative {attempt} - structure incomplete.")
-            lock_model(model_key)
-            return extract_horizon_result(query, ctx, attempt + 1, max_attempts)
-            
-        # Si on a dû se rabattre sur le dernier modèle gratuit (ou payant si configuré ainsi), on incrémente le compteur global
-        if attempt == len(horizon_steps):
-            increment_failover_count()
-            
-        return parsed
-        
-    except Exception as e:
-        print(f"[HORIZON] Erreur tentative {attempt} ({model_key}): {e}")
-        lock_model(model_key)
-        return extract_horizon_result(query, ctx, attempt + 1, max_attempts)
+def prepare_shared_context(data, source_override=None):
+    user_message     = data.get("message", "")
+    calendar_events  = data.get("calendarEvents", {})
+    raw_history      = data.get("history", [])
+    memory_summary   = data.get("summary", "")
+    source           = source_override if source_override else data.get("source", "chat").lower().strip()
+    image_b64        = data.get("image", None)
+    selected_buttons = data.get("selectedButtons", [])
+    current_expenses = data.get("currentExpenses", [])
+    current_calories = data.get("currentCalories", [])
+    current_cycle    = data.get("currentCycle", "mois")
+    user_tier        = normalize_tier(data.get("userTier", "connected_free"))
 
-@app.route("/horizon", methods=["POST"])
-def horizon():
+    maintenant      = datetime.now()
+    date_aujourdhui = maintenant.strftime("%A %d %B %Y")
+    annee_en_cours  = maintenant.strftime("%Y")
+
+    filtered_calendar = {}
+    date_debut = (maintenant - timedelta(days=31)).date()
+    date_fin   = maintenant.date()
     try:
-        data  = request.json or {}
-        query = data.get("query", "").strip()
-        if not query:
-            return jsonify({"error": "L'intention d'exploration est vide."}), 400
-            
-        # Forçage du prompt système pour la structure JSON attendue
-        data["message"] = (
-            f"Fais une recherche web complete et extrait tout sur : {query}. "
-            f"Reponds OBLIGATOIREMENT en JSON valide avec les cles : response, attributes, matrix."
-        )
-        
-        ctx = prepare_shared_context(data, source_override="horizonweb")
-        
-        # Si l'utilisateur est un membre Premium/Ultra/Founder, on évite la cascade gratuite et on cible directement le modèle payant assigné
-        if ctx["user_tier"] != "connected_free":
-            tier      = ctx["user_tier"]
-            model_key = "gemini_paid_founder" if tier == "founder" else "gemini_paid_standard"
-            try:
-                r = call_gemini(client_gemini_paid, model_key, ctx, timeout=25)
-                return jsonify(clean_and_parse_horizon_json(r.text))
-            except Exception as e:
-                print(f"[HORIZON PAID] Echec ({e})")
-                return jsonify(ERR_HORIZON), 500
-                
-        # Sécurité anti-abus pour le niveau gratuit
-        if get_failover_count() >= MAX_FREE_FAILOVERS:
-            return jsonify(ERR_QUOTA)
-            
-        # Lancement de la nouvelle cascade
-        result = extract_horizon_result(query, ctx)
-        return jsonify(result)
-        
+        for date_str, events in calendar_events.items():
+            if re.match(r"^\d{4}-\d{2}-\d{2}$", date_str):
+                date_evt = datetime.strptime(date_str, "%Y-%m-%d").date()
+                if date_debut <= date_evt <= date_fin:
+                    filtered_calendar[date_str] = events
+            else:
+                filtered_calendar[date_str] = events
     except Exception as e:
-        print(f"Erreur critique /horizon: {e}")
-        return jsonify(ERR_HORIZON), 500
+        print(f"[WARN] Calendrier: {e}")
+        filtered_calendar = calendar_events
+
+    base_system_prompt = generate_system_prompt(
+        source=source,
+        selected_buttons=selected_buttons,
+        date_aujourdhui=date_aujourdhui,
+        annee_en_cours=annee_en_cours,
+        user_tier=user_tier,
+        filtered_calendar=filtered_calendar,
+        current_expenses=current_expenses,
+        current_calories=current_calories,
+        current_cycle=current_cycle
+    )
+
+    system_prompt = base_system_prompt
+
+    if memory_summary and user_tier not in ("connected_free", "basic"):
+        system_prompt += (
+            "\n\nLONG TERM MEMORY\n"
+            "================\n"
+            f"{memory_summary}\n"
+        )
+
+    system_prompt += "\n\nCRITICAL SAFETY DIRECTIVE: Only trigger actions explicitly demanded in the LATEST message."
+
+    taille_memoire    = 30 if user_tier in ["ultra", "founder"] else (15 if user_tier in ["basic", "premium"] else 5)
+    output_tokens      = 4096 if user_tier in ["ultra", "founder"] else (2048 if user_tier in ["basic", "premium"] else 1024)
+    historique_ajuste = raw_history[-taille_memoire:]
+    force_neutral      = len(selected_buttons) > 0 or source == "vitality"
+    gemini_contents   = build_gemini_contents(historique_ajuste, image_b64, user_message, force_neutral)
+
+    messages_openai = [{"role": "system", "content": system_prompt}]
+    for msg in historique_ajuste:
+        if not isinstance(msg, str) or msg.startswith("__IMAGE__:"):
+            continue
+        clean_content = msg.split(":", 1)[1].strip() if ":" in msg else msg.strip()
+        if "action limit reached" in clean_content.lower() or clean_content == "...":
+            continue
+        if msg.startswith("You:") or msg.startswith("Toi:"):
+            clean_content = re.sub(r'\s{3,}', ' ', clean_content).strip()
+            messages_openai.append({"role": "user", "content": clean_content})
+        elif msg.startswith("Echo:"):
+            try:
+                parsed = json.loads(clean_content)
+                clean_content = parsed.get("response", clean_content)
+            except Exception:
+                pass
+            messages_openai.append({"role": "assistant", "content": clean_content})
+    if user_message:
+        messages_openai.append({"role": "user", "content": user_message})
+
+    return {
+        "system_prompt":   system_prompt,
+        "output_tokens":   output_tokens,
+        "gemini_contents": gemini_contents,
+        "messages_openai": messages_openai,
+        "user_tier":       user_tier,
+    }
+
+def call_with_timeout(fn, timeout_sec):
+    result = [None]
+    error  = [None]
+
+    def target():
+        try:
+            result[0] = fn()
+        except Exception as e:
+            error[0] = e
+
+    t = threading.Thread(target=target, daemon=True)
+    t.start()
+    t.join(timeout=timeout_sec)
+
+    if t.is_alive():
+        raise TimeoutError(f"Timeout apres {timeout_sec}s")
+    if error[0]:
+        raise error[0]
+    return result[0]
+
+def call_gemini(client, model_key, ctx, timeout=2):
+    def fn():
+        return client.models.generate_content(
+            model=MODELS[model_key],
+            contents=ctx["gemini_contents"],
+            config=types.GenerateContentConfig(
+                system_instruction=ctx["system_prompt"],
+                max_output_tokens=ctx["output_tokens"],
+                temperature=0.1,
+            )
+        )
+    return call_with_timeout(fn, timeout)
+
+def call_openai(client, model_key, ctx, temp=0.1, timeout=2.0):
+    model_name = MODELS[model_key]
+    if model_name.startswith("@cf/"):
+        cf_account = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
+        cf_token   = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
+        url = f"https://api.cloudflare.com/client/v4/accounts/{cf_account}/ai/run/{model_name}"
+        r = _cf_session.post(
+            url,
+            json={"messages": ctx["messages_openai"][1:]},
+            headers={"Authorization": f"Bearer {cf_token}"},
+            timeout=timeout
+        )
+        r.raise_for_status()
+        return r.json()["result"]["response"]
+    res = client.chat.completions.create(
+        model=model_name,
+        messages=ctx["messages_openai"],
+        temperature=temp,
+        timeout=timeout
+    )
+    return res.choices[0].message.content
+
+def run_paid_cascade(ctx):
+    tier = ctx["user_tier"]
+    if tier == "founder":
+        primary, fallback = "gemini_paid_founder",  "gemini_paid_standard"
+    elif tier == "ultra":
+        primary, fallback = "gemini_paid_ultra",    "gemini_paid_standard"
+    else:
+        primary, fallback = "gemini_paid_standard", "gemini_paid_ultra"
+    try:
+        r = call_gemini(client_gemini_paid, primary, ctx, timeout=25)
+        return clean_and_parse_json(r.text)
+    except Exception as e:
+        print(f"[PAID] Echec {primary} ({e}), bascule {fallback}")
+    try:
+        r = call_gemini(client_gemini_paid, fallback, ctx, timeout=25)
+        return clean_and_parse_json(r.text)
+    except Exception as e:
+        print(f"[PAID] Echec {fallback} ({e})")
+    return ERR_FINAL
+
+def run_free_cascade(steps, ctx, parser=None):
+    if parser is None:
+        parser = clean_and_parse_json
+    if get_failover_count() >= MAX_FREE_FAILOVERS:
+        return ERR_QUOTA
+    for i, (client, model_key, timeout) in enumerate(steps):
+        if client is None:
+            continue
+        if is_model_locked(model_key):
+            continue
+        is_last = (i == len(steps) - 1)
+        try:
+            if client in (client_gemini_free, client_gemini_paid):
+                r      = call_gemini(client, model_key, ctx, timeout=timeout)
+                result = parser(r.text)
+            else:
+                r      = call_openai(client, model_key, ctx, temp=0.1, timeout=float(timeout))
+                result = parser(r)
+            if is_last:
+                increment_failover_count()
+            return result
+        except Exception as e:
+            print(f"[FREE] Echec {model_key} ({e})")
+            lock_model(model_key)
+    return ERR_FINAL
+
+@app.route("/ping")
+def ping():
+    return jsonify({"status": "awake"})
+
+@app.route("/export", methods=["POST"])
+def export_route():
+    data  = request.get_json(silent=True) or {}
+    fmt   = (data.get("format") or "").lower().strip()
+    title = (data.get("title")  or "Document Echo AI").strip()
+    html  = (data.get("html")   or "").strip()
+    if not html:
+        return jsonify({"error": "Contenu vide."}), 400
+    safe = "".join(c for c in title if c.isalnum() or c in " _-").strip().replace(" ", "_") or "document"
+    try:
+        if fmt == "txt":
+            txt = re.sub(r'<[^>]+>', '', html).replace('&nbsp;', ' ').replace('&amp;', '&')
+            return send_file(io.BytesIO(txt.encode("utf-8")), mimetype="text/plain", as_attachment=True, download_name=f"{safe}.txt")
+        elif fmt == "pdf":
+            try:
+                from xhtml2pdf import pisa
+                styled = f"<html><head><meta charset=\"utf-8\"><style>body{{font-family:sans-serif;font-size:11pt;line-height:1.6;color:#18181b}}h1{{font-size:22pt;border-bottom:1px solid #e4e4e7;padding-bottom:8px}}p{{margin-bottom:12px;text-align:justify}}</style></head><body><h1>{title}</h1>{html}</body></html>"
+                buf = io.BytesIO()
+                pisa.CreatePDF(io.StringIO(styled), dest=buf)
+                buf.seek(0)
+                return send_file(buf, mimetype="application/pdf", as_attachment=True, download_name=f"{safe}.pdf")
+            except ImportError:
+                return jsonify({"error": "xhtml2pdf non installe."}), 503
+        elif fmt == "docx":
+            try:
+                from docx import Document
+                from docx.shared import Pt, RGBColor
+                from docx.enum.text import WD_ALIGN_PARAGRAPH
+                doc = Document()
+                t = doc.add_paragraph(); r = t.add_run(title)
+                r.font.size = Pt(24); r.font.bold = True; r.font.color.rgb = RGBColor(15, 23, 42)
+                clean = re.sub(r'<[^>]+>', '\n', html).replace('&nbsp;', ' ')
+                for line in clean.split('\n'):
+                    line = line.strip()
+                    if line:
+                        p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+                        run = p.add_run(line); run.font.size = Pt(11)
+                buf = io.BytesIO(); doc.save(buf); buf.seek(0)
+                return send_file(buf, mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document", as_attachment=True, download_name=f"{safe}.docx")
+            except ImportError:
+                return jsonify({"error": "python-docx non installe."}), 503
+        elif fmt == "epub":
+            try:
+                from ebooklib import epub
+                book = epub.EpubBook()
+                book.set_identifier(f"echo-{int(datetime.now().timestamp())}")
+                book.set_title(title); book.set_language("fr"); book.add_author("Echo AI")
+                ch = epub.EpubHtml(title=title, file_name="ch1.xhtml", lang="fr")
+                ch.content = f"<html><body><h1>{title}</h1>{html}</body></html>"
+                book.add_item(ch); book.toc = (epub.Link("ch1.xhtml", title, "ch1"),)
+                book.spine = ["nav", ch]; book.add_item(epub.EpubNav()); book.add_item(epub.EpubNcx())
+                buf = io.BytesIO(); epub.write_epub(buf, book, {}); buf.seek(0)
+                return send_file(buf, mimetype="application/epub+zip", as_attachment=True, download_name=f"{safe}.epub")
+            except ImportError:
+                return jsonify({"error": "EbookLib non installe."}), 503
+        else:
+            return jsonify({"error": f"Format '{fmt}' non supporte."}), 400
+    except Exception as e:
+        print(f"[EXPORT ERROR] {fmt}: {e}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/home", methods=["POST"])
 def home():
