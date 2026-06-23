@@ -73,7 +73,7 @@ def increment_failover_count():
     GLOBAL_FAILOVER_MEMORY_COUNT += 1
     print(f"[FAILOVER FILET] {GLOBAL_FAILOVER_MEMORY_COUNT} / {MAX_FREE_FAILOVERS}")
 
-# ── LOCKS DE MODELES (20s) ─────────────────────────────────────────────────────
+# ── LOCKS DE MODELES (60s) ─────────────────────────────────────────────────────
 MODELS_LOCK_REGISTRY = {}
 
 def is_model_locked(model_key: str) -> bool:
@@ -86,8 +86,8 @@ def is_model_locked(model_key: str) -> bool:
     return False
 
 def lock_model(model_key: str):
-    MODELS_LOCK_REGISTRY[model_key] = datetime.now() + timedelta(seconds=20)
-    print(f"[LOCK] {model_key} hors circuit 20s.")
+    MODELS_LOCK_REGISTRY[model_key] = datetime.now() + timedelta(seconds=60)
+    print(f"[LOCK] {model_key} hors circuit 60s.")
 
 # ── NORMALISATION DU TIER ──────────────────────────────────────────────────────
 VALID_TIERS = {"connected_free", "basic", "premium", "ultra", "founder"}
@@ -266,11 +266,11 @@ def prepare_shared_context(data, source_override=None):
         "\n\nCRITICAL SAFETY DIRECTIVE: Only trigger actions explicitly demanded in the LATEST message."
     )
 
-    taille_memoire  = 30 if user_tier in ["ultra", "founder"] else (15 if user_tier in ["basic", "premium"] else 5)
-    output_tokens   = 4096 if user_tier in ["ultra", "founder"] else (2048 if user_tier in ["basic", "premium"] else 1024)
+    taille_memoire    = 30 if user_tier in ["ultra", "founder"] else (15 if user_tier in ["basic", "premium"] else 5)
+    output_tokens     = 4096 if user_tier in ["ultra", "founder"] else (2048 if user_tier in ["basic", "premium"] else 1024)
     historique_ajuste = raw_history[-taille_memoire:]
-    force_neutral   = len(selected_buttons) > 0 or source == "vitality"
-    gemini_contents = build_gemini_contents(historique_ajuste, image_b64, user_message, force_neutral)
+    force_neutral     = len(selected_buttons) > 0 or source == "vitality"
+    gemini_contents   = build_gemini_contents(historique_ajuste, image_b64, user_message, force_neutral)
 
     messages_openai = [{"role": "system", "content": system_prompt}]
     for msg in historique_ajuste:
@@ -301,18 +301,19 @@ def prepare_shared_context(data, source_override=None):
     }
 
 # ── EXECUTEURS ─────────────────────────────────────────────────────────────────
-def call_gemini(client, model_key, ctx):
+def call_gemini(client, model_key, ctx, timeout=None):
+    config_kwargs = {
+        "system_instruction": ctx["system_prompt"],
+        "max_output_tokens":  ctx["output_tokens"],
+        "temperature":        0.1,
+    }
     return client.models.generate_content(
         model=MODELS[model_key],
         contents=ctx["gemini_contents"],
-        config=types.GenerateContentConfig(
-            system_instruction=ctx["system_prompt"],
-            max_output_tokens=ctx["output_tokens"],
-            temperature=0.2,
-        )
+        config=types.GenerateContentConfig(**config_kwargs)
     )
 
-def call_openai(client, model_key, ctx, temp=0.4, timeout=15.0):
+def call_openai(client, model_key, ctx, temp=0.1, timeout=2.0):
     model_name = MODELS[model_key]
 
     if model_name.startswith("@cf/"):
@@ -362,6 +363,7 @@ def run_paid_cascade(ctx):
     return ERR_FINAL
 
 # ── CASCADE FREE GENERIQUE ─────────────────────────────────────────────────────
+# steps = liste de (client, model_key, timeout_secondes)
 def run_free_cascade(steps, ctx, parser=None):
     if parser is None:
         parser = clean_and_parse_json
@@ -369,7 +371,7 @@ def run_free_cascade(steps, ctx, parser=None):
     if get_failover_count() >= MAX_FREE_FAILOVERS:
         return ERR_QUOTA
 
-    for i, (client, model_key) in enumerate(steps):
+    for i, (client, model_key, timeout) in enumerate(steps):
         if client is None:
             continue
         if is_model_locked(model_key):
@@ -377,10 +379,10 @@ def run_free_cascade(steps, ctx, parser=None):
         is_last = (i == len(steps) - 1)
         try:
             if client in (client_gemini_free, client_gemini_paid):
-                r      = call_gemini(client, model_key, ctx)
+                r      = call_gemini(client, model_key, ctx, timeout=timeout)
                 result = parser(r.text)
             else:
-                r      = call_openai(client, model_key, ctx)
+                r      = call_openai(client, model_key, ctx, temp=0.1, timeout=timeout)
                 result = parser(r)
             if is_last:
                 increment_failover_count()
@@ -448,9 +450,9 @@ def export_route():
                 for line in clean.split('\n'):
                     line = line.strip()
                     if line:
-                        p           = doc.add_paragraph()
-                        p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-                        run         = p.add_run(line)
+                        p             = doc.add_paragraph()
+                        p.alignment   = WD_ALIGN_PARAGRAPH.JUSTIFY
+                        run           = p.add_run(line)
                         run.font.size = Pt(11)
                 buf = io.BytesIO()
                 doc.save(buf)
@@ -494,6 +496,7 @@ def export_route():
         return jsonify({"error": str(e)}), 500
 
 # ── ROUTE /chat ────────────────────────────────────────────────────────────────
+# gemini_free_1  2s → kimi       2s → glm      3s → compound   2s → gemini_paid_standard 25s
 @app.route("/chat", methods=["POST"])
 def chat():
     try:
@@ -504,9 +507,11 @@ def chat():
             return jsonify(run_paid_cascade(ctx))
 
         steps = [
-            (client_gemini_free, "gemini_free_1"),
-            (client_nvidia,      "kimi"),
-            (client_gemini_paid, "gemini_paid_standard"),
+            (client_gemini_free, "gemini_free_1",    2),
+            (client_nvidia,      "kimi",             2),
+            (client_cloudflare,  "glm",              3),
+            (client_groq,        "compound",         2),
+            (client_gemini_paid, "gemini_paid_standard", 25),
         ]
         return jsonify(run_free_cascade(steps, ctx))
 
@@ -515,6 +520,7 @@ def chat():
         return jsonify(ERR_CRASH), 500
 
 # ── ROUTE /home ────────────────────────────────────────────────────────────────
+# gemini_free_2  2s → deepseek   2s → compound  2s → glm       3s → gemini_paid_standard 25s
 @app.route("/home", methods=["POST"])
 def home():
     try:
@@ -525,9 +531,11 @@ def home():
             return jsonify(run_paid_cascade(ctx))
 
         steps = [
-            (client_gemini_free, "gemini_free_2"),
-            (client_github,      "deepseek"),
-            (client_gemini_paid, "gemini_paid_standard"),
+            (client_gemini_free, "gemini_free_2",    2),
+            (client_github,      "deepseek",         2),
+            (client_groq,        "compound",         2),
+            (client_cloudflare,  "glm",              3),
+            (client_gemini_paid, "gemini_paid_standard", 25),
         ]
         return jsonify(run_free_cascade(steps, ctx))
 
@@ -535,28 +543,8 @@ def home():
         print(f"Erreur /home: {e}")
         return jsonify(ERR_CRASH), 500
 
-# ── ROUTE /history ─────────────────────────────────────────────────────────────
-@app.route("/history", methods=["POST"])
-def history():
-    try:
-        data = request.json or {}
-        ctx  = prepare_shared_context(data, source_override="history")
-
-        if ctx["user_tier"] != "connected_free":
-            return jsonify(run_paid_cascade(ctx))
-
-        steps = [
-            (client_groq,        "compound"),
-            (client_openrouter,  "nemotron"),
-            (client_gemini_paid, "gemini_paid_standard"),
-        ]
-        return jsonify(run_free_cascade(steps, ctx))
-
-    except Exception as e:
-        print(f"Erreur /history: {e}")
-        return jsonify(ERR_CRASH), 500
-
 # ── ROUTE /vitality ────────────────────────────────────────────────────────────
+# glm  4s → compound  4s → gemini_paid_standard 25s
 @app.route("/vitality", methods=["POST"])
 def vitality():
     try:
@@ -567,9 +555,9 @@ def vitality():
             return jsonify(run_paid_cascade(ctx))
 
         steps = [
-            (client_cloudflare,  "glm"),
-            (client_groq,        "compound"),
-            (client_gemini_paid, "gemini_paid_standard"),
+            (client_cloudflare,  "glm",              4),
+            (client_groq,        "compound",         4),
+            (client_gemini_paid, "gemini_paid_standard", 25),
         ]
         return jsonify(run_free_cascade(steps, ctx))
 
@@ -577,7 +565,30 @@ def vitality():
         print(f"Erreur /vitality: {e}")
         return jsonify(ERR_CRASH), 500
 
+# ── ROUTE /history ─────────────────────────────────────────────────────────────
+# compound  4s → nemotron  4s → gemini_paid_standard 25s
+@app.route("/history", methods=["POST"])
+def history():
+    try:
+        data = request.json or {}
+        ctx  = prepare_shared_context(data, source_override="history")
+
+        if ctx["user_tier"] != "connected_free":
+            return jsonify(run_paid_cascade(ctx))
+
+        steps = [
+            (client_groq,        "compound",         4),
+            (client_openrouter,  "nemotron",         4),
+            (client_gemini_paid, "gemini_paid_standard", 25),
+        ]
+        return jsonify(run_free_cascade(steps, ctx))
+
+    except Exception as e:
+        print(f"Erreur /history: {e}")
+        return jsonify(ERR_CRASH), 500
+
 # ── ROUTE /books ───────────────────────────────────────────────────────────────
+# kimi 2s → glm 3s → compound 2s → nemotron 2s → deepseek 2s → gemini_paid_standard 25s
 @app.route("/books", methods=["POST"])
 def books():
     try:
@@ -620,7 +631,7 @@ def books():
                 gemini_history.append(types.Content(role="model", parts=[types.Part(text=msg[6:])]))
         gemini_history.append(types.Content(role="user", parts=[types.Part(text=message)]))
 
-        def run_books_call(client, model_key):
+        def run_books_call(client, model_key, timeout):
             if client in (client_gemini_free, client_gemini_paid):
                 resp = client.models.generate_content(
                     model=MODELS[model_key],
@@ -644,14 +655,14 @@ def books():
                     model=MODELS[model_key],
                     messages=openai_messages,
                     temperature=0.85,
-                    timeout=15.0
+                    timeout=timeout
                 )
                 return res.choices[0].message.content or ""
 
         if tier in ("basic", "premium", "ultra", "founder"):
             paid_key = "gemini_paid_founder" if tier == "founder" else "gemini_paid_standard"
             try:
-                full_text = run_books_call(client_gemini_paid, paid_key)
+                full_text = run_books_call(client_gemini_paid, paid_key, 25)
             except Exception as e:
                 print(f"[BOOKS PAID] Echec {paid_key} ({e})")
                 full_text = ""
@@ -660,16 +671,20 @@ def books():
                 return jsonify({"response": ERR_QUOTA["response"], "inject": False, "action": None})
 
             full_text   = ""
+            # kimi 2s → glm 3s → compound 2s → nemotron 2s → deepseek 2s → gemini_paid_standard 25s
             books_steps = [
-                (client_nvidia,      "kimi"),
-                (client_github,      "deepseek"),
-                (client_gemini_paid, "gemini_paid_standard"),
+                (client_nvidia,      "kimi",              2),
+                (client_cloudflare,  "glm",               3),
+                (client_groq,        "compound",          2),
+                (client_openrouter,  "nemotron",          2),
+                (client_github,      "deepseek",          2),
+                (client_gemini_paid, "gemini_paid_standard", 25),
             ]
-            for i, (client, model_key) in enumerate(books_steps):
+            for i, (client, model_key, timeout) in enumerate(books_steps):
                 if client is None or is_model_locked(model_key):
                     continue
                 try:
-                    full_text = run_books_call(client, model_key)
+                    full_text = run_books_call(client, model_key, timeout)
                     if i == len(books_steps) - 1:
                         increment_failover_count()
                     break
@@ -693,7 +708,8 @@ def books():
         return jsonify({"response": ERR_CRASH["response"], "inject": False, "action": None}), 500
 
 # ── ROUTE /horizon ─────────────────────────────────────────────────────────────
-def extract_horizon_result(query, ctx, attempt=1, max_attempts=3):
+# nemotron 3s → gemini_free_2 3s → gemini_free_1 3s → glm 3s → deepseek 3s → gemini_paid_standard 25s
+def extract_horizon_result(query, ctx, attempt=1, max_attempts=6):
     if attempt > max_attempts:
         return ERR_HORIZON
 
@@ -703,22 +719,29 @@ def extract_horizon_result(query, ctx, attempt=1, max_attempts=3):
         "quels_sont_les_risques", "quelle_option_est_recommandee"
     ]
 
-    if attempt == 1:
-        client, model_key = client_gemini_free, "gemini_free_2"
-    elif attempt == 2:
-        client, model_key = client_github,      "deepseek"
-    else:
-        client, model_key = client_gemini_paid, "gemini_paid_standard"
+    horizon_steps = [
+        (client_openrouter,  "nemotron",          3),
+        (client_gemini_free, "gemini_free_2",     3),
+        (client_gemini_free, "gemini_free_1",     3),
+        (client_cloudflare,  "glm",               3),
+        (client_github,      "deepseek",          3),
+        (client_gemini_paid, "gemini_paid_standard", 25),
+    ]
 
-    if client is None or (attempt < 3 and is_model_locked(model_key)):
+    if attempt > len(horizon_steps):
+        return ERR_HORIZON
+
+    client, model_key, timeout = horizon_steps[attempt - 1]
+
+    if client is None or (attempt < len(horizon_steps) and is_model_locked(model_key)):
         return extract_horizon_result(query, ctx, attempt + 1, max_attempts)
 
     try:
         if client in (client_gemini_free, client_gemini_paid):
-            r      = call_gemini(client, model_key, ctx)
+            r      = call_gemini(client, model_key, ctx, timeout=timeout)
             parsed = clean_and_parse_horizon_json(r.text)
         else:
-            r      = call_openai(client, model_key, ctx)
+            r      = call_openai(client, model_key, ctx, temp=0.1, timeout=timeout)
             parsed = clean_and_parse_horizon_json(r)
 
         has_response   = "response"   in parsed and parsed["response"]
@@ -734,7 +757,7 @@ def extract_horizon_result(query, ctx, attempt=1, max_attempts=3):
             lock_model(model_key)
             return extract_horizon_result(query, ctx, attempt + 1, max_attempts)
 
-        if attempt == 3:
+        if attempt == len(horizon_steps):
             increment_failover_count()
 
         return parsed
@@ -765,7 +788,7 @@ def horizon():
             tier      = ctx["user_tier"]
             model_key = "gemini_paid_founder" if tier == "founder" else "gemini_paid_standard"
             try:
-                r = call_gemini(client_gemini_paid, model_key, ctx)
+                r = call_gemini(client_gemini_paid, model_key, ctx, timeout=25)
                 return jsonify(clean_and_parse_horizon_json(r.text))
             except Exception as e:
                 print(f"[HORIZON PAID] Echec ({e})")

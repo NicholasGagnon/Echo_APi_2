@@ -11,7 +11,7 @@ git push origin main
 
 
 
-
+pour supprimer un user de supabase
 
 DO $$
 DECLARE uid uuid;
@@ -26,5 +26,10 @@ END $$;
 vercel
 
 cd C:\projetvision\horloge-vivante
+git commit --allow-empty -m "force redeploy"
+git push origin main
+
+
+cd C:\Users\nicog\identity
 git commit --allow-empty -m "force redeploy"
 git push origin main
