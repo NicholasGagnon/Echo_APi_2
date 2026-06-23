@@ -313,7 +313,7 @@ def call_gemini(client, model_key, ctx):
         )
     )
 
-def call_openai(client, model_key, ctx, temp=0.3, timeout=15.0):
+def call_openai(client, model_key, ctx, temp=0.1, timeout=15.0):
     model_name = MODELS[model_key]
 
     if model_name.startswith("@cf/"):
@@ -818,12 +818,14 @@ Réponds uniquement avec le résumé mis à jour.
 
         response = client_gemini_paid.models.generate_content(
             model=MODELS["gemini_paid_standard"],
-            contents=prompt
+            contents=[{"role": "user", "parts": [{"text": prompt}]}]
         )
 
+        summary_text = response.text.strip() if response.text else ""
         return jsonify({
-            "summary": response.text.strip()
+            "summary": summary_text if summary_text else ""
         })
+        print(f"[MEMORY] Resume genere : {len(summary_text)} chars")
 
     except Exception as e:
         print(f"[MEMORY] {e}")
