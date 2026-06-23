@@ -3,7 +3,6 @@ import io
 import re
 import json
 import base64
-import requests as _requests_lib
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
@@ -19,21 +18,23 @@ load_dotenv()
 app = Flask(__name__)
 CORS(app)
 
-# ── MODELES VALIDES ────────────────────────────────────────────────────────────
+# ── MODELES VALIDES — NE PAS MODIFIER SANS TESTER ────────────────────────────
 MODELS = {
-    "gemini_free_1":        "gemini-3.1-flash-lite",
-    "gemini_free_2":        "gemini-2.5-flash-lite",
-    "deepseek":             "deepseek/DeepSeek-V3-0324",
-    "kimi":                 "moonshotai/kimi-k2.6",
-    "nemotron":             "nvidia/nemotron-3-super-120b-a12b:free",
-    "glm":                  "@cf/zai-org/glm-5.2",
-    "compound":             "compound-beta",
+    # Gratuits
+    "gemini_free_1":    "gemini-3.1-flash-lite",
+    "gemini_free_2":    "gemini-2.5-flash-lite",
+    "deepseek":         "deepseek/DeepSeek-V3-0324",
+    "kimi":             "moonshotai/kimi-k2.6",
+    "ernie":            "baidu/ernie-4.5-vl-424b-preview:free",
+    "glm":              "glm-4-flash",
+    "compound":         "compound-beta",
+    # Payants
     "gemini_paid_founder":  "gemini-3.5-flash",
     "gemini_paid_ultra":    "gemini-3.1-flash-lite",
     "gemini_paid_standard": "gemini-2.5-flash-lite",
 }
 
-# ── CLES D'API ─────────────────────────────────────────────────────────────────
+# ── CLÉS D'API ────────────────────────────────────────────────────────────────
 API_KEY_FREE          = os.getenv("API_KEY_FREE", "").strip()
 API_KEY_PAID          = os.getenv("API_KEY_PAID", "").strip()
 OPENROUTER_API_KEY    = os.getenv("OPENROUTER_API_KEY", "").strip()
@@ -49,7 +50,7 @@ NVIDIA_BASE_URL     = "https://integrate.api.nvidia.com/v1"
 GROQ_BASE_URL       = "https://api.groq.com/openai/v1"
 CLOUDFLARE_BASE_URL = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/v1"
 
-# ── CLIENTS ────────────────────────────────────────────────────────────────────
+# ── CLIENTS ───────────────────────────────────────────────────────────────────
 client_gemini_free  = genai.Client(api_key=API_KEY_FREE)  if API_KEY_FREE  else None
 client_gemini_paid  = genai.Client(api_key=API_KEY_PAID)  if API_KEY_PAID  else None
 client_openrouter   = OpenAI(base_url=OPENROUTER_BASE_URL, api_key=OPENROUTER_API_KEY) if OPENROUTER_API_KEY else None
@@ -58,9 +59,7 @@ client_nvidia       = OpenAI(base_url=NVIDIA_BASE_URL,     api_key=NVIDIA_API_KE
 client_groq         = OpenAI(base_url=GROQ_BASE_URL,       api_key=GROQ_API_KEY)       if GROQ_API_KEY       else None
 client_cloudflare   = OpenAI(base_url=CLOUDFLARE_BASE_URL, api_key=CLOUDFLARE_API_TOKEN) if CLOUDFLARE_API_TOKEN else None
 
-_cf_session = _requests_lib.Session()
-
-# ── FILET DE SECURITE CONNECTED_FREE ──────────────────────────────────────────
+# ── FILET DE SÉCURITÉ CONNECTED_FREE ─────────────────────────────────────────
 GLOBAL_FAILOVER_MEMORY_COUNT = 0
 MAX_FREE_FAILOVERS = 200
 
@@ -73,7 +72,7 @@ def increment_failover_count():
     GLOBAL_FAILOVER_MEMORY_COUNT += 1
     print(f"[FAILOVER FILET] {GLOBAL_FAILOVER_MEMORY_COUNT} / {MAX_FREE_FAILOVERS}")
 
-# ── LOCKS DE MODELES (20s) ─────────────────────────────────────────────────────
+# ── GESTION DES LOCKS DE MODELES (60s) ───────────────────────────────────────
 MODELS_LOCK_REGISTRY = {}
 
 def is_model_locked(model_key: str) -> bool:
@@ -86,10 +85,10 @@ def is_model_locked(model_key: str) -> bool:
     return False
 
 def lock_model(model_key: str):
-    MODELS_LOCK_REGISTRY[model_key] = datetime.now() + timedelta(seconds=20)
-    print(f"[LOCK] {model_key} hors circuit 20s.")
+    MODELS_LOCK_REGISTRY[model_key] = datetime.now() + timedelta(seconds=60)
+    print(f"[LOCK] {model_key} hors circuit 60s.")
 
-# ── NORMALISATION DU TIER ──────────────────────────────────────────────────────
+# ── NORMALISATION DU TIER ─────────────────────────────────────────────────────
 VALID_TIERS = {"connected_free", "basic", "premium", "ultra", "founder"}
 
 def normalize_tier(raw: str) -> str:
@@ -102,17 +101,17 @@ def normalize_tier(raw: str) -> str:
     if "basic"   in cleaned:   return "basic"
     return "connected_free"
 
-# ── MESSAGES D'ERREUR ──────────────────────────────────────────────────────────
-ERR_QUOTA   = {"action": None, "response": "Le service est temporairement sature. Reessaie dans quelques instants."}
-ERR_FINAL   = {"action": None, "response": "Tous les serveurs sont momentanement indisponibles. Reessaie dans 1 minute."}
-ERR_CRASH   = {"action": None, "response": "Une erreur inattendue s'est produite. Reessaie dans quelques secondes."}
-ERR_HORIZON = {
-    "response": "Le moteur de recherche est temporairement indisponible. Reessaie dans quelques instants.",
+# ── MESSAGES D'ERREUR UTILISATEUR ────────────────────────────────────────────
+ERR_QUOTA    = {"action": None, "response": "Le service est temporairement saturé. Réessaie dans quelques instants."}
+ERR_FINAL    = {"action": None, "response": "Tous les serveurs sont momentanément indisponibles. Réessaie dans 1 minute."}
+ERR_CRASH    = {"action": None, "response": "Une erreur inattendue s'est produite. Réessaie dans quelques secondes."}
+ERR_HORIZON  = {
+    "response": "Le moteur de recherche est temporairement indisponible. Réessaie dans quelques instants.",
     "attributes": [],
     "matrix": None
 }
 
-# ── JSON PARSERS ───────────────────────────────────────────────────────────────
+# ── JSON PARSER ───────────────────────────────────────────────────────────────
 def clean_and_parse_json(raw_text):
     text = raw_text.strip()
     if text.startswith("```json"): text = text[7:]
@@ -171,7 +170,7 @@ def clean_and_parse_horizon_json(raw_text):
 
     return {"response": text, "attributes": [], "matrix": None}
 
-# ── BUILD GEMINI CONTENTS ──────────────────────────────────────────────────────
+# ── BUILD GEMINI CONTENTS ─────────────────────────────────────────────────────
 def build_gemini_contents(historique_reduit, image_b64, user_message, force_neutral_style):
     contents = []
     for msg in historique_reduit:
@@ -180,8 +179,9 @@ def build_gemini_contents(historique_reduit, image_b64, user_message, force_neut
         clean_content = msg.split(":", 1)[1].strip() if ":" in msg else msg.strip()
         if "action limit reached" in clean_content.lower() or clean_content == "...":
             continue
-
-        if msg.startswith("Echo:"):
+        if msg.startswith("You:") or msg.startswith("Toi:"):
+            contents.append({"role": "user", "parts": [types.Part.from_text(text=clean_content)]})
+        elif msg.startswith("Echo:"):
             try:
                 parsed = json.loads(clean_content)
                 clean_content = parsed.get("response", clean_content)
@@ -190,9 +190,6 @@ def build_gemini_contents(historique_reduit, image_b64, user_message, force_neut
             if force_neutral_style:
                 clean_content = "[Analyse technique archivee]"
             contents.append({"role": "model", "parts": [types.Part.from_text(text=clean_content)]})
-        elif msg.startswith("You:") or msg.startswith("Toi:"):
-            clean_content = re.sub(r'\s{3,}', ' ', clean_content).strip()
-            contents.append({"role": "user", "parts": [types.Part.from_text(text=clean_content)]})
 
     last_parts = []
     if image_b64:
@@ -208,12 +205,11 @@ def build_gemini_contents(historique_reduit, image_b64, user_message, force_neut
     contents.append({"role": "user", "parts": last_parts})
     return contents
 
-# ── PREPARE SHARED CONTEXT ─────────────────────────────────────────────────────
+# ── PREPARE SHARED CONTEXT ────────────────────────────────────────────────────
 def prepare_shared_context(data, source_override=None):
     user_message     = data.get("message", "")
     calendar_events  = data.get("calendarEvents", {})
     raw_history      = data.get("history", [])
-    memory_summary   = data.get("summary", "")
     source           = source_override if source_override else data.get("source", "chat").lower().strip()
     image_b64        = data.get("image", None)
     selected_buttons = data.get("selectedButtons", [])
@@ -252,24 +248,14 @@ def prepare_shared_context(data, source_override=None):
         current_calories=current_calories,
         current_cycle=current_cycle
     )
-
-    system_prompt = base_system_prompt
-
-    if memory_summary:
-        system_prompt += (
-            "\n\nLONG TERM MEMORY\n"
-            "================\n"
-            f"{memory_summary}\n"
-        )
-
-    system_prompt += (
+    system_prompt = base_system_prompt + (
         "\n\nCRITICAL SAFETY DIRECTIVE: Only trigger actions explicitly demanded in the LATEST message."
     )
 
-    taille_memoire  = 30 if user_tier in ["ultra", "founder"] else (15 if user_tier in ["basic", "premium"] else 5)
-    output_tokens   = 4096 if user_tier in ["ultra", "founder"] else (2048 if user_tier in ["basic", "premium"] else 1024)
+    taille_memoire = 30 if user_tier in ["ultra", "founder"] else (15 if user_tier in ["basic", "premium"] else 5)
+    output_tokens  = 4096 if user_tier in ["ultra", "founder"] else (2048 if user_tier in ["basic", "premium"] else 1024)
     historique_ajuste = raw_history[-taille_memoire:]
-    force_neutral   = len(selected_buttons) > 0 or source == "vitality"
+    force_neutral = len(selected_buttons) > 0 or source == "vitality"
     gemini_contents = build_gemini_contents(historique_ajuste, image_b64, user_message, force_neutral)
 
     messages_openai = [{"role": "system", "content": system_prompt}]
@@ -280,7 +266,6 @@ def prepare_shared_context(data, source_override=None):
         if "action limit reached" in clean_content.lower() or clean_content == "...":
             continue
         if msg.startswith("You:") or msg.startswith("Toi:"):
-            clean_content = re.sub(r'\s{3,}', ' ', clean_content).strip()
             messages_openai.append({"role": "user", "content": clean_content})
         elif msg.startswith("Echo:"):
             try:
@@ -293,57 +278,41 @@ def prepare_shared_context(data, source_override=None):
         messages_openai.append({"role": "user", "content": user_message})
 
     return {
-        "system_prompt":   system_prompt,
-        "output_tokens":   output_tokens,
+        "system_prompt": system_prompt,
+        "output_tokens": output_tokens,
         "gemini_contents": gemini_contents,
         "messages_openai": messages_openai,
-        "user_tier":       user_tier,
+        "user_tier": user_tier,
     }
 
-# ── EXECUTEURS ─────────────────────────────────────────────────────────────────
+# ── EXECUTEURS ────────────────────────────────────────────────────────────────
 def call_gemini(client, model_key, ctx):
     return client.models.generate_content(
         model=MODELS[model_key],
         contents=ctx["gemini_contents"],
         config=types.GenerateContentConfig(
             system_instruction=ctx["system_prompt"],
-            max_output_tokens=ctx["output_tokens"],
-            temperature=0.2,
+            max_output_tokens=ctx["output_tokens"]
         )
     )
 
-def call_openai(client, model_key, ctx, temp=0.4, timeout=15.0):
-    model_name = MODELS[model_key]
-
-    if model_name.startswith("@cf/"):
-        cf_account = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
-        cf_token   = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
-        url = f"https://api.cloudflare.com/client/v4/accounts/{cf_account}/ai/run/{model_name}"
-        r = _cf_session.post(
-            url,
-            json={"messages": ctx["messages_openai"][1:]},
-            headers={"Authorization": f"Bearer {cf_token}"},
-            timeout=timeout
-        )
-        r.raise_for_status()
-        return r.json()["result"]["response"]
-
+def call_openai(client, model_key, ctx, temp=0.7, timeout=15.0):
     res = client.chat.completions.create(
-        model=model_name,
+        model=MODELS[model_key],
         messages=ctx["messages_openai"],
         temperature=temp,
         timeout=timeout
     )
     return res.choices[0].message.content
 
-# ── CASCADE PAID ───────────────────────────────────────────────────────────────
+# ── CASCADE PAID ──────────────────────────────────────────────────────────────
 def run_paid_cascade(ctx):
     tier = ctx["user_tier"]
 
     if tier == "founder":
-        primary, fallback = "gemini_paid_founder",  "gemini_paid_standard"
+        primary, fallback = "gemini_paid_founder", "gemini_paid_standard"
     elif tier == "ultra":
-        primary, fallback = "gemini_paid_ultra",    "gemini_paid_standard"
+        primary, fallback = "gemini_paid_ultra", "gemini_paid_standard"
     else:
         primary, fallback = "gemini_paid_standard", "gemini_paid_ultra"
 
@@ -361,8 +330,12 @@ def run_paid_cascade(ctx):
 
     return ERR_FINAL
 
-# ── CASCADE FREE GENERIQUE ─────────────────────────────────────────────────────
+# ── CASCADE FREE GÉNÉRIQUE ────────────────────────────────────────────────────
 def run_free_cascade(steps, ctx, parser=None):
+    """
+    steps = liste de (client, model_key)
+    Le dernier step est le filet payant — incrémente le compteur.
+    """
     if parser is None:
         parser = clean_and_parse_json
 
@@ -377,10 +350,10 @@ def run_free_cascade(steps, ctx, parser=None):
         is_last = (i == len(steps) - 1)
         try:
             if client in (client_gemini_free, client_gemini_paid):
-                r      = call_gemini(client, model_key, ctx)
+                r = call_gemini(client, model_key, ctx)
                 result = parser(r.text)
             else:
-                r      = call_openai(client, model_key, ctx)
+                r = call_openai(client, model_key, ctx)
                 result = parser(r)
             if is_last:
                 increment_failover_count()
@@ -391,12 +364,7 @@ def run_free_cascade(steps, ctx, parser=None):
 
     return ERR_FINAL
 
-# ── ROUTE /ping ────────────────────────────────────────────────────────────────
-@app.route("/ping")
-def ping():
-    return jsonify({"status": "awake"})
-
-# ── ROUTE /export ──────────────────────────────────────────────────────────────
+# ── ROUTE /export ─────────────────────────────────────────────────────────────
 @app.route("/export", methods=["POST"])
 def export_route():
     data  = request.get_json(silent=True) or {}
@@ -439,18 +407,18 @@ def export_route():
                 from docx.shared import Pt, RGBColor
                 from docx.enum.text import WD_ALIGN_PARAGRAPH
                 doc = Document()
-                t   = doc.add_paragraph()
-                r   = t.add_run(title)
-                r.font.size      = Pt(24)
-                r.font.bold      = True
+                t = doc.add_paragraph()
+                r = t.add_run(title)
+                r.font.size = Pt(24)
+                r.font.bold = True
                 r.font.color.rgb = RGBColor(15, 23, 42)
                 clean = re.sub(r'<[^>]+>', '\n', html).replace('&nbsp;', ' ')
                 for line in clean.split('\n'):
                     line = line.strip()
                     if line:
-                        p           = doc.add_paragraph()
+                        p = doc.add_paragraph()
                         p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-                        run         = p.add_run(line)
+                        run = p.add_run(line)
                         run.font.size = Pt(11)
                 buf = io.BytesIO()
                 doc.save(buf)
@@ -472,10 +440,10 @@ def export_route():
                 book.set_title(title)
                 book.set_language("fr")
                 book.add_author("Echo AI")
-                ch         = epub.EpubHtml(title=title, file_name="ch1.xhtml", lang="fr")
+                ch = epub.EpubHtml(title=title, file_name="ch1.xhtml", lang="fr")
                 ch.content = f"<html><body><h1>{title}</h1>{html}</body></html>"
                 book.add_item(ch)
-                book.toc   = (epub.Link("ch1.xhtml", title, "ch1"),)
+                book.toc = (epub.Link("ch1.xhtml", title, "ch1"),)
                 book.spine = ["nav", ch]
                 book.add_item(epub.EpubNav())
                 book.add_item(epub.EpubNcx())
@@ -493,7 +461,7 @@ def export_route():
         print(f"[EXPORT ERROR] {fmt}: {e}")
         return jsonify({"error": str(e)}), 500
 
-# ── ROUTE /chat ────────────────────────────────────────────────────────────────
+# ── ROUTE /chat ───────────────────────────────────────────────────────────────
 @app.route("/chat", methods=["POST"])
 def chat():
     try:
@@ -504,9 +472,9 @@ def chat():
             return jsonify(run_paid_cascade(ctx))
 
         steps = [
-            (client_gemini_free, "gemini_free_1"),
-            (client_nvidia,      "kimi"),
-            (client_gemini_paid, "gemini_paid_standard"),
+            (client_gemini_free, "gemini_free_1"),   # 1. Gemini 3.1 Flash-Lite gratuit
+            (client_nvidia,      "kimi"),             # 2. Kimi K2.6
+            (client_gemini_paid, "gemini_free_2"),    # 3. Filet payant
         ]
         return jsonify(run_free_cascade(steps, ctx))
 
@@ -514,7 +482,7 @@ def chat():
         print(f"Erreur /chat: {e}")
         return jsonify(ERR_CRASH), 500
 
-# ── ROUTE /home ────────────────────────────────────────────────────────────────
+# ── ROUTE /home ───────────────────────────────────────────────────────────────
 @app.route("/home", methods=["POST"])
 def home():
     try:
@@ -525,9 +493,9 @@ def home():
             return jsonify(run_paid_cascade(ctx))
 
         steps = [
-            (client_gemini_free, "gemini_free_2"),
-            (client_github,      "deepseek"),
-            (client_gemini_paid, "gemini_paid_standard"),
+            (client_gemini_free, "gemini_free_2"),    # 1. Gemini 2.5 Flash-Lite gratuit
+            (client_openrouter,  "ernie"),            # 2. Ernie 4.5
+            (client_gemini_paid, "gemini_free_2"),    # 3. Filet payant
         ]
         return jsonify(run_free_cascade(steps, ctx))
 
@@ -535,7 +503,7 @@ def home():
         print(f"Erreur /home: {e}")
         return jsonify(ERR_CRASH), 500
 
-# ── ROUTE /history ─────────────────────────────────────────────────────────────
+# ── ROUTE /history ────────────────────────────────────────────────────────────
 @app.route("/history", methods=["POST"])
 def history():
     try:
@@ -546,9 +514,9 @@ def history():
             return jsonify(run_paid_cascade(ctx))
 
         steps = [
-            (client_groq,        "compound"),
-            (client_openrouter,  "nemotron"),
-            (client_gemini_paid, "gemini_paid_standard"),
+            (client_groq,        "compound"),         # 1. Groq Compound
+            (client_cloudflare,  "glm"),              # 2. GLM 4.7 Flash
+            (client_gemini_paid, "gemini_free_2"),    # 3. Filet payant
         ]
         return jsonify(run_free_cascade(steps, ctx))
 
@@ -556,7 +524,7 @@ def history():
         print(f"Erreur /history: {e}")
         return jsonify(ERR_CRASH), 500
 
-# ── ROUTE /vitality ────────────────────────────────────────────────────────────
+# ── ROUTE /vitality ───────────────────────────────────────────────────────────
 @app.route("/vitality", methods=["POST"])
 def vitality():
     try:
@@ -567,9 +535,9 @@ def vitality():
             return jsonify(run_paid_cascade(ctx))
 
         steps = [
-            (client_cloudflare,  "glm"),
-            (client_groq,        "compound"),
-            (client_gemini_paid, "gemini_paid_standard"),
+            (client_cloudflare,  "glm"),              # 1. GLM 4.7 Flash
+            (client_groq,        "compound"),         # 2. Groq Compound
+            (client_gemini_paid, "gemini_free_2"),    # 3. Filet payant
         ]
         return jsonify(run_free_cascade(steps, ctx))
 
@@ -577,7 +545,7 @@ def vitality():
         print(f"Erreur /vitality: {e}")
         return jsonify(ERR_CRASH), 500
 
-# ── ROUTE /books ───────────────────────────────────────────────────────────────
+# ── ROUTE /books ──────────────────────────────────────────────────────────────
 @app.route("/books", methods=["POST"])
 def books():
     try:
@@ -589,7 +557,7 @@ def books():
         book_title = data.get("bookTitle", "")
 
         INJECT_KEYWORDS = ["inject", "injecte", "insere", "ecris ici", "write here", "add this"]
-        wants_inject    = any(kw in message.lower() for kw in INJECT_KEYWORDS)
+        wants_inject = any(kw in message.lower() for kw in INJECT_KEYWORDS)
 
         mode_prompts = {
             "creative": "Tu es en mode Creatif. Genere du contenu litteraire original avec un style soigne.",
@@ -636,7 +604,7 @@ def books():
                 openai_messages = [{"role": "system", "content": system_prompt}]
                 for msg in history[-10:]:
                     if msg.startswith("You: "):
-                        openai_messages.append({"role": "user",      "content": msg[5:]})
+                        openai_messages.append({"role": "user", "content": msg[5:]})
                     elif msg.startswith("Echo: "):
                         openai_messages.append({"role": "assistant", "content": msg[6:]})
                 openai_messages.append({"role": "user", "content": message})
@@ -648,6 +616,7 @@ def books():
                 )
                 return res.choices[0].message.content or ""
 
+        # Cascade books
         if tier in ("basic", "premium", "ultra", "founder"):
             paid_key = "gemini_paid_founder" if tier == "founder" else "gemini_paid_standard"
             try:
@@ -656,14 +625,15 @@ def books():
                 print(f"[BOOKS PAID] Echec {paid_key} ({e})")
                 full_text = ""
         else:
+            # Connected Free
             if get_failover_count() >= MAX_FREE_FAILOVERS:
                 return jsonify({"response": ERR_QUOTA["response"], "inject": False, "action": None})
 
-            full_text   = ""
+            full_text = ""
             books_steps = [
-                (client_nvidia,      "kimi"),
-                (client_github,      "deepseek"),
-                (client_gemini_paid, "gemini_paid_standard"),
+                (client_openrouter, "ernie"),
+                (client_github,     "deepseek"),
+                (client_gemini_paid, "gemini_free_2"),
             ]
             for i, (client, model_key) in enumerate(books_steps):
                 if client is None or is_model_locked(model_key):
@@ -692,7 +662,7 @@ def books():
         print(f"Erreur /books: {e}")
         return jsonify({"response": ERR_CRASH["response"], "inject": False, "action": None}), 500
 
-# ── ROUTE /horizon ─────────────────────────────────────────────────────────────
+# ── ROUTE /horizon ────────────────────────────────────────────────────────────
 def extract_horizon_result(query, ctx, attempt=1, max_attempts=3):
     if attempt > max_attempts:
         return ERR_HORIZON
@@ -703,25 +673,26 @@ def extract_horizon_result(query, ctx, attempt=1, max_attempts=3):
         "quels_sont_les_risques", "quelle_option_est_recommandee"
     ]
 
+    # Sélection du client/modèle selon la tentative
     if attempt == 1:
         client, model_key = client_gemini_free, "gemini_free_2"
     elif attempt == 2:
-        client, model_key = client_github,      "deepseek"
+        client, model_key = client_github, "deepseek"
     else:
-        client, model_key = client_gemini_paid, "gemini_paid_standard"
+        client, model_key = client_gemini_paid, "gemini_free_2"
 
     if client is None or (attempt < 3 and is_model_locked(model_key)):
         return extract_horizon_result(query, ctx, attempt + 1, max_attempts)
 
     try:
         if client in (client_gemini_free, client_gemini_paid):
-            r      = call_gemini(client, model_key, ctx)
+            r = call_gemini(client, model_key, ctx)
             parsed = clean_and_parse_horizon_json(r.text)
         else:
-            r      = call_openai(client, model_key, ctx)
+            r = call_openai(client, model_key, ctx)
             parsed = clean_and_parse_horizon_json(r)
 
-        has_response   = "response"   in parsed and parsed["response"]
+        has_response   = "response" in parsed and parsed["response"]
         has_attributes = "attributes" in parsed and isinstance(parsed["attributes"], list)
         has_matrix     = (
             "matrix" in parsed
@@ -762,7 +733,8 @@ def horizon():
         ctx = prepare_shared_context(data, source_override="horizonweb")
 
         if ctx["user_tier"] != "connected_free":
-            tier      = ctx["user_tier"]
+            # Paid : direct gemini paid sans boucle agentique
+            tier = ctx["user_tier"]
             model_key = "gemini_paid_founder" if tier == "founder" else "gemini_paid_standard"
             try:
                 r = call_gemini(client_gemini_paid, model_key, ctx)
@@ -780,37 +752,6 @@ def horizon():
     except Exception as e:
         print(f"Erreur critique /horizon: {e}")
         return jsonify(ERR_HORIZON), 500
-
-# ── ROUTE /memory-summary ──────────────────────────────────────────────────────
-@app.route("/memory-summary", methods=["POST"])
-def memory_summary():
-    try:
-        data        = request.json or {}
-        old_summary = data.get("summary", "")
-        messages    = data.get("messages", [])
-        recent_text = "\n".join(messages[-100:])
-
-        prompt = (
-            "Tu es un moteur de memoire long terme.\n\n"
-            f"Resume existant :\n{old_summary}\n\n"
-            f"Nouveaux messages :\n{recent_text}\n\n"
-            "Mets a jour la memoire. Conserve : identite utilisateur, preferences, projets, "
-            "livres, habitudes, abonnements, gouts, informations durables. "
-            "Ignore : bavardage temporaire, salutations, petites discussions sans valeur. "
-            "Reponds uniquement avec le resume mis a jour."
-        )
-
-        response     = client_gemini_paid.models.generate_content(
-            model=MODELS["gemini_paid_standard"],
-            contents=[{"role": "user", "parts": [{"text": prompt}]}]
-        )
-        summary_text = response.text.strip() if response.text else ""
-        print(f"[MEMORY] Resume genere : {len(summary_text)} chars")
-        return jsonify({"summary": summary_text})
-
-    except Exception as e:
-        print(f"[MEMORY] {e}")
-        return jsonify({"summary": ""}), 500
 
 
 if __name__ == "__main__":
