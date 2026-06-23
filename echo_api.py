@@ -777,7 +777,57 @@ def horizon():
         print(f"Erreur critique /horizon: {e}")
         return jsonify(ERR_HORIZON), 500
 
+@app.route("/memory-summary", methods=["POST"])
+def memory_summary():
+    try:
+        data = request.json or {}
 
+        old_summary = data.get("summary", "")
+        messages = data.get("messages", [])
+
+        recent_text = "\n".join(messages[-100:])
+
+        prompt = f"""
+Tu es un moteur de mémoire long terme.
+
+Résumé existant :
+{old_summary}
+
+Nouveaux messages :
+{recent_text}
+
+Mets à jour la mémoire.
+
+Conserve :
+- identité utilisateur
+- préférences
+- projets
+- livres
+- habitudes
+- abonnements
+- goûts
+- informations durables
+
+Ignore :
+- bavardage temporaire
+- salutations
+- petites discussions sans valeur
+
+Réponds uniquement avec le résumé mis à jour.
+"""
+
+        response = client_gemini_paid.models.generate_content(
+            model=MODELS["gemini_paid_standard"],
+            contents=prompt
+        )
+
+        return jsonify({
+            "summary": response.text.strip()
+        })
+
+    except Exception as e:
+        print(f"[MEMORY] {e}")
+        return jsonify({"summary": ""}), 500
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print(f"Echo API sur le port {port}")
