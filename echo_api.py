@@ -417,9 +417,9 @@ def get_horizon_steps(user_tier: str):
     if is_paid_tier(user_tier):
         return [(client_gemini_paid, "gemini_paid_standard", 25)]
     return [
-        (client_gemini_free, "gemini_free_1", 15),   # Gemini 2.0 Flash Lite free
-        (client_cloudflare,  "glm",           15),   # GLM
-        (client_gemini_paid, "gemini_paid_standard", 25),  # fallback payant
+        (client_gemini_free, "gemini_free_1", 25),   
+        (client_cloudflare,  "glm",           25),   # GLM
+        (client_gemini_paid, "gemini_paid_standard", 30),  # fallback payant
     ]
 
 def extract_horizon_result(query: str, ctx: dict, attempt: int = 1) -> dict:
@@ -548,7 +548,7 @@ def export_route():
 
 # ── /home ──────────────────────────────────────────────────────────────────────
 # Payant : paid_cascade
-# Free   : Gemini 2.0 Flash Lite 6s → Kimi 6s → Gemini 2.5 Flash Lite payant 25s
+
 @app.route("/home", methods=["POST"])
 def home():
     try:
@@ -740,7 +740,7 @@ def books():
         return jsonify({"response": ERR_CRASH["response"], "inject": False, "action": None}), 500
 
 # ── /horizon ──────────────────────────────────────────────────────────────────
-# Free : Gemini 2.0 Flash Lite free 15s → GLM 15s → Gemini 2.5 Flash Lite payant 25s
+
 @app.route("/horizon", methods=["POST"])
 def horizon():
     try:
