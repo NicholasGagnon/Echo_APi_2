@@ -52,13 +52,16 @@ NVIDIA_BASE_URL     = "https://integrate.api.nvidia.com/v1"
 GROQ_BASE_URL       = "https://api.groq.com/openai/v1"
 CLOUDFLARE_BASE_URL = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/v1"
 
+import httpx
+_shared_http_client = httpx.Client(timeout=30.0)
+
 client_gemini_free  = genai.Client(api_key=API_KEY_FREE)  if API_KEY_FREE  else None
 client_gemini_paid  = genai.Client(api_key=API_KEY_PAID)  if API_KEY_PAID  else None
-client_openrouter   = OpenAI(base_url=OPENROUTER_BASE_URL, api_key=OPENROUTER_API_KEY) if OPENROUTER_API_KEY else None
-client_github       = OpenAI(base_url=GITHUB_BASE_URL,     api_key=GITHUB_API_KEY)     if GITHUB_API_KEY     else None
-client_nvidia       = OpenAI(base_url=NVIDIA_BASE_URL,     api_key=NVIDIA_API_KEY)     if NVIDIA_API_KEY     else None
-client_groq         = OpenAI(base_url=GROQ_BASE_URL,       api_key=GROQ_API_KEY)       if GROQ_API_KEY       else None
-client_cloudflare   = OpenAI(base_url=CLOUDFLARE_BASE_URL, api_key=CLOUDFLARE_API_TOKEN) if CLOUDFLARE_API_TOKEN else None
+client_openrouter   = OpenAI(base_url=OPENROUTER_BASE_URL, api_key=OPENROUTER_API_KEY, http_client=_shared_http_client) if OPENROUTER_API_KEY else None
+client_github       = OpenAI(base_url=GITHUB_BASE_URL,     api_key=GITHUB_API_KEY,     http_client=_shared_http_client) if GITHUB_API_KEY     else None
+client_nvidia       = OpenAI(base_url=NVIDIA_BASE_URL,     api_key=NVIDIA_API_KEY,     http_client=_shared_http_client) if NVIDIA_API_KEY     else None
+client_groq         = OpenAI(base_url=GROQ_BASE_URL,       api_key=GROQ_API_KEY,       http_client=_shared_http_client) if GROQ_API_KEY       else None
+client_cloudflare   = OpenAI(base_url=CLOUDFLARE_BASE_URL, api_key=CLOUDFLARE_API_TOKEN, http_client=_shared_http_client) if CLOUDFLARE_API_TOKEN else None
 
 _cf_session = _requests_lib.Session()
 
@@ -632,7 +635,7 @@ def books():
         tier       = normalize_tier(data.get("userTier", "connected_free"))
         buttons    = data.get("selectedButtons", [])
         book_title = data.get("bookTitle", "")
-        output_tokens = PAID_MAX_TOKENS if is_paid_tier(tier) else FREE_MAX_TOKENS
+        output_tokens = 2048 if is_paid_tier(tier) else 1024
 
         INJECT_KEYWORDS = ["inject", "injecte", "insere", "ecris ici", "write here", "add this"]
         wants_inject    = any(kw in message.lower() for kw in INJECT_KEYWORDS)
@@ -778,6 +781,15 @@ def horizon():
     except Exception as e:
         print(f"[HORIZON] Erreur critique: {e}")
         return jsonify(ERR_HORIZON), 500
+
+def _warmup_api():
+    try:
+        print("[BOOST] Initialisation de l'ecosysteme Echo et reveil des routes...")
+        _requests_lib.get("http://127.0.0.1:5000/ping", timeout=2)
+    except Exception:
+        pass
+
+threading.Thread(target=_warmup_api, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
