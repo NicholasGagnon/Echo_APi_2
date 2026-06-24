@@ -21,15 +21,15 @@ app = Flask(__name__)
 CORS(app)
 
 MODELS = {
-    "gemini_free_1":        "gemini-3.1-flash-lite",
+    "gemini_free_1":        "gemini-2.0-flash-lite",
     "gemini_free_2":        "gemini-2.5-flash-lite",
     "deepseek":             "deepseek/DeepSeek-V3-0324",
-    "kimi":                 "moonshotai/kimi-k2.6",
+    "kimi":                 "moonshotai/kimi-k2-freeplay",
     "nemotron":             "nvidia/nemotron-3-super-120b-a12b:free",
-    "glm":                  "@cf/zai-org/glm-5.2",
+    "glm":                  "zai-org/glm-4-32b:free",
     "compound":             "compound-beta",
-    "gemini_paid_founder":  "gemini-3.5-flash",
-    "gemini_paid_ultra":    "gemini-3.1-flash-lite",
+    "gemini_paid_founder":  "gemini-2.5-flash",
+    "gemini_paid_ultra":    "gemini-2.0-flash-lite",
     "gemini_paid_standard": "gemini-2.5-flash-lite",
 }
 
@@ -242,9 +242,9 @@ def prepare_shared_context(data, source_override=None):
     system_prompt += "\n\nCRITICAL SAFETY DIRECTIVE: Only trigger actions explicitly demanded in the LATEST message."
 
     taille_memoire    = 30 if user_tier in ["ultra", "founder"] else (15 if user_tier in ["basic", "premium"] else 5)
-    output_tokens      = 4096 if user_tier in ["ultra", "founder"] else (2048 if user_tier in ["basic", "premium"] else 1024)
+    output_tokens     = 4096 if user_tier in ["ultra", "founder"] else (2048 if user_tier in ["basic", "premium"] else 1024)
     historique_ajuste = raw_history[-taille_memoire:]
-    force_neutral      = len(selected_buttons) > 0 or source == "vitality"
+    force_neutral     = len(selected_buttons) > 0 or source == "vitality"
     gemini_contents   = build_gemini_contents(historique_ajuste, image_b64, user_message, force_neutral)
 
     messages_openai = [{"role": "system", "content": system_prompt}]
@@ -278,24 +278,21 @@ def prepare_shared_context(data, source_override=None):
 def call_with_timeout(fn, timeout_sec):
     result = [None]
     error  = [None]
-
     def target():
         try:
             result[0] = fn()
         except Exception as e:
             error[0] = e
-
     t = threading.Thread(target=target, daemon=True)
     t.start()
     t.join(timeout=timeout_sec)
-
     if t.is_alive():
         raise TimeoutError(f"Timeout apres {timeout_sec}s")
     if error[0]:
         raise error[0]
     return result[0]
 
-def call_gemini(client, model_key, ctx, timeout=2):
+def call_gemini(client, model_key, ctx, timeout=25):
     def fn():
         return client.models.generate_content(
             model=MODELS[model_key],
@@ -308,7 +305,7 @@ def call_gemini(client, model_key, ctx, timeout=2):
         )
     return call_with_timeout(fn, timeout)
 
-def call_openai(client, model_key, ctx, temp=0.1, timeout=2.0):
+def call_openai(client, model_key, ctx, temp=0.1, timeout=20.0):
     model_name = MODELS[model_key]
     if model_name.startswith("@cf/"):
         cf_account = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
@@ -375,6 +372,97 @@ def run_free_cascade(steps, ctx, parser=None):
             print(f"[FREE] Echec {model_key} ({e})")
             lock_model(model_key)
     return ERR_FINAL
+
+# ── HORIZON — cascade dédiée ───────────────────────────────────────────────────
+# Ordre : Kimi (OpenRouter free) → GLM (OpenRouter free) → Gemini 2.5 flash-lite (payant)
+# Nemotron retiré : trop hallucinateur sur les données locales
+def get_horizon_steps(user_tier: str):
+    """
+    Retourne la cascade de modèles pour Horizon selon le tier.
+    Payant : Gemini 2.5 flash-lite directement.
+    Gratuit : Kimi → GLM → Gemini 2.5 flash-lite (fallback payant).
+    """
+    if user_tier != "connected_free":
+        return [
+            (client_gemini_paid, "gemini_paid_standard", 30),
+        ]
+    return [
+        (client_openrouter, "kimi",                 25),  # Kimi K2 freeplay — bon sur données structurées
+        (client_openrouter, "glm",                  25),  # GLM-4 32B free — solide fallback
+        (client_gemini_paid, "gemini_paid_standard", 30), # Gemini 2.5 flash-lite — fallback payant fiable
+    ]
+
+def extract_horizon_result(query: str, ctx: dict, attempt: int = 1) -> dict:
+    """
+    Cascade Horizon avec retry automatique.
+    Chaque modèle a une seule chance. Si la structure JSON est incomplète → modèle suivant.
+    """
+    required_matrix_keys = [
+        "c_est_quoi", "est_ce_bon", "combien_ca_coute", "est_ce_disponible",
+        "qu_en_pensent_les_gens", "quelles_sont_les_alternatives",
+        "quels_sont_les_risques", "quelle_option_est_recommandee"
+    ]
+
+    steps = get_horizon_steps(ctx["user_tier"])
+
+    if attempt > len(steps):
+        print("[HORIZON] Tous les modèles épuisés.")
+        return ERR_HORIZON
+
+    client, model_key, timeout = steps[attempt - 1]
+
+    if client is None:
+        print(f"[HORIZON] Client None pour {model_key}, passage au suivant.")
+        return extract_horizon_result(query, ctx, attempt + 1)
+
+    if is_model_locked(model_key):
+        print(f"[HORIZON] {model_key} verrouillé, passage au suivant.")
+        return extract_horizon_result(query, ctx, attempt + 1)
+
+    try:
+        print(f"[HORIZON] Tentative {attempt}/{len(steps)} — {model_key}")
+
+        if client in (client_gemini_free, client_gemini_paid):
+            r      = call_gemini(client, model_key, ctx, timeout=timeout)
+            parsed = clean_and_parse_horizon_json(r.text)
+        else:
+            r      = call_openai(client, model_key, ctx, temp=0.1, timeout=float(timeout))
+            parsed = clean_and_parse_horizon_json(r)
+
+        # Validation de structure
+        has_response   = bool(parsed.get("response", "").strip())
+        has_attributes = isinstance(parsed.get("attributes"), list) and len(parsed["attributes"]) > 0
+        has_matrix     = (
+            isinstance(parsed.get("matrix"), dict)
+            and all(k in parsed["matrix"] for k in required_matrix_keys)
+        )
+
+        if not has_response:
+            print(f"[HORIZON] {model_key} — réponse vide, modèle suivant.")
+            lock_model(model_key)
+            return extract_horizon_result(query, ctx, attempt + 1)
+
+        # Si matrix incomplète mais réponse présente → on accepte avec matrix=None
+        # (évite de perdre une bonne réponse pour un JSON mal formé)
+        if not has_matrix:
+            print(f"[HORIZON] {model_key} — matrix incomplète, réponse conservée sans matrix.")
+            parsed["matrix"] = None
+
+        if not has_attributes:
+            parsed["attributes"] = []
+
+        # Incrémenter failover seulement si on est sur le modèle payant en dernier recours
+        if model_key == "gemini_paid_standard" and ctx["user_tier"] == "connected_free":
+            increment_failover_count()
+
+        print(f"[HORIZON] Succès — {model_key}")
+        return parsed
+
+    except Exception as e:
+        print(f"[HORIZON] Erreur {model_key} ({e}), modèle suivant.")
+        lock_model(model_key)
+        return extract_horizon_result(query, ctx, attempt + 1)
+
 
 @app.route("/ping")
 def ping():
@@ -449,9 +537,9 @@ def home():
         if ctx["user_tier"] != "connected_free":
             return jsonify(run_paid_cascade(ctx))
         steps = [
-            (client_gemini_free, "gemini_free_2",        4),
-            (client_cloudflare,  "glm",                  4),
-            (client_gemini_free, "gemini_free_1",        4),
+            (client_gemini_free, "gemini_free_2",        8),
+            (client_cloudflare,  "glm",                  8),
+            (client_gemini_free, "gemini_free_1",        8),
             (client_gemini_paid, "gemini_paid_standard", 25),
         ]
         return jsonify(run_free_cascade(steps, ctx))
@@ -467,9 +555,9 @@ def chat():
         if ctx["user_tier"] != "connected_free":
             return jsonify(run_paid_cascade(ctx))
         steps = [
-            (client_gemini_free, "gemini_free_1",        4),
-            (client_nvidia,      "kimi",                 4),
-            (client_gemini_free, "gemini_free_2",        4),
+            (client_gemini_free, "gemini_free_1",        8),
+            (client_openrouter,  "kimi",                 8),
+            (client_gemini_free, "gemini_free_2",        8),
             (client_gemini_paid, "gemini_paid_standard", 25),
         ]
         return jsonify(run_free_cascade(steps, ctx))
@@ -502,9 +590,9 @@ def history():
         if ctx["user_tier"] != "connected_free":
             return jsonify(run_paid_cascade(ctx))
         steps = [
-            (client_openrouter,  "nemotron",             5),
-            (client_github,      "deepseek",             5),
-            (client_groq,        "compound",             5),
+            (client_openrouter,  "kimi",                 8),
+            (client_github,      "deepseek",             8),
+            (client_groq,        "compound",             8),
             (client_gemini_paid, "gemini_paid_standard", 25),
         ]
         return jsonify(run_free_cascade(steps, ctx))
@@ -536,7 +624,7 @@ def books():
         if wants_inject:
             inject_instruction = (
                 "\n\nL'utilisateur veut que tu INJECTES du texte dans son livre. "
-                "Genere le passage et termine with :\n<<<INJECT_TEXT>>>\n[texte propre sans HTML]\n<<<END_INJECT>>>"
+                "Genere le passage et termine avec :\n<<<INJECT_TEXT>>>\n[texte propre sans HTML]\n<<<END_INJECT>>>"
             )
         system_prompt = f"{mode_instruction}{inject_instruction}\n\nLivre : \"{book_title}\". Reponds en moins de 400 mots. Sois direct et elegant."
 
@@ -590,9 +678,8 @@ def books():
                 return jsonify({"response": ERR_QUOTA["response"], "inject": False, "action": None})
             full_text   = ""
             books_steps = [
-                (client_openrouter,  "nemotron",             5),
-                (client_nvidia,      "kimi",                 5),
-                (client_cloudflare,  "glm",                  5),
+                (client_openrouter,  "kimi",                 10),
+                (client_openrouter,  "glm",                  10),
                 (client_gemini_paid, "gemini_paid_standard", 25),
             ]
             for i, (client, model_key, timeout) in enumerate(books_steps):
@@ -620,50 +707,6 @@ def books():
         print(f"Erreur /books: {e}")
         return jsonify({"response": ERR_CRASH["response"], "inject": False, "action": None}), 500
 
-def extract_horizon_result(query, ctx, attempt=1, max_attempts=3):
-    if attempt > max_attempts:
-        return ERR_HORIZON
-    required_matrix_keys = [
-        "c_est_quoi", "est_ce_bon", "combien_ca_coute", "est_ce_disponible",
-        "qu_en_pensent_les_gens", "quelles_sont_les_alternatives",
-        "quels_sont_les_risques", "quelle_option_est_recommandee"
-    ]
-    horizon_steps = [
-        (client_openrouter,  "nemotron",             20),
-        (client_gemini_free, "gemini_free_2",        20),
-        (client_gemini_paid, "gemini_paid_standard", 25),
-    ]
-    if attempt > len(horizon_steps):
-        return ERR_HORIZON
-    client, model_key, timeout = horizon_steps[attempt - 1]
-    if client is None or (attempt < len(horizon_steps) and is_model_locked(model_key)):
-        return extract_horizon_result(query, ctx, attempt + 1, max_attempts)
-    try:
-        if client in (client_gemini_free, client_gemini_paid):
-            r      = call_gemini(client, model_key, ctx, timeout=timeout)
-            parsed = clean_and_parse_horizon_json(r.text)
-        else:
-            r      = call_openai(client, model_key, ctx, temp=0.1, timeout=float(timeout))
-            parsed = clean_and_parse_horizon_json(r)
-        has_response   = "response"   in parsed and parsed["response"]
-        has_attributes = "attributes" in parsed and isinstance(parsed["attributes"], list)
-        has_matrix     = (
-            "matrix" in parsed
-            and isinstance(parsed["matrix"], dict)
-            and all(k in parsed["matrix"] for k in required_matrix_keys)
-        )
-        if not has_response or not has_attributes or not has_matrix:
-            print(f"[HORIZON] Tentative {attempt} - structure incomplete.")
-            lock_model(model_key)
-            return extract_horizon_result(query, ctx, attempt + 1, max_attempts)
-        if attempt == len(horizon_steps):
-            increment_failover_count()
-        return parsed
-    except Exception as e:
-        print(f"[HORIZON] Erreur tentative {attempt} ({model_key}): {e}")
-        lock_model(model_key)
-        return extract_horizon_result(query, ctx, attempt + 1, max_attempts)
-
 @app.route("/horizon", methods=["POST"])
 def horizon():
     try:
@@ -671,26 +714,27 @@ def horizon():
         query = data.get("query", "").strip()
         if not query:
             return jsonify({"error": "L'intention d'exploration est vide."}), 400
+
+        # Message enrichi : demande explicite de recherche web + JSON strict
+        # "jusqu'à 10" pour éviter le remplissage artificiel
         data["message"] = (
-            f"Fais une recherche web complete et extrait tout sur : {query}. "
-            f"Reponds OBLIGATOIREMENT en JSON valide avec les cles : response, attributes, matrix."
+            f"Recherche web complète sur : {query}\n\n"
+            f"RÈGLE CRITIQUE : Retourne uniquement des informations réelles confirmées par ta recherche. "
+            f"Si une donnée (adresse, prix, horaire, URL) n'est pas trouvée, écris le jeton approprié. "
+            f"Retourne jusqu'à 10 résultats — moins si tu n'en confirmes pas davantage. "
+            f"Réponds UNIQUEMENT en JSON valide avec les clés : response, attributes, matrix."
         )
+
         ctx = prepare_shared_context(data, source_override="horizonweb")
-        if ctx["user_tier"] != "connected_free":
-            tier      = ctx["user_tier"]
-            model_key = "gemini_paid_founder" if tier == "founder" else "gemini_paid_standard"
-            try:
-                r = call_gemini(client_gemini_paid, model_key, ctx, timeout=25)
-                return jsonify(clean_and_parse_horizon_json(r.text))
-            except Exception as e:
-                print(f"[HORIZON PAID] Echec ({e})")
-                return jsonify(ERR_HORIZON), 500
-        if get_failover_count() >= MAX_FREE_FAILOVERS:
+
+        if get_failover_count() >= MAX_FREE_FAILOVERS and ctx["user_tier"] == "connected_free":
             return jsonify(ERR_QUOTA)
+
         result = extract_horizon_result(query, ctx)
         return jsonify(result)
+
     except Exception as e:
-        print(f"Erreur critique /horizon: {e}")
+        print(f"[HORIZON] Erreur critique: {e}")
         return jsonify(ERR_HORIZON), 500
 
 if __name__ == "__main__":
