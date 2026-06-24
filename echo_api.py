@@ -305,6 +305,24 @@ def call_gemini(client, model_key, ctx, timeout=25):
         )
     return call_with_timeout(fn, timeout)
 
+def call_gemini_with_search(client, model_key, ctx, timeout=30):
+    """
+    Variante de call_gemini avec Google Search grounding activé.
+    Utilisée exclusivement par la route /horizon pour avoir des données réelles.
+    """
+    def fn():
+        return client.models.generate_content(
+            model=MODELS[model_key],
+            contents=ctx["gemini_contents"],
+            config=types.GenerateContentConfig(
+                system_instruction=ctx["system_prompt"],
+                max_output_tokens=ctx["output_tokens"],
+                temperature=0.1,
+                tools=[types.Tool(google_search=types.GoogleSearch())],
+            )
+        )
+    return call_with_timeout(fn, timeout)
+
 def call_openai(client, model_key, ctx, temp=0.1, timeout=20.0):
     model_name = MODELS[model_key]
     if model_name.startswith("@cf/"):
@@ -423,7 +441,7 @@ def extract_horizon_result(query: str, ctx: dict, attempt: int = 1) -> dict:
         print(f"[HORIZON] Tentative {attempt}/{len(steps)} — {model_key}")
 
         if client in (client_gemini_free, client_gemini_paid):
-            r      = call_gemini(client, model_key, ctx, timeout=timeout)
+            r      = call_gemini_with_search(client, model_key, ctx, timeout=timeout)
             parsed = clean_and_parse_horizon_json(r.text)
         else:
             r      = call_openai(client, model_key, ctx, temp=0.1, timeout=float(timeout))
@@ -715,13 +733,25 @@ def horizon():
         if not query:
             return jsonify({"error": "L'intention d'exploration est vide."}), 400
 
-        # Message enrichi : demande explicite de recherche web + JSON strict
-        # "jusqu'à 10" pour éviter le remplissage artificiel
+        # Message enrichi avec date/heure réelle et instruction Google Search explicite
+        maintenant      = datetime.now()
+        date_str        = maintenant.strftime("%A %d %B %Y")
+        heure_str       = maintenant.strftime("%H:%M")
+
         data["message"] = (
-            f"Recherche web complète sur : {query}\n\n"
-            f"RÈGLE CRITIQUE : Retourne uniquement des informations réelles confirmées par ta recherche. "
-            f"Si une donnée (adresse, prix, horaire, URL) n'est pas trouvée, écris le jeton approprié. "
-            f"Retourne jusqu'à 10 résultats — moins si tu n'en confirmes pas davantage. "
+            f"DATE ET HEURE ACTUELLES : {date_str}, {heure_str} (heure locale du serveur).\n"
+            f"ANNÉE EN COURS : 2026. Toutes les informations doivent être actuelles et valides en 2026.\n\n"
+            f"INSTRUCTION OBLIGATOIRE — GOOGLE SEARCH ACTIVÉ :\n"
+            f"Tu disposes d'un outil de recherche Google en temps réel. "
+            f"Tu DOIS l'utiliser pour répondre à cette requête. "
+            f"N'utilise PAS ta mémoire interne comme source principale. "
+            f"Cherche d'abord. Transmets ce que tu trouves. Rien d'autre.\n\n"
+            f"REQUÊTE : {query}\n\n"
+            f"RÈGLES DE TRANSMISSION :\n"
+            f"- Retourne uniquement des informations confirmées par ta recherche Google.\n"
+            f"- Si une donnée (adresse, téléphone, horaire, prix, URL) est introuvable : utilise le jeton approprié.\n"
+            f"- Retourne jusqu'à 10 résultats confirmés — moins si tu n'en trouves pas davantage.\n"
+            f"- Une réponse incomplète est acceptable. Une réponse inventée est un échec.\n\n"
             f"Réponds UNIQUEMENT en JSON valide avec les clés : response, attributes, matrix."
         )
 
