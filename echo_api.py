@@ -387,9 +387,9 @@ def get_horizon_steps(user_tier: str):
             (client_gemini_paid, "gemini_paid_standard", 30),
         ]
     return [
-        (client_openrouter, "kimi",                 25),  # Kimi K2 freeplay — bon sur données structurées
-        (client_cloudflare, "glm",                  25),  # GLM-4 32B free — solide fallback
-        (client_gemini_paid, "gemini_paid_standard", 30), # Gemini 2.5 flash-lite — fallback payant fiable
+        (client_gemini_free, "gemini_free_1",        20), # Gemini 3.1 flash-lite — premier, 20s
+        (client_openrouter,  "kimi",                 25), # Kimi K2.6 — fallback structuré
+        (client_gemini_paid, "gemini_paid_standard", 30), # Gemini 2.5 flash-lite — fallback payant
     ]
 
 def extract_horizon_result(query: str, ctx: dict, attempt: int = 1) -> dict:
@@ -555,8 +555,8 @@ def chat():
         if ctx["user_tier"] != "connected_free":
             return jsonify(run_paid_cascade(ctx))
         steps = [
-            (client_gemini_free, "gemini_free_1",        8),
-            (client_openrouter,  "kimi",                 8),
+            (client_openrouter,  "kimi",                 4),
+            (client_groq,        "compound",             4),
             (client_gemini_free, "gemini_free_2",        8),
             (client_gemini_paid, "gemini_paid_standard", 25),
         ]
