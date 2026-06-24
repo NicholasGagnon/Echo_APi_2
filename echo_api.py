@@ -348,10 +348,12 @@ def call_openai(client, model_key, ctx, temp=0.2, timeout=20.0):
         )
         r.raise_for_status()
         return r.json()["result"]["response"]
+    max_tokens_limit = ctx.get("output_tokens", 2500)
     res = client.chat.completions.create(
         model=model_name,
         messages=ctx["messages_openai"],
         temperature=temp,
+        max_tokens=max_tokens_limit,
         timeout=timeout
     )
     return res.choices[0].message.content
@@ -650,13 +652,15 @@ def books():
             )
         system_prompt = f"{mode_instruction}{inject_instruction}\n\nLivre : \"{book_title}\". Reponds en moins de 400 mots. Sois direct et elegant."
 
+        # Nettoyage et alternance stricte pour l'historique Gemini
         gemini_history = []
         for msg in history[-10:]:
             if msg.startswith("You: "):
-                gemini_history.append(types.Content(role="user",  parts=[types.Part(text=msg[5:])]))
+                gemini_history.append(types.Content(role="user",  parts=[types.Part.from_text(text=msg[5:])]))
             elif msg.startswith("Echo: "):
-                gemini_history.append(types.Content(role="model", parts=[types.Part(text=msg[6:])]))
-        gemini_history.append(types.Content(role="user", parts=[types.Part(text=message)]))
+                if gemini_history:
+                    gemini_history.append(types.Content(role="model", parts=[types.Part.from_text(text=msg[6:])]))
+        gemini_history.append(types.Content(role="user", parts=[types.Part.from_text(text=message)]))
 
         def run_books_call(client, model_key, timeout):
             if client in (client_gemini_free, client_gemini_paid):
@@ -684,6 +688,7 @@ def books():
                     model=MODELS[model_key],
                     messages=openai_messages,
                     temperature=0.2,
+                    max_tokens=output_tokens,
                     timeout=float(timeout)
                 )
                 return res.choices[0].message.content or ""
