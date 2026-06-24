@@ -767,7 +767,60 @@ def horizon():
         print(f"[HORIZON] Erreur critique: {e}")
         return jsonify(ERR_HORIZON), 500
 
-def _warmup_api():
+@app.route("/memory-summary", methods=["POST"])
+def memory_summary():
+    try:
+        data         = request.json or {}
+        messages     = data.get("messages", [])
+        prev_summary = data.get("summary", "")
+        user_tier    = normalize_tier(data.get("userTier", "connected_free"))
+
+        if not messages:
+            return jsonify({"summary": prev_summary or ""})
+
+        # Construire le prompt de compression
+        history_text = "\n".join(messages[-30:]) if messages else ""
+        prompt = (
+            "Tu es un système de compression de mémoire conversationnelle.\n"
+            "Ton rôle : produire un résumé dense et factuel de la conversation ci-dessous.\n"
+            "Ce résumé sera injecté comme mémoire long terme dans les prochaines conversations.\n\n"
+            f"RÉSUMÉ PRÉCÉDENT :\n{prev_summary or 'Aucun'}\n\n"
+            f"NOUVEAUX MESSAGES :\n{history_text}\n\n"
+            "INSTRUCTIONS :\n"
+            "- Garde les faits importants, préférences, décisions, contexte clé.\n"
+            "- Ignore les salutations et messages vides.\n"
+            "- Sois concis : max 300 mots.\n"
+            "- Réponds UNIQUEMENT avec le résumé, sans introduction ni explication."
+        )
+
+        ctx = {
+            "system_prompt":   "Tu es un compresseur de mémoire conversationnelle. Réponds uniquement avec le résumé demandé.",
+            "output_tokens":   600,
+            "gemini_contents": [{"role": "user", "parts": [types.Part.from_text(text=prompt)]}],
+            "messages_openai": [
+                {"role": "system", "content": "Tu es un compresseur de mémoire conversationnelle."},
+                {"role": "user",   "content": prompt},
+            ],
+            "user_tier": user_tier,
+        }
+
+        try:
+            r       = call_gemini(client_gemini_paid, "gemini_paid_standard", ctx, timeout=20, temperature=0.1)
+            summary = r.text.strip() if r and r.text else prev_summary
+        except Exception as e:
+            print(f"[MEMORY] Echec gemini_paid_standard ({e}), fallback free")
+            try:
+                r       = call_gemini(client_gemini_free, "gemini_free_2", ctx, timeout=15, temperature=0.1)
+                summary = r.text.strip() if r and r.text else prev_summary
+            except Exception as e2:
+                print(f"[MEMORY] Echec total ({e2})")
+                summary = prev_summary or ""
+
+        return jsonify({"summary": summary})
+
+    except Exception as e:
+        print(f"[MEMORY] Erreur critique: {e}")
+        return jsonify({"summary": ""}), 500
     try:
         print("[BOOST] Initialisation de l'ecosysteme Echo et reveil des routes...")
         _requests_lib.get("http://127.0.0.1:5000/ping", timeout=2)
