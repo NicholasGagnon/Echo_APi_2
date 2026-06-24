@@ -34,8 +34,8 @@ MODELS = {
 }
 
 # ── Tokens par tier ────────────────────────────────────────────────────────────
-FREE_MAX_TOKENS  = 20_000
-PAID_MAX_TOKENS  = 50_000
+FREE_MAX_TOKENS  = 2_500
+PAID_MAX_TOKENS  = 5_000
 
 API_KEY_FREE          = os.getenv("API_KEY_FREE", "").strip()
 API_KEY_PAID          = os.getenv("API_KEY_PAID", "").strip()
