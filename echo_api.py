@@ -77,7 +77,6 @@ def increment_failover_count():
     GLOBAL_FAILOVER_MEMORY_COUNT += 1
     print(f"[FAILOVER] {GLOBAL_FAILOVER_MEMORY_COUNT} / {MAX_FREE_FAILOVERS}")
 
-# ── Lock modèles 60s si échec ──────────────────────────────────────────────────
 MODELS_LOCK_REGISTRY = {}
 
 def is_model_locked(model_key: str) -> bool:
@@ -361,7 +360,6 @@ def call_openai(client, model_key, ctx, temp=0.2, timeout=20.0):
     )
     return res.choices[0].message.content
 
-# ── Cascade payant selon tier ──────────────────────────────────────────────────
 def run_paid_cascade(ctx):
     tier = ctx["user_tier"]
     if tier == "founder":
@@ -385,7 +383,6 @@ def run_paid_cascade(ctx):
         print(f"[PAID] Echec {fallback} ({e})")
     return ERR_FINAL
 
-# ── Cascade gratuit générique ──────────────────────────────────────────────────
 def run_free_cascade(steps, ctx, parser=None):
     if parser is None:
         parser = clean_and_parse_json
@@ -414,12 +411,9 @@ def run_free_cascade(steps, ctx, parser=None):
 
 # ── HORIZON cascade ────────────────────────────────────────────────────────────
 def get_horizon_steps(user_tier: str):
-    if is_paid_tier(user_tier):
-        return [(client_gemini_paid, "gemini_paid_standard", 25)]
     return [
-        (client_gemini_free, "gemini_free_1", 25),   
-        (client_cloudflare,  "glm",           25),   # GLM
-        (client_gemini_paid, "gemini_paid_standard", 30),  # fallback payant
+        (client_gemini_paid, "gemini_paid_standard", 35),
+        (client_gemini_paid, "gemini_paid_standard", 35),
     ]
 
 def extract_horizon_result(query: str, ctx: dict, attempt: int = 1) -> dict:
@@ -547,8 +541,6 @@ def export_route():
         return jsonify({"error": str(e)}), 500
 
 # ── /home ──────────────────────────────────────────────────────────────────────
-# Payant : paid_cascade
-
 @app.route("/home", methods=["POST"])
 def home():
     try:
@@ -567,7 +559,6 @@ def home():
         return jsonify(ERR_CRASH), 500
 
 # ── /chat ──────────────────────────────────────────────────────────────────────
-# Free : Gemini 2.5 Flash Lite free 6s → GLM 6s → Gemini 2.5 Flash Lite payant 25s
 @app.route("/chat", methods=["POST"])
 def chat():
     try:
@@ -592,21 +583,17 @@ def vitality():
     try:
         data = request.json or {}
         ctx  = prepare_shared_context(data, source_override="vitality")
-        if is_paid_tier(ctx["user_tier"]):
-            return jsonify(run_paid_cascade(ctx))
-        steps = [
-            (client_groq,        "compound",             8),
-            (client_openrouter,  "kimi",                 8),
-            (client_openrouter,  "deepseek",             8),
-            (client_gemini_paid, "gemini_paid_standard", 25),
-        ]
-        return jsonify(run_free_cascade(steps, ctx))
+        try:
+            r = call_gemini(client_gemini_paid, "gemini_paid_standard", ctx, timeout=25, temperature=0.2)
+            return jsonify(clean_and_parse_json(r.text))
+        except Exception as e:
+            print(f"[VITALITY] Echec gemini_paid_standard ({e})")
+        return jsonify(ERR_FINAL)
     except Exception as e:
         print(f"Erreur /vitality: {e}")
         return jsonify(ERR_CRASH), 500
 
 # ── /history ──────────────────────────────────────────────────────────────────
-# Free : DeepSeek 7s → Compound 7s → Gemini 2.5 Flash Lite payant 25s
 @app.route("/history", methods=["POST"])
 def history():
     try:
@@ -625,7 +612,6 @@ def history():
         return jsonify(ERR_CRASH), 500
 
 # ── /books ────────────────────────────────────────────────────────────────────
-# Free : Gemini 2.5 Flash Lite free 6s → Nemotron 6s → Compound 6s → DeepSeek 6s → Gemini 2.5 Flash Lite payant 25s
 @app.route("/books", methods=["POST"])
 def books():
     try:
@@ -711,7 +697,6 @@ def books():
                 (client_gemini_free, "gemini_free_2",        6),
                 (client_nvidia,      "nemotron",              6),
                 (client_groq,        "compound",              6),
-                (client_openrouter,  "deepseek",              6),
                 (client_gemini_paid, "gemini_paid_standard", 25),
             ]
             for i, (client, model_key, timeout) in enumerate(books_steps):
@@ -740,7 +725,7 @@ def books():
         return jsonify({"response": ERR_CRASH["response"], "inject": False, "action": None}), 500
 
 # ── /horizon ──────────────────────────────────────────────────────────────────
-
+# Free : Gemini 2.0 Flash Lite free 15s → GLM 15s → Gemini 2.5 Flash Lite payant 25s
 @app.route("/horizon", methods=["POST"])
 def horizon():
     try:
