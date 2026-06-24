@@ -21,15 +21,15 @@ app = Flask(__name__)
 CORS(app)
 
 MODELS = {
-    "gemini_free_1":        "gemini-2.0-flash-lite",
+    "gemini_free_1":        "gemini-3.1-flash-lite",
     "gemini_free_2":        "gemini-2.5-flash-lite",
     "deepseek":             "deepseek/DeepSeek-V3-0324",
-    "kimi":                 "moonshotai/kimi-k2-freeplay",
+    "kimi":                 "moonshotai/kimi-k2.6",
     "nemotron":             "nvidia/nemotron-3-super-120b-a12b:free",
-    "glm":                  "zai-org/glm-4-32b:free",
+    "glm":                  "@cf/zai-org/glm-5.2",
     "compound":             "compound-beta",
-    "gemini_paid_founder":  "gemini-2.5-flash",
-    "gemini_paid_ultra":    "gemini-2.0-flash-lite",
+    "gemini_paid_founder":  "gemini-3.5-flash",
+    "gemini_paid_ultra":    "gemini-3.1-flash-lite",
     "gemini_paid_standard": "gemini-2.5-flash-lite",
 }
 
@@ -388,7 +388,7 @@ def get_horizon_steps(user_tier: str):
         ]
     return [
         (client_openrouter, "kimi",                 25),  # Kimi K2 freeplay — bon sur données structurées
-        (client_openrouter, "glm",                  25),  # GLM-4 32B free — solide fallback
+        (client_cloudflare, "glm",                  25),  # GLM-4 32B free — solide fallback
         (client_gemini_paid, "gemini_paid_standard", 30), # Gemini 2.5 flash-lite — fallback payant fiable
     ]
 
@@ -679,7 +679,7 @@ def books():
             full_text   = ""
             books_steps = [
                 (client_openrouter,  "kimi",                 10),
-                (client_openrouter,  "glm",                  10),
+                (client_cloudflare,  "glm",                  10),
                 (client_gemini_paid, "gemini_paid_standard", 25),
             ]
             for i, (client, model_key, timeout) in enumerate(books_steps):
