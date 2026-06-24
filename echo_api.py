@@ -821,6 +821,8 @@ def memory_summary():
     except Exception as e:
         print(f"[MEMORY] Erreur critique: {e}")
         return jsonify({"summary": ""}), 500
+
+def _warmup_api():
     try:
         print("[BOOST] Initialisation de l'ecosysteme Echo et reveil des routes...")
         _requests_lib.get("http://127.0.0.1:5000/ping", timeout=2)
