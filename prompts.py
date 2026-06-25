@@ -16,7 +16,6 @@ MODES_PROMPTS = {
 }
 
 # ── RÈGLE DE RESPIRATION UNIVERSELLE ─────────────────────────────────────────
-# Injectée dans TOUS les prompts de toutes les pages sauf HorizonWeb (qui a son propre format)
 BREATHING_FORMAT_RULE = """
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 RÈGLE DE RESPIRATION — OBLIGATOIRE SUR TOUTES LES PAGES
@@ -181,12 +180,9 @@ FORMAT DE RÉPONSE OBLIGATOIRE — JSON VALIDE UNIQUEMENT
 """
 
 
-
-
 def generate_system_prompt(source, selected_buttons, date_aujourdhui, annee_en_cours, user_tier, filtered_calendar, current_expenses=None, current_calories=None, current_cycle="mois"):
 
-    # ── HorizonWeb : prompt dédié uniquement, pas de BREATHING_FORMAT_RULE
-    # (HorizonWeb a son propre format JSON strict avec \\n dans "response")
+    # ── HorizonWeb : prompt dédié uniquement
     if source == "horizonweb":
         return HORIZONWEB_CORE_PROMPT
 
@@ -230,7 +226,7 @@ RÈGLES D'ACTION POUR VITALITÉ :
 Voici les seules structures d'actions que tu as le droit de générer :
 
 1. AJOUTER UNE DÉPENSE :
-"action": {{ "type": "ADD_BUDGET_EXPENSE", "payload": {{ "title": "[Nom]", "amount": [Chiffre], "currency": "[ $ ou € ]", "date": "YYYY-MM-DD" }} }}
+"action": {{ "type": "ADD_BUDGET_EXPENSE", "payload": {{ "title": "[Nom exact du produit/service]", "amount": [Chiffre], "currency": "[ $ ou € ]", "date": "YYYY-MM-DD" }} }}
 
 2. MODIFIER UNE DÉPENSE EXISTANTE :
 "action": {{ "type": "UPDATE_BUDGET_EXPENSE", "payload": {{ "id": "[ID_Trouvé]", "title": "[Nouveau Nom]", "amount": [Nouveau Chiffre], "currency": "[ $ ou € ]", "date": "YYYY-MM-DD" }} }}
@@ -245,27 +241,46 @@ Voici les seules structures d'actions que tu as le droit de générer :
 "action": {{ "type": "UPDATE_CALORIE_GOAL", "payload": {{ "goal": [Chiffre], "weight": [kg ou null], "height": [cm ou null] }} }}
 
 6. AJOUTER UN REPAS :
-"action": {{ "type": "ADD_CALORIE_LOG", "payload": {{ "title": "[Nom]", "meal": "[Nom]", "calories": [Chiffre] }} }}
+"action": {{ "type": "ADD_CALORIE_LOG", "payload": {{ "foodName": "[Nom exact de l'aliment]", "meal": "[Nom exact de l'aliment]", "calories": [Chiffre] }} }}
 
 7. SUPPRIMER UN REPAS :
 "action": {{ "type": "DELETE_CALORIE_LOG", "payload": {{ "id": "[ID_Trouvé]" }} }}
 """
     else:
         actions_rules = f"""
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RÈGLES CRITIQUES POUR L'ACTION CALENDRIER — FORMAT ISO 8601 OBLIGATOIRE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Quand l'utilisateur mentionne une heure pour un rendez-vous, tu DOIS impérativement intégrer cette heure
+directement dans les champs "start" et "end" au format ISO 8601 complet : "YYYY-MM-DDTHH:MM:00"
+
+EXEMPLES OBLIGATOIRES :
+- "rendez-vous demain à 19h jusqu'à 20h" → start: "2026-06-28T19:00:00", end: "2026-06-28T20:00:00"
+- "meeting vendredi 14h30" → start: "2026-06-26T14:30:00", end: "2026-06-26T15:30:00"
+- "toute la journée" ou sans heure → start: "2026-06-28", end: "2026-06-28"
+
+INTERDIT ABSOLUMENT :
+- Ne jamais mettre l'heure dans le champ "notes". Les notes sont pour les commentaires uniquement.
+- Ne jamais retourner start: "YYYY-MM-DD" si une heure a été mentionnée par l'utilisateur.
+
 1. CALENDRIER :
-"action": {{ "type": "ADD_CALENDAR_EVENT", "payload": {{ "title": "[Nom]", "start": "YYYY-MM-DD", "end": "YYYY-MM-DD", "notes": "Heure : [Heure]." }} }}
+"action": {{ "type": "ADD_CALENDAR_EVENT", "payload": {{ "title": "[Nom de l'événement]", "start": "YYYY-MM-DDTHH:MM:00", "end": "YYYY-MM-DDTHH:MM:00", "notes": "[Commentaires optionnels uniquement, PAS l'heure]" }} }}
+
+Si aucune heure n'est mentionnée (journée complète) :
+"action": {{ "type": "ADD_CALENDAR_EVENT", "payload": {{ "title": "[Nom de l'événement]", "start": "YYYY-MM-DD", "end": "YYYY-MM-DD", "notes": "[Commentaires optionnels]" }} }}
 
 2. BUDGET / DÉPENSES :
-"action": {{ "type": "ADD_BUDGET_EXPENSE", "payload": {{ "title": "[Nom]", "amount": [Chiffre], "date": "YYYY-MM-DD" }} }}
+"action": {{ "type": "ADD_BUDGET_EXPENSE", "payload": {{ "title": "[Nom exact du produit/service]", "amount": [Chiffre], "date": "YYYY-MM-DD" }} }}
 
 3. CALORIES / REPAS :
-"action": {{ "type": "ADD_CALORIE_LOG", "payload": {{ "title": "[Nom]", "meal": "[Nom]", "calories": [Chiffre] }} }}
+"action": {{ "type": "ADD_CALORIE_LOG", "payload": {{ "foodName": "[Nom exact de l'aliment]", "meal": "[Nom exact de l'aliment]", "calories": [Chiffre] }} }}
 
 État du calendrier des 31 derniers jours :
 {json.dumps(filtered_calendar)}
 """
 
-    # ── Assemblage final avec BREATHING_FORMAT_RULE injectée dans toutes les pages sauf horizonweb
+    # ── Assemblage final
     if "surprise" in selected_buttons:
         return MODES_PROMPTS["surprise"] + BREATHING_FORMAT_RULE + base_rules + actions_rules
 
