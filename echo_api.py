@@ -69,18 +69,21 @@ def increment_failover_count():
 
 # ── LOCK MODÈLES — 30s ─────────────────────────────────────────────────────────
 MODELS_LOCK_REGISTRY = {}
+_lock_mutex = threading.Lock()
 
 def is_model_locked(model_key: str) -> bool:
-    lock_time = MODELS_LOCK_REGISTRY.get(model_key)
-    if lock_time:
-        if datetime.now() < lock_time:
-            return True
-        else:
-            del MODELS_LOCK_REGISTRY[model_key]
-    return False
+    with _lock_mutex:
+        lock_time = MODELS_LOCK_REGISTRY.get(model_key)
+        if lock_time:
+            if datetime.now() < lock_time:
+                return True
+            else:
+                del MODELS_LOCK_REGISTRY[model_key]
+        return False
 
 def lock_model(model_key: str, seconds: int = 30):
-    MODELS_LOCK_REGISTRY[model_key] = datetime.now() + timedelta(seconds=seconds)
+    with _lock_mutex:
+        MODELS_LOCK_REGISTRY[model_key] = datetime.now() + timedelta(seconds=seconds)
     print(f"[LOCK] {model_key} hors circuit {seconds}s.")
 
 # ── TIERS ──────────────────────────────────────────────────────────────────────
@@ -205,7 +208,7 @@ def prepare_shared_context(data, source_override=None):
     calendar_events  = data.get("calendarEvents", {})
     raw_history      = data.get("history", [])
     memory_summary   = data.get("summary", "")
-    source           = source_override or data.get("source", "chat").lower().strip()
+    source           = source_override or (data.get("source") or "chat").lower().strip()
     image_b64        = data.get("image", None)
     selected_buttons = data.get("selectedButtons", [])
     current_expenses = data.get("currentExpenses", [])
@@ -538,11 +541,11 @@ def history():
 def books():
     try:
         data       = request.json or {}
-        message    = data.get("message", "").strip()
+        message    = (data.get("message") or "").strip()
         history    = data.get("history", [])
         tier       = normalize_tier(data.get("userTier", "connected_free"))
         buttons    = data.get("selectedButtons", [])
-        book_title = data.get("bookTitle", "")
+        book_title = (data.get("bookTitle") or "").strip()
         output_tokens = 2048 if is_paid_tier(tier) else 1024
 
         INJECT_KEYWORDS = ["inject", "injecte", "insere", "ecris ici", "write here", "add this"]
@@ -679,7 +682,7 @@ def books():
 def horizon():
     try:
         data  = request.json or {}
-        query = data.get("query", "").strip()
+        query = (data.get("query") or "").strip()
         if not query:
             return jsonify({"error": "L'intention d'exploration est vide."}), 400
 
