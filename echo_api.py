@@ -463,35 +463,6 @@ def run_free_cascade(steps, ctx, parser=None, is_horizon=False):
 def ping():
     return jsonify({"status": "awake"})
 
-@app.route("/horizon-pre", methods=["POST"])
-def horizon_pre():
-    try:
-        data  = request.json or {}
-        query = (data.get("query") or "").strip()
-        if not query or len(query) < 4:
-            return jsonify({"status": "skip"}), 200
-
-        ctx = {
-            "system_prompt": "Tu es un assistant. Reponds en un mot.",
-            "output_tokens": 5,
-            "messages_openai": [
-                {"role": "system", "content": "Tu es un assistant. Reponds en un mot."},
-                {"role": "user",   "content": f"Sujet : {query[:80]}"},
-            ],
-            "user_tier": "connected_free",
-        }
-
-        threading.Thread(
-            target=lambda: call_openrouter("mistral", ctx, temp=0.1, timeout=15.0),
-            daemon=True
-        ).start()
-
-        return jsonify({"status": "heating"}), 200
-
-    except Exception as e:
-        print(f"[HORIZON-PRE] {e}")
-        return jsonify({"status": "error"}), 200
-
 # ── /home ──────────────────────────────────────────────────────────────────────
 @app.route("/home", methods=["POST"])
 def home():
@@ -807,37 +778,42 @@ def horizon():
             "quels_sont_les_risques", "quelle_option_est_recommandee"
         ]
 
-        # ── Horizon : retry 2.5-flash-lite x5 avec backoff 4s, mistral en filet ──
+        # ── Horizon : cascade simple avec retry au début ──────────────────────
         import time
         parsed = None
-        max_retries = 5
 
-        for attempt in range(max_retries):
-            try:
-                print(f"[HORIZON] Tentative {attempt + 1}/5 — gemini_paid_standard (2.5-flash-lite)")
-                r      = call_gemini_with_search(client_gemini_paid, "gemini_paid_standard", ctx, timeout=45, temperature=0.5)
-                parsed = clean_and_parse_horizon_json(r.text)
-                if parsed.get("response", "").strip():
-                    print("[HORIZON] Succes — gemini_paid_standard")
-                    break
-                else:
-                    print(f"[HORIZON] Reponse vide tentative {attempt + 1}")
-            except Exception as e:
-                print(f"[HORIZON] Echec tentative {attempt + 1} ({e})")
+        horizon_steps = [
+            ("gs", "gemini_paid_standard", 8),   # gemini-2.5-flash-lite + grounding
+            ("gs", "gemini_paid_ultra",    8),   # gemini-3.1-flash-lite + grounding
+            ("ds", "deepseek",             8),   # deepseek direct (filet)
+        ]
 
-            if attempt < max_retries - 1:
-                print(f"[HORIZON] Pause 4s avant retry...")
-                time.sleep(4)
+        for attempt in range(3):  # max 3 passes complètes
+            for provider, model_key, timeout in horizon_steps:
+                try:
+                    print(f"[HORIZON] Pass {attempt+1} — {model_key}")
+                    if provider == "gs":
+                        r      = call_gemini_with_search(client_gemini_paid, model_key, ctx, timeout=timeout, temperature=0.5)
+                        parsed = clean_and_parse_horizon_json(r.text)
+                    else:
+                        r      = call_deepseek(ctx, temp=0.5, timeout=float(timeout))
+                        parsed = clean_and_parse_horizon_json(r)
 
-        # Filet — mistral si 2.5 a échoué 5 fois (mémoire interne, pas de grounding)
+                    if parsed.get("response", "").strip():
+                        print(f"[HORIZON] Succes — {model_key}")
+                        break
+                    else:
+                        print(f"[HORIZON] Reponse vide — {model_key}")
+                except Exception as e:
+                    print(f"[HORIZON] Echec {model_key} ({e})")
+
+            if parsed and parsed.get("response", "").strip():
+                break
+            if attempt < 2:
+                print(f"[HORIZON] Retry complet pass {attempt+2}...")
+
         if not parsed or not parsed.get("response", "").strip():
-            print("[HORIZON] Filet — mistral (memoire interne)")
-            try:
-                r      = call_openrouter("mistral", ctx, temp=0.5, timeout=25.0)
-                parsed = clean_and_parse_horizon_json(r)
-            except Exception as e:
-                print(f"[HORIZON] Echec mistral ({e})")
-                return jsonify(ERR_HORIZON)
+            return jsonify(ERR_HORIZON)
 
         # Normaliser les champs
         if not isinstance(parsed.get("matrix"), dict):
