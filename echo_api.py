@@ -463,6 +463,35 @@ def run_free_cascade(steps, ctx, parser=None, is_horizon=False):
 def ping():
     return jsonify({"status": "awake"})
 
+@app.route("/horizon-pre", methods=["POST"])
+def horizon_pre():
+    try:
+        data  = request.json or {}
+        query = (data.get("query") or "").strip()
+        if not query or len(query) < 4:
+            return jsonify({"status": "skip"}), 200
+
+        ctx = {
+            "system_prompt": "Tu es un assistant. Reponds en un mot.",
+            "output_tokens": 5,
+            "messages_openai": [
+                {"role": "system", "content": "Tu es un assistant. Reponds en un mot."},
+                {"role": "user",   "content": f"Sujet : {query[:80]}"},
+            ],
+            "user_tier": "connected_free",
+        }
+
+        threading.Thread(
+            target=lambda: call_openrouter("mistral", ctx, temp=0.1, timeout=15.0),
+            daemon=True
+        ).start()
+
+        return jsonify({"status": "heating"}), 200
+
+    except Exception as e:
+        print(f"[HORIZON-PRE] {e}")
+        return jsonify({"status": "error"}), 200
+
 # ── /home ──────────────────────────────────────────────────────────────────────
 @app.route("/home", methods=["POST"])
 def home():
@@ -725,6 +754,10 @@ def horizon():
         if not query:
             return jsonify({"error": "L'intention d'exploration est vide."}), 400
 
+        # Warmup — retourner immédiatement sans appeler les modèles
+        if data.get("warmup") or query == "...":
+            return jsonify({"status": "warm"}), 200
+
         maintenant = datetime.now()
         date_str   = maintenant.strftime("%A %d %B %Y")
         heure_str  = maintenant.strftime("%H:%M")
@@ -774,54 +807,45 @@ def horizon():
             "quels_sont_les_risques", "quelle_option_est_recommandee"
         ]
 
-        # free + basic  : mistral 25s → llama 25s → deepseek 25s
-        # premium+      : gemini+search 25s → mistral 25s → deepseek 25s
-        if not is_paid_tier(user_tier) or user_tier == "basic":
-            horizon_steps = [
-                ("or", "mistral",  25),
-                ("or", "llama",    25),
-                ("ds", "deepseek", 25),
-            ]
-        else:
-            horizon_steps = [
-                ("gs", "gemini_paid_ultra", 25),
-                ("or", "mistral",           25),
-                ("ds", "deepseek",          25),
-            ]
+        # ── Horizon : retry 2.5-flash-lite x5 avec backoff 4s, mistral en filet ──
+        import time
+        parsed = None
+        max_retries = 5
 
-        for provider, model_key, timeout in horizon_steps:
-            if is_model_locked(model_key):
-                continue
+        for attempt in range(max_retries):
             try:
-                print(f"[HORIZON] Tentative {model_key}")
-                if provider == "gs":
-                    r      = call_gemini_with_search(client_gemini_paid, model_key, ctx, timeout=timeout, temperature=0.5)
-                    parsed = clean_and_parse_horizon_json(r.text)
-                elif provider == "ds":
-                    r      = call_deepseek(ctx, temp=0.5, timeout=float(timeout))
-                    parsed = clean_and_parse_horizon_json(r)
+                print(f"[HORIZON] Tentative {attempt + 1}/5 — gemini_paid_standard (2.5-flash-lite)")
+                r      = call_gemini_with_search(client_gemini_paid, "gemini_paid_standard", ctx, timeout=45, temperature=0.5)
+                parsed = clean_and_parse_horizon_json(r.text)
+                if parsed.get("response", "").strip():
+                    print("[HORIZON] Succes — gemini_paid_standard")
+                    break
                 else:
-                    r      = call_openrouter(model_key, ctx, temp=0.5, timeout=float(timeout))
-                    parsed = clean_and_parse_horizon_json(r)
-
-                if not parsed.get("response", "").strip():
-                    print(f"[HORIZON] {model_key} reponse vide")
-                    lock_model(model_key, 30)
-                    continue
-
-                if not isinstance(parsed.get("matrix"), dict) or not all(k in parsed["matrix"] for k in required_matrix_keys):
-                    parsed["matrix"] = None
-                if not isinstance(parsed.get("attributes"), list):
-                    parsed["attributes"] = []
-
-                print(f"[HORIZON] Succes — {model_key}")
-                return jsonify(parsed)
-
+                    print(f"[HORIZON] Reponse vide tentative {attempt + 1}")
             except Exception as e:
-                print(f"[HORIZON] Echec {model_key} ({e})")
-                lock_model(model_key, 30)
+                print(f"[HORIZON] Echec tentative {attempt + 1} ({e})")
 
-        return jsonify(ERR_HORIZON)
+            if attempt < max_retries - 1:
+                print(f"[HORIZON] Pause 4s avant retry...")
+                time.sleep(4)
+
+        # Filet — mistral si 2.5 a échoué 5 fois (mémoire interne, pas de grounding)
+        if not parsed or not parsed.get("response", "").strip():
+            print("[HORIZON] Filet — mistral (memoire interne)")
+            try:
+                r      = call_openrouter("mistral", ctx, temp=0.5, timeout=25.0)
+                parsed = clean_and_parse_horizon_json(r)
+            except Exception as e:
+                print(f"[HORIZON] Echec mistral ({e})")
+                return jsonify(ERR_HORIZON)
+
+        # Normaliser les champs
+        if not isinstance(parsed.get("matrix"), dict):
+            parsed["matrix"] = None
+        if not isinstance(parsed.get("attributes"), list):
+            parsed["attributes"] = []
+
+        return jsonify(parsed)
 
     except Exception as e:
         print(f"[HORIZON] Erreur critique: {e}")

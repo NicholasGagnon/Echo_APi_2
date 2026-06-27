@@ -33,3 +33,35 @@ git push origin main
 cd C:\Users\nicog\identity
 git commit --allow-empty -m "force redeploy"
 git push origin main
+
+
+
+// Vider tout le localStorage Echo
+Object.keys(localStorage)
+  .filter(k => k.startsWith("echo"))
+  .forEach(k => { console.log("Supprimé:", k); localStorage.removeItem(k); });
+
+// Vider les conversations anonymes
+localStorage.removeItem("echo-chat-local-convos");
+localStorage.removeItem("echo-conversation-v2");
+
+console.log("Tout nettoyé ✓");
+
+
+
+
+// reset quotas
+Object.keys(localStorage)
+  .filter(k => k.startsWith("echo-usage-tracker"))
+  .forEach(k => { localStorage.removeItem(k); console.log("Supprimé:", k); });
+console.log("Quotas reset ✓");
+// Reset TOUT — quotas + cache horizon
+localStorage.clear();
+console.log("Tout vidé ✓");
+[
+  ...Object.keys(localStorage).filter(k => k.startsWith("echo-usage-tracker")),
+  "horizon_last_query",
+  "horizon_last_response", 
+  "horizon_last_attributes",
+].forEach(k => { localStorage.removeItem(k); console.log("Supprimé:", k); });
+console.log("Quotas reset ✓");
