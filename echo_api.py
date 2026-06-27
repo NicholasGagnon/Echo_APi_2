@@ -29,9 +29,10 @@ MODELS = {
     # OpenRouter payant
     "mistral":    "mistralai/mistral-small-24b-instruct-2501",
     "hy3":        "tencent/hy3-preview",
-    "deepseek":   "deepseek/deepseek-v4-flash",
     "owl":        "openrouter/owl-alpha",
-    "glm":        "zai-org/glm-4-7-flash",
+    "llama":      "meta-llama/llama-3.3-70b-instruct",
+    # DeepSeek direct
+    "deepseek":   "deepseek-chat",
 }
 
 FREE_MAX_TOKENS = 2_500
@@ -40,6 +41,7 @@ PAID_MAX_TOKENS = 5_000
 # ── CLÉS & CLIENTS ─────────────────────────────────────────────────────────────
 API_KEY_PAID          = os.getenv("API_KEY_PAID", "").strip()
 OPENROUTER_API_KEY    = os.getenv("OPENROUTER_API_KEY", "").strip()
+DEEPSEEK_API_KEY      = os.getenv("DEEPSEEK_API_KEY", "").strip()
 CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
 
 client_gemini_paid = genai.Client(api_key=API_KEY_PAID) if API_KEY_PAID else None
@@ -50,6 +52,11 @@ _shared_http_client = httpx.Client(timeout=35.0)
 client_openrouter = (
     OpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_API_KEY, http_client=_shared_http_client)
     if OPENROUTER_API_KEY else None
+)
+
+client_deepseek = (
+    OpenAI(base_url="https://api.deepseek.com", api_key=DEEPSEEK_API_KEY, http_client=_shared_http_client)
+    if DEEPSEEK_API_KEY else None
 )
 
 _cf_session = _requests_lib.Session()
@@ -331,7 +338,7 @@ def call_gemini_with_search(client, model_key, ctx, timeout=30, temperature=0.5)
     return call_with_timeout(fn, timeout)
 
 def call_openrouter(model_key, ctx, temp=0.5, timeout=20.0):
-    """Appel OpenRouter — tous les modèles non-Gemini passent par ici."""
+    """Appel OpenRouter — mistral, hy3, owl, llama passent par ici."""
     if client_openrouter is None:
         raise RuntimeError("OpenRouter non configuré")
     res = client_openrouter.chat.completions.create(
@@ -346,41 +353,57 @@ def call_openrouter(model_key, ctx, temp=0.5, timeout=20.0):
         raise ValueError(f"Reponse vide de {model_key}")
     return content
 
+def call_deepseek(ctx, temp=0.5, timeout=20.0):
+    """Appel DeepSeek direct via leur API OpenAI-compatible."""
+    if client_deepseek is None:
+        raise RuntimeError("DeepSeek non configuré")
+    res = client_deepseek.chat.completions.create(
+        model=MODELS["deepseek"],
+        messages=ctx["messages_openai"],
+        temperature=temp,
+        max_tokens=ctx.get("output_tokens", FREE_MAX_TOKENS),
+        timeout=timeout,
+    )
+    content = res.choices[0].message.content
+    if content is None:
+        raise ValueError("Reponse vide de deepseek")
+    return content
+
 # ── CASCADE PAYANTE par tier ───────────────────────────────────────────────────
 def run_paid_cascade(ctx, page_timeout: int = 10):
     """
     page_timeout : timeout par modèle (varie selon la page)
-    basic    : mistral → deepseek → gemini_paid_standard (15s fixe)
-    premium  : deepseek → gemini_paid_standard → mistral (15s fixe)
-    ultra    : deepseek → gemini_paid_ultra → glm
-    founder  : gemini_paid_founder → gemini_paid_ultra → glm
+    basic    → mistral → hy3 → gemini_paid_standard
+    premium  → deepseek direct → mistral → gemini_paid_standard
+    ultra    → deepseek direct → llama → gemini_paid_standard
+    founder  → gemini_paid_founder → deepseek direct → gemini_paid_standard
     """
     tier = ctx["user_tier"]
-    t    = page_timeout  # timeout dynamique pour les 2 premiers modèles
+    t    = page_timeout
 
     if tier == "basic":
         steps = [
-            ("or", "mistral",           t),
-            ("or", "deepseek",          t),
+            ("or", "mistral",              t),
+            ("or", "hy3",                  t),
             ("g",  "gemini_paid_standard", 15),
         ]
     elif tier == "premium":
         steps = [
-            ("or", "deepseek",          t),
-            ("g",  "gemini_paid_standard", t),
-            ("or", "mistral",           15),
+            ("ds", "deepseek",             t),
+            ("or", "mistral",              t),
+            ("g",  "gemini_paid_standard", 15),
         ]
     elif tier == "ultra":
         steps = [
-            ("or", "deepseek",          t),
-            ("g",  "gemini_paid_ultra", t),
-            ("or", "glm",               30),
+            ("ds", "deepseek",             t),
+            ("or", "llama",                t),
+            ("g",  "gemini_paid_standard", 15),
         ]
     else:  # founder
         steps = [
-            ("g",  "gemini_paid_founder", t),
-            ("g",  "gemini_paid_ultra",   t),
-            ("or", "glm",                 30),
+            ("g",  "gemini_paid_founder",  t),
+            ("ds", "deepseek",             t),
+            ("g",  "gemini_paid_standard", 15),
         ]
 
     for provider, model_key, timeout in steps:
@@ -390,6 +413,9 @@ def run_paid_cascade(ctx, page_timeout: int = 10):
             if provider == "g":
                 r      = call_gemini(client_gemini_paid, model_key, ctx, timeout=timeout, temperature=0.5)
                 result = clean_and_parse_json(r.text)
+            elif provider == "ds":
+                r      = call_deepseek(ctx, temp=0.5, timeout=float(timeout))
+                result = clean_and_parse_json(r)
             else:
                 r      = call_openrouter(model_key, ctx, temp=0.5, timeout=float(timeout))
                 result = clean_and_parse_json(r)
@@ -404,7 +430,7 @@ def run_paid_cascade(ctx, page_timeout: int = 10):
 def run_free_cascade(steps, ctx, parser=None, is_horizon=False):
     """
     steps : liste de (provider, model_key, timeout)
-            provider = "g" (Gemini) | "or" (OpenRouter) | "gs" (Gemini+Search)
+            provider = "g" (Gemini) | "or" (OpenRouter) | "gs" (Gemini+Search) | "ds" (DeepSeek direct)
     is_horizon : désactive le compteur failover global
     """
     if parser is None:
@@ -413,7 +439,9 @@ def run_free_cascade(steps, ctx, parser=None, is_horizon=False):
         return ERR_QUOTA
 
     for i, (provider, model_key, timeout) in enumerate(steps):
-        if client_openrouter is None and provider in ("or",):
+        if provider in ("or",) and client_openrouter is None:
+            continue
+        if provider == "ds" and client_deepseek is None:
             continue
         if is_model_locked(model_key):
             continue
@@ -425,6 +453,9 @@ def run_free_cascade(steps, ctx, parser=None, is_horizon=False):
             elif provider == "gs":
                 r      = call_gemini_with_search(client_gemini_paid, model_key, ctx, timeout=timeout, temperature=0.5)
                 result = parser(r.text)
+            elif provider == "ds":
+                r      = call_deepseek(ctx, temp=0.5, timeout=float(timeout))
+                result = parser(r)
             else:  # "or"
                 r      = call_openrouter(model_key, ctx, temp=0.5, timeout=float(timeout))
                 result = parser(r)
@@ -453,8 +484,8 @@ def home():
         if is_paid_tier(ctx["user_tier"]):
             return jsonify(run_paid_cascade(ctx, page_timeout=10))
         steps = [
-            ("or", "mistral",           8),
-            ("or", "hy3",              12),
+            ("or", "mistral",              8),
+            ("or", "hy3",                 12),
             ("g",  "gemini_paid_standard", 15),
         ]
         return jsonify(run_free_cascade(steps, ctx))
@@ -471,8 +502,8 @@ def chat():
         if is_paid_tier(ctx["user_tier"]):
             return jsonify(run_paid_cascade(ctx, page_timeout=10))
         steps = [
-            ("or", "mistral",           8),
-            ("or", "hy3",              12),
+            ("or", "mistral",              8),
+            ("or", "hy3",                 12),
             ("g",  "gemini_paid_standard", 15),
         ]
         return jsonify(run_free_cascade(steps, ctx))
@@ -489,8 +520,8 @@ def vitality():
         if is_paid_tier(ctx["user_tier"]):
             return jsonify(run_paid_cascade(ctx, page_timeout=20))
         steps = [
-            ("or", "hy3",              20),
-            ("or", "mistral",          20),
+            ("or", "hy3",                 20),
+            ("or", "mistral",             20),
             ("g",  "gemini_paid_standard", 15),
         ]
         return jsonify(run_free_cascade(steps, ctx))
@@ -526,7 +557,7 @@ def history():
         # Fallback si owl a échoué ou était locked
         if result is None:
             fallback_steps = [
-                ("or", "mistral",          20),
+                ("or", "mistral",              20),
                 ("g",  "gemini_paid_standard", 20),
             ]
             result = run_free_cascade(fallback_steps, ctx)
@@ -612,37 +643,56 @@ def books():
                 raise ValueError(f"Reponse vide de {model_key}")
             return content
 
-        # Cascade books — même pour payants
+        def run_books_call_deepseek(timeout):
+            openai_messages = [{"role": "system", "content": system_prompt}]
+            for msg in history[-10:]:
+                if msg.startswith("You: "):
+                    openai_messages.append({"role": "user",      "content": msg[5:]})
+                elif msg.startswith("Echo: "):
+                    openai_messages.append({"role": "assistant", "content": msg[6:]})
+            openai_messages.append({"role": "user", "content": message})
+            res = client_deepseek.chat.completions.create(
+                model=MODELS["deepseek"],
+                messages=openai_messages,
+                temperature=0.5,
+                max_tokens=output_tokens,
+                timeout=float(timeout),
+            )
+            content = res.choices[0].message.content
+            if not content:
+                raise ValueError("Reponse vide de deepseek")
+            return content
+
+        # Cascade books
         books_steps = [
             ("g",  "gemini_paid_standard", 20),
-            ("or", "deepseek",             20),
             ("or", "hy3",                  25),
+            ("or", "mistral",              20),
         ]
-        # Pour payants, on peut utiliser un modèle plus fort en premier
         if is_paid_tier(tier):
             t = 20
             if tier == "founder":
                 books_steps = [
                     ("g",  "gemini_paid_founder", t),
-                    ("g",  "gemini_paid_ultra",   t),
-                    ("or", "glm",                 30),
+                    ("ds", "deepseek",            t),
+                    ("g",  "gemini_paid_standard", 15),
                 ]
             elif tier == "ultra":
                 books_steps = [
-                    ("or", "deepseek",          t),
-                    ("g",  "gemini_paid_ultra", t),
-                    ("or", "glm",               30),
+                    ("ds", "deepseek",             t),
+                    ("or", "llama",                t),
+                    ("g",  "gemini_paid_standard", 15),
                 ]
             elif tier == "premium":
                 books_steps = [
-                    ("or", "deepseek",             t),
-                    ("g",  "gemini_paid_standard", t),
-                    ("or", "mistral",              15),
+                    ("ds", "deepseek",             t),
+                    ("or", "mistral",              t),
+                    ("g",  "gemini_paid_standard", 15),
                 ]
             else:  # basic
                 books_steps = [
                     ("or", "mistral",              t),
-                    ("or", "deepseek",             t),
+                    ("or", "hy3",                  t),
                     ("g",  "gemini_paid_standard", 15),
                 ]
 
@@ -653,6 +703,8 @@ def books():
             try:
                 if provider == "g":
                     full_text = run_books_call_gemini(model_key, timeout)
+                elif provider == "ds":
+                    full_text = run_books_call_deepseek(timeout)
                 else:
                     full_text = run_books_call_openrouter(model_key, timeout)
                 if i == len(books_steps) - 1 and not is_paid_tier(tier):
@@ -709,18 +761,18 @@ def horizon():
 
         ctx = prepare_shared_context(data, source_override="horizonweb")
 
-        # Horizon : mêmes modèles peu importe le tier
-        # deepseek-v4-flash (OR) 25s → gemini-3.1-flash-lite 25s → hy3 (OR) 25s
         required_matrix_keys = [
             "c_est_quoi", "est_ce_bon", "combien_ca_coute", "est_ce_disponible",
             "qu_en_pensent_les_gens", "quelles_sont_les_alternatives",
             "quels_sont_les_risques", "quelle_option_est_recommandee"
         ]
 
+        # Horizon : mêmes modèles pour tous les tiers
+        # deepseek direct 25s → gemini-3.1-flash-lite+search 25s → llama (OR) 25s
         horizon_steps = [
-            ("or", "deepseek", 25),
-            ("gs", "gemini_paid_ultra", 25),  # gemini-3.1-flash-lite avec search
-            ("or", "hy3",     25),
+            ("ds", "deepseek",        25),
+            ("gs", "gemini_paid_ultra", 25),
+            ("or", "llama",           25),
         ]
 
         parsed = None
@@ -732,6 +784,9 @@ def horizon():
                 if provider == "gs":
                     r      = call_gemini_with_search(client_gemini_paid, model_key, ctx, timeout=timeout, temperature=0.5)
                     parsed = clean_and_parse_horizon_json(r.text)
+                elif provider == "ds":
+                    r      = call_deepseek(ctx, temp=0.5, timeout=float(timeout))
+                    parsed = clean_and_parse_horizon_json(r)
                 else:
                     r      = call_openrouter(model_key, ctx, temp=0.5, timeout=float(timeout))
                     parsed = clean_and_parse_horizon_json(r)
