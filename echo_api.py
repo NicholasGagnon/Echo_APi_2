@@ -371,13 +371,6 @@ def call_deepseek(ctx, temp=0.5, timeout=20.0):
 
 # ── CASCADE PAYANTE par tier ───────────────────────────────────────────────────
 def run_paid_cascade(ctx, page_timeout: int = 10):
-    """
-    page_timeout : timeout par modèle (varie selon la page)
-    basic    → mistral → hy3 → gemini_paid_standard
-    premium  → deepseek direct → mistral → gemini_paid_standard
-    ultra    → deepseek direct → llama → gemini_paid_standard
-    founder  → gemini_paid_founder → deepseek direct → gemini_paid_standard
-    """
     tier = ctx["user_tier"]
     t    = page_timeout
 
@@ -428,11 +421,6 @@ def run_paid_cascade(ctx, page_timeout: int = 10):
 
 # ── CASCADE FREE ───────────────────────────────────────────────────────────────
 def run_free_cascade(steps, ctx, parser=None, is_horizon=False):
-    """
-    steps : liste de (provider, model_key, timeout)
-            provider = "g" (Gemini) | "or" (OpenRouter) | "gs" (Gemini+Search) | "ds" (DeepSeek direct)
-    is_horizon : désactive le compteur failover global
-    """
     if parser is None:
         parser = clean_and_parse_json
     if not is_horizon and get_failover_count() >= MAX_FREE_FAILOVERS:
@@ -543,7 +531,7 @@ def history():
 
         result = None
 
-        # ── owl-alpha : lock 60s après TOUTE réponse (succès ou échec) ──
+        # owl-alpha : lock 60s après TOUTE réponse (succès ou échec)
         if not is_model_locked("owl"):
             try:
                 r      = call_openrouter("owl", ctx, temp=0.5, timeout=15.0)
@@ -552,9 +540,8 @@ def history():
             except Exception as e:
                 print(f"[HISTORY] owl-alpha echec ({e})")
             finally:
-                lock_model("owl", 60)  # toujours locker owl après passage
+                lock_model("owl", 60)
 
-        # Fallback si owl a échoué ou était locked
         if result is None:
             fallback_steps = [
                 ("or", "mistral",              20),
@@ -597,7 +584,6 @@ def books():
             )
         system_prompt = f"{mode_instruction}{inject_instruction}\n\nLivre : \"{book_title}\". Reponds en moins de 400 mots. Sois direct et elegant."
 
-        # Historique Gemini avec alternance stricte
         gemini_history = []
         for msg in history[-10:]:
             if msg.startswith("You: "):
@@ -663,7 +649,6 @@ def books():
                 raise ValueError("Reponse vide de deepseek")
             return content
 
-        # Cascade books
         books_steps = [
             ("g",  "gemini_paid_standard", 20),
             ("or", "hy3",                  25),
@@ -729,7 +714,9 @@ def books():
         return jsonify({"response": ERR_CRASH["response"], "inject": False, "action": None}), 500
 
 # ── /horizon ──────────────────────────────────────────────────────────────────
-# Exception : mêmes modèles pour TOUS les tiers (free et payant)
+# CONTEXTE ISOLÉ — aucun historique de conversation pour ne pas polluer le grounding
+# Cascades : free/basic → mistral → llama → deepseek
+#            premium/ultra/founder → gemini+search → mistral → deepseek
 @app.route("/horizon", methods=["POST"])
 def horizon():
     try:
@@ -741,8 +728,10 @@ def horizon():
         maintenant = datetime.now()
         date_str   = maintenant.strftime("%A %d %B %Y")
         heure_str  = maintenant.strftime("%H:%M")
+        user_tier  = normalize_tier(data.get("userTier", "connected_free"))
 
-        data["message"] = (
+        # ── Contexte ISOLÉ — aucun historique, aucune pollution ──────────────
+        horizon_message = (
             f"DATE ET HEURE ACTUELLES : {date_str}, {heure_str} (heure locale du serveur).\n"
             f"ANNEE EN COURS : 2026. Toutes les informations doivent etre actuelles et valides en 2026.\n\n"
             f"INSTRUCTION OBLIGATOIRE — GOOGLE SEARCH ACTIVE :\n"
@@ -759,7 +748,25 @@ def horizon():
             f"Reponds UNIQUEMENT en JSON valide avec les cles : response, attributes, matrix."
         )
 
-        ctx = prepare_shared_context(data, source_override="horizonweb")
+        horizon_system = generate_system_prompt(
+            source="horizonweb",
+            selected_buttons=[],
+            date_aujourdhui=date_str,
+            annee_en_cours="2026",
+            user_tier=user_tier,
+            filtered_calendar={},
+        )
+
+        ctx = {
+            "system_prompt":   horizon_system,
+            "output_tokens":   PAID_MAX_TOKENS if is_paid_tier(user_tier) else FREE_MAX_TOKENS,
+            "gemini_contents": [{"role": "user", "parts": [types.Part.from_text(text=horizon_message)]}],
+            "messages_openai": [
+                {"role": "system", "content": horizon_system},
+                {"role": "user",   "content": horizon_message},
+            ],
+            "user_tier": user_tier,
+        }
 
         required_matrix_keys = [
             "c_est_quoi", "est_ce_bon", "combien_ca_coute", "est_ce_disponible",
@@ -767,15 +774,21 @@ def horizon():
             "quels_sont_les_risques", "quelle_option_est_recommandee"
         ]
 
-        # Horizon : mêmes modèles pour tous les tiers
-        # deepseek direct 25s → gemini-3.1-flash-lite+search 25s → llama (OR) 25s
-        horizon_steps = [
-            ("ds", "deepseek",        25),
-            ("gs", "gemini_paid_ultra", 25),
-            ("or", "llama",           25),
-        ]
+        # free + basic  : mistral 25s → llama 25s → deepseek 25s
+        # premium+      : gemini+search 25s → mistral 25s → deepseek 25s
+        if not is_paid_tier(user_tier) or user_tier == "basic":
+            horizon_steps = [
+                ("or", "mistral",  25),
+                ("or", "llama",    25),
+                ("ds", "deepseek", 25),
+            ]
+        else:
+            horizon_steps = [
+                ("gs", "gemini_paid_ultra", 25),
+                ("or", "mistral",           25),
+                ("ds", "deepseek",          25),
+            ]
 
-        parsed = None
         for provider, model_key, timeout in horizon_steps:
             if is_model_locked(model_key):
                 continue
@@ -851,14 +864,13 @@ def memory_summary():
             "user_tier": user_tier,
         }
 
-        # Essai Gemini d'abord, fallback OpenRouter
         try:
             r       = call_gemini(client_gemini_paid, "gemini_paid_standard", ctx, timeout=20, temperature=0.1)
             summary = (r.text or "").strip() if r else ""
             if summary:
                 return jsonify({"summary": summary})
         except Exception as e:
-            print(f"[MEMORY] Gemini echec ({e}), fallback OpenRouter")
+            print(f"[MEMORY] Gemini echec ({e}), fallback mistral")
 
         try:
             r       = call_openrouter("mistral", ctx, temp=0.1, timeout=15.0)
