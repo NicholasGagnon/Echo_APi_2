@@ -584,13 +584,17 @@ def vitality():
         data = request.json or {}
         ctx  = prepare_shared_context(data, source_override="vitality")
         if is_paid_tier(ctx["user_tier"]):
-            return jsonify(run_paid_cascade(ctx, page_timeout=20))
+            result = run_paid_cascade(ctx, page_timeout=20)
+            print(f"[VITALITY] action retournée: {result.get('action')}")
+            return jsonify(result)
         steps = [
             ("or", "hy3",                 20),
             ("or", "mistral",             20),
             ("z",  "glm",                 15),
         ]
-        return jsonify(run_free_cascade(steps, ctx))
+        result = run_free_cascade(steps, ctx)
+        print(f"[VITALITY] action retournée: {result.get('action')}")
+        return jsonify(result)
     except Exception as e:
         print(f"Erreur /vitality: {e}")
         return jsonify(ERR_CRASH), 500
