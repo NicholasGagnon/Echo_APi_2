@@ -1020,5 +1020,38 @@ def _warmup_api():
 
 threading.Thread(target=_warmup_api, daemon=True).start()
 
+# ── BENCHMARK AU DÉMARRAGE — vitesse comparée des modèles ─────────────────────
+def benchmark_models():
+    time.sleep(8)  # laisser Flask démarrer proprement
+    print("[BENCH] Démarrage du benchmark modèles...")
+    test_ctx = {
+        "system_prompt": "Reponds en un mot.",
+        "output_tokens": 5,
+        "messages_openai": [
+            {"role": "system", "content": "Reponds en un mot."},
+            {"role": "user",   "content": "Bonjour"},
+        ],
+        "gemini_contents": [{"role": "user", "parts": [types.Part.from_text(text="Bonjour")]}],
+        "user_tier": "connected_free",
+    }
+    benchmarks = [
+        ("mistral",  lambda: call_openrouter("mistral",  test_ctx, temp=0.1, timeout=15.0)),
+        ("ling",     lambda: call_openrouter("ling",     test_ctx, temp=0.1, timeout=10.0)),
+        ("deepseek", lambda: call_deepseek(test_ctx,              temp=0.1, timeout=15.0)),
+        ("glm",      lambda: call_glm(test_ctx,                   temp=0.1, timeout=15.0)),
+    ]
+    for name, fn in benchmarks:
+        try:
+            t0 = time.time()
+            fn()
+            ms = int((time.time() - t0) * 1000)
+            LAST_RESPONSE_MS[name] = ms
+            print(f"[BENCH] {name} : {ms}ms ✓")
+        except Exception as e:
+            LAST_ERROR[name] = f"bench: {str(e)[:60]}"
+            print(f"[BENCH] {name} echec : {e}")
+
+threading.Thread(target=benchmark_models, daemon=True).start()
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)

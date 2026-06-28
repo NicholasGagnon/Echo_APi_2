@@ -3,262 +3,238 @@
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Echo API — Monitoring</title>
+  <title>Echo Dashboard — Cockpit Mode</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #050507; color: #00f0ff; font-family: 'Courier New', monospace; min-height: 100vh; padding: 1.5rem; overflow-x: hidden; }
 
-    body {
-      background: #09090b;
-      color: #e4e4e7;
-      font-family: 'Courier New', monospace;
-      min-height: 100vh;
-      padding: 2rem;
-    }
+    /* Grille d'arrière-plan style Matrice/Sci-Fi */
+    body::before { content: ""; position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background-image: linear-gradient(rgba(18, 18, 24, 0.7) 1px, transparent 1px), linear-gradient(90deg, rgba(18, 18, 24, 0.7) 1px, transparent 1px); background-size: 20px 20px; z-index: -1; }
 
-    header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      margin-bottom: 2rem;
-      padding-bottom: 1rem;
-      border-bottom: 1px solid #27272a;
-    }
+    header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 2rem; padding-bottom: 1rem; border-bottom: 2px dashed #00f0ff; box-shadow: 0 10px 20px -10px rgba(0, 240, 255, 0.2); }
+    h1 { font-size: 1.2rem; font-weight: 900; letter-spacing: 0.2em; text-transform: uppercase; text-shadow: 0 0 8px rgba(0, 240, 255, 0.6); }
+    h1 span.red { color: #ff0055; text-shadow: 0 0 8px rgba(ff, 0, 85, 0.6); }
 
-    h1 {
-      font-size: 1.1rem;
-      font-weight: 900;
-      letter-spacing: 0.15em;
-      text-transform: uppercase;
-    }
+    .badge { font-size: 0.7rem; font-weight: 900; padding: 0.35rem 1rem; border-radius: 4px; border: 1px solid; text-transform: uppercase; box-shadow: 0 0 10px currentColor; }
+    .badge.ok    { background: rgba(0,240,255,0.1); border-color: #00f0ff; color: #00f0ff; }
+    .badge.warn  { background: rgba(245,158,11,0.1); border-color: #f59e0b; color: #f59e0b; }
+    .badge.error { background: rgba(255,0,85,0.1);  border-color: #ff0055; color: #ff0055; }
+    .badge.loading { background: #1f1f2e; border-color: #71717a; color: #71717a; animation: pulse 1.5s infinite; }
 
-    h1 span.cyan  { color: #06b6d4; }
-    h1 span.red   { color: #dc2626; }
+    .btn { background: #00f0ff; border: none; color: #000; padding: 0.4rem 1rem; border-radius: 4px; cursor: pointer; font-family: monospace; font-size: 0.7rem; font-weight: 900; text-transform: uppercase; box-shadow: 0 0 10px rgba(0, 240, 255, 0.5); transition: all 0.2s; }
+    .btn:hover { background: #fff; box-shadow: 0 0 20px rgba(255, 255, 255, 0.8); }
 
-    .global-badge {
-      font-size: 0.7rem;
-      font-weight: 900;
-      letter-spacing: 0.1em;
-      text-transform: uppercase;
-      padding: 0.3rem 0.9rem;
-      border-radius: 9999px;
-      border: 1px solid;
-    }
-    .global-badge.ok    { background: rgba(16,185,129,0.1); border-color: #10b981; color: #10b981; }
-    .global-badge.warn  { background: rgba(245,158,11,0.1); border-color: #f59e0b; color: #f59e0b; }
-    .global-badge.error { background: rgba(220,38,38,0.1);  border-color: #dc2626; color: #dc2626; }
+    /* Tableau de bord principal */
+    .dashboard-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1.5rem; margin-bottom: 2rem; }
+    .panel { background: #0c0d12; border: 2px solid #1f2232; border-radius: 12px; padding: 1.2rem; box-shadow: inset 0 0 15px rgba(0,0,0,0.6); position: relative; }
+    .panel::after { content: ""; position: absolute; top: 0; left: 0; width: 100%; height: 4px; background: #00f0ff; border-radius: 12px 12px 0 0; }
+    .panel.critical::after { background: #ff0055; }
+    .panel-title { font-size: 0.65rem; font-weight: 900; letter-spacing: 0.15em; text-transform: uppercase; color: #71717a; margin-bottom: 1rem; border-bottom: 1px solid #1f2232; padding-bottom: 0.3rem; }
 
-    .refresh-btn {
-      background: none;
-      border: 1px solid #3f3f46;
-      color: #a1a1aa;
-      padding: 0.3rem 0.8rem;
-      border-radius: 0.5rem;
-      cursor: pointer;
-      font-family: monospace;
-      font-size: 0.7rem;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-      transition: all 0.2s;
-      margin-left: 0.75rem;
-    }
-    .refresh-btn:hover { border-color: #06b6d4; color: #06b6d4; }
+    /* --- CADRANS À AIGUILLE (SVG) --- */
+    .gauge-cluster { display: flex; flex-wrap: wrap; gap: 1.5rem; justify-content: center; }
+    .gauge-box { text-align: center; width: 110px; }
+    .gauge-svg { width: 100px; height: 100px; }
+    .gauge-bg { fill: none; stroke: #1a1d29; stroke-width: 8; }
+    .gauge-fill { fill: none; stroke: #00f0ff; stroke-width: 8; stroke-linecap: round; transform: rotate(-90deg); transform-origin: 50% 50%; transition: stroke-dasharray 0.5s ease; }
+    .gauge-needle { fill: #ff0055; transform-origin: 50% 50%; transition: transform 0.5s cubic-bezier(0.175, 0.885, 0.32, 1.275); }
+    .gauge-label { font-size: 0.65rem; color: #a1a1aa; margin-top: 0.3rem; display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .gauge-value { font-size: 0.7rem; font-weight: 900; color: #fff; }
 
-    .last-update {
-      font-size: 0.65rem;
-      color: #52525b;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-    }
+    /* --- COMPTEURS DIGITAUX À ROULEAUX --- */
+    .odometer-box { display: flex; align-items: center; justify-content: space-between; background: #050609; border: 1px dashed #00f0ff; padding: 0.5rem; border-radius: 4px; margin-bottom: 0.5rem; box-shadow: inset 0 0 8px rgba(0,0,0,0.8); }
+    .odo-label { font-size: 0.75rem; color: #a1a1aa; font-weight: bold; }
+    .odo-display { background: #11131c; padding: 0.2rem 0.5rem; border-radius: 2px; border: 1px solid #222536; display: flex; font-size: 0.85rem; font-weight: 900; color: #ffeb3b; text-shadow: 0 0 5px rgba(255, 235, 59, 0.5); font-family: monospace; letter-spacing: 2px; }
 
-    .grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 1.25rem;
-      margin-bottom: 1.25rem;
-    }
-
-    @media (max-width: 700px) { .grid { grid-template-columns: 1fr; } }
-
-    .card {
-      background: #18181b;
-      border: 1px solid #27272a;
-      border-radius: 0.875rem;
-      padding: 1.25rem;
-    }
-
-    .card-title {
-      font-size: 0.65rem;
-      font-weight: 900;
-      letter-spacing: 0.15em;
-      text-transform: uppercase;
-      color: #71717a;
-      margin-bottom: 1rem;
-    }
-
-    .row {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 0.5rem 0;
-      border-bottom: 1px solid #27272a;
-    }
+    /* Listes d'endpoints standards */
+    .row { display: flex; align-items: center; justify-content: space-between; padding: 0.4rem 0; border-bottom: 1px solid #141724; font-size: 0.75rem; }
     .row:last-child { border-bottom: none; }
+    .status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 0.5rem; box-shadow: 0 0 8px currentColor; }
+    .status-dot.ok { color: #00f0ff; background: #00f0ff; }
+    .status-dot.warn { color: #f59e0b; background: #f59e0b; }
+    .status-dot.error { color: #ff0055; background: #ff0055; }
+    .ms-badge { font-size: 0.65rem; color: #71717a; margin-right: 0.5rem; }
 
-    .row-label {
-      font-size: 0.8rem;
-      color: #a1a1aa;
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
-    }
+    .tags { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+    .tag { font-size: 0.6rem; font-weight: 700; padding: 0.2rem 0.5rem; border-radius: 3px; background: rgba(0, 240, 255, 0.1); border: 1px solid #00f0ff; color: #00f0ff; }
+    .tag.locked { background: rgba(255, 0, 85, 0.1); border-color: #ff0055; color: #ff0055; animation: blink 1s infinite; }
 
-    .dot {
-      width: 7px;
-      height: 7px;
-      border-radius: 50%;
-      flex-shrink: 0;
-    }
-    .dot.ok    { background: #10b981; box-shadow: 0 0 6px #10b981; }
-    .dot.warn  { background: #f59e0b; box-shadow: 0 0 6px #f59e0b; }
-    .dot.error { background: #dc2626; box-shadow: 0 0 6px #dc2626; }
-    .dot.loading { background: #3f3f46; animation: pulse 1s infinite; }
-
-    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
-
-    .row-value {
-      font-size: 0.75rem;
-      font-weight: 700;
-      color: #e4e4e7;
-    }
-    .row-value.ok    { color: #10b981; }
-    .row-value.warn  { color: #f59e0b; }
-    .row-value.error { color: #dc2626; }
-
-    .models-card { grid-column: 1 / -1; }
-
-    .models-list {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 0.5rem;
-    }
-
-    .model-tag {
-      font-size: 0.65rem;
-      font-weight: 700;
-      letter-spacing: 0.06em;
-      text-transform: uppercase;
-      padding: 0.25rem 0.6rem;
-      border-radius: 0.4rem;
-      background: rgba(6,182,212,0.08);
-      border: 1px solid rgba(6,182,212,0.2);
-      color: #06b6d4;
-    }
-
-    .loading-msg {
-      text-align: center;
-      color: #52525b;
-      font-size: 0.75rem;
-      padding: 3rem;
-      letter-spacing: 0.1em;
-      text-transform: uppercase;
-    }
+    @keyframes pulse { 0%,100%{opacity: 1} 50%{opacity: 0.4} }
+    @keyframes blink { 0%,100%{opacity: 1} 50%{opacity: 0.5} }
   </style>
 </head>
 <body>
 
 <header>
-  <h1><span class="cyan">Echo</span> <span class="red">API</span> — Monitoring</h1>
-  <div style="display:flex;align-items:center;gap:1rem">
-    <span class="last-update" id="lastUpdate">—</span>
-    <span class="global-badge loading" id="globalBadge">Chargement...</span>
-    <button class="refresh-btn" onclick="load()">↻ Refresh</button>
+  <h1><span class="cyan">ECHO</span> <span class="red">COCKPIT</span> // MONITOR</h1>
+  <div style="display:flex;align-items:center;gap:1rem;">
+    <span style="font-size: 0.65rem; color:#71717a;" id="lastUpdate">—</span>
+    <span class="badge loading" id="globalBadge">BOOTING...</span>
+    <button class="btn" onclick="load()">SYS REFRESH</button>
   </div>
 </header>
 
 <div id="content">
-  <div class="loading-msg">Connexion au monitoring...</div>
+  <div style="text-align:center;color:#71717a;font-size:0.8rem;padding:5rem;letter-spacing:0.2em">INITIALISATION DES SYSTÈMES...</div>
 </div>
 
 <script>
-  const API = "http://127.0.0.1:5001/api/monitoring";
+const API = "http://127.0.0.1:5001/api/monitoring";
 
-  function statusClass(s) {
-    if (s === "ok")    return "ok";
-    if (s === "warn")  return "warn";
-    return "error";
-  }
+function getStatusClass(s) { return s === "ok" ? "ok" : s === "warn" ? "warn" : "error"; }
 
-  function renderRow(label, item) {
-    const sc = statusClass(item.status || (item.ok ? "ok" : "error"));
-    return `
-      <div class="row">
-        <span class="row-label">
-          <span class="dot ${sc}"></span>
-          ${label}
-        </span>
-        <span class="row-value ${sc}">${item.label || "—"}</span>
+// Générateur d'aiguille à cadran (SVG) — FIXÉ
+function drawGauge(label, msValue) {
+  let maxMs = 5000; 
+  let val = Math.min(msValue || 0, maxMs);
+  let percentage = val / maxMs;
+  
+  // L'arc va de -90 degrés (0ms) à +90 degrés (5000ms)
+  let angle = -90 + (percentage * 180); 
+  
+  let strokeColor = "#00f0ff";
+  if (msValue > 1500) strokeColor = "#f59e0b";
+  if (msValue > 3500) strokeColor = "#ff0055";
+
+  let radius = 36;
+  let circumference = 2 * Math.PI * radius; 
+  let strokeDash = (percentage * (circumference / 2)); 
+
+  return `
+    <div class="gauge-box">
+      <svg class="gauge-svg" viewBox="0 0 100 100">
+        <path class="gauge-bg" d="M 14 50 A 36 36 0 0 1 86 50" stroke-dasharray="113 113" stroke-linecap="round"/>
+        <path class="gauge-fill" d="M 14 50 A 36 36 0 0 1 86 50" stroke="${strokeColor}" stroke-dasharray="${strokeDash} 226" />
+        <line x1="50" y1="50" x2="50" y2="18" stroke="#ff0055" stroke-width="3" stroke-linecap="round" transform="rotate(${angle}, 50, 50)"/>
+        <circle cx="50" cy="50" r="5" fill="#fff" stroke="#ff0055" stroke-width="1" />
+      </svg>
+      <span class="gauge-label">${label}</span>
+      <span class="gauge-value">${msValue ? msValue + 'ms' : '—'}</span>
+    </div>`;
+}
+
+function load() {
+  const badge = document.getElementById("globalBadge");
+  badge.className = "badge loading"; badge.textContent = "SYNC...";
+
+  fetch(API).then(r => r.json()).then(data => {
+    const g = data.global || "error";
+    badge.className = `badge ${getStatusClass(g)}`;
+    badge.textContent = g === "ok" ? "✓ RADAR CLEAR" : g === "warn" ? "⚠ WARN DEGRADED" : "✗ SYS CRITICAL";
+    document.getElementById("lastUpdate").textContent = "SYS_TIME: " + new Date().toLocaleTimeString("fr-CA");
+
+    const p = data.providers || {};
+    const e = data.endpoints || {};
+    const m = data.models_active || [];
+    const st = data.echo_stats || null;
+
+    // 1. Génération des Odomètres (Balances fournisseurs)
+    const renderOdo = (name, obj) => `
+      <div class="odometer-box">
+        <span class="odo-label">${name}</span>
+        <span class="odo-display">${obj.label || '0.00$'}</span>
       </div>`;
-  }
 
-  function load() {
-    document.getElementById("globalBadge").className = "global-badge loading";
-    document.getElementById("globalBadge").textContent = "...";
+    // 2. Génération des cadrans à aiguilles pour les temps de réponse
+    const msData = st?.response_ms || {};
+    let gaugesHtml = "";
+    Object.keys(msData).forEach(k => {
+      gaugesHtml += drawGauge(k, msData[k]);
+    });
+    if (!gaugesHtml) gaugesHtml = `<span style="font-size:0.7rem;color:#71717a">Aucun relevé radar actif</span>`;
 
-    fetch(API)
-      .then(r => r.json())
-      .then(data => {
-        const g = data.global || "error";
-        const badge = document.getElementById("globalBadge");
-        badge.className = `global-badge ${g}`;
-        badge.textContent = g === "ok" ? "✓ Tout opérationnel" : g === "warn" ? "⚠ Dégradé" : "✗ Critique";
+    // 3. Modèles lockés & erreurs
+    const locked = st?.locked_models || [];
+    const lockedHtml = locked.length === 0 
+      ? `<span style="font-size:0.65rem;color:#71717a">Aucun cylindre locké</span>`
+      : locked.map(l => `<span class="tag locked">LOCK: ${l.model} (${l.seconds_left}s)</span>`).join("");
 
-        document.getElementById("lastUpdate").textContent =
-          "Mis à jour : " + new Date().toLocaleTimeString("fr-CA");
+    const errors = st?.last_errors || {};
+    let errHtml = "";
+    Object.keys(errors).forEach(k => {
+      errHtml += `<div class="row" style="color:#ff0055"><span style="font-weight:bold">${k}</span><span style="font-size:0.65rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:60%">${errors[k]}</span></div>`;
+    });
+    if (!errHtml) errHtml = `<span style="font-size:0.65rem;color:#71717a">Registre d'erreurs vierge</span>`;
 
-        const p = data.providers || {};
-        const e = data.endpoints || {};
-        const m = data.models_active || [];
+    // 4. Liste des Endpoints
+    const renderRow = (label, item) => {
+      const cls = getStatusClass(item.status || (item.ok ? "ok" : "error"));
+      const ms = item.ms != null ? `<span class="ms-badge">${item.ms}ms</span>` : "";
+      return `
+        <div class="row">
+          <span><span class="status-dot ${cls}"></span>${label}</span>
+          <span>${ms}<span style="font-weight:bold; color:${cls === 'ok' ? '#00f0ff' : cls === 'warn' ? '#f59e0b' : '#ff0055'}">${item.label || '—'}</span></span>
+        </div>`;
+    };
 
-        document.getElementById("content").innerHTML = `
-          <div class="grid">
+    document.getElementById("content").innerHTML = `
+      <div class="dashboard-grid">
+        <div class="panel">
+          <div class="panel-title">🎛️ Jauges de Carburant (API Balances)</div>
+          ${renderOdo("OPENROUTER", p.openrouter || {})}
+          ${renderOdo("DEEPSEEK", p.deepseek || {})}
+          ${renderOdo("Z.AI (GLM)", p.zai || {})}
+          ${renderOdo("GEMINI PAID", p.gemini || {})}
+        </div>
 
-            <div class="card">
-              <div class="card-title">💳 Providers & Balances</div>
-              ${renderRow("OpenRouter", p.openrouter || {})}
-              ${renderRow("DeepSeek",   p.deepseek   || {})}
-              ${renderRow("Z.AI (GLM)", p.zai        || {})}
-              ${renderRow("Gemini",     p.gemini     || {})}
-            </div>
+        <div class="panel">
+          <div class="panel-title">⚡ Unité Centrale (Core Stats)</div>
+          <div class="row"><span>Uptime Système</span><span style="color:#fff;font-weight:bold">${st?.uptime || '—'}</span></div>
+          <div class="row"><span>Failovers Limiteur</span><span style="color:#fff;font-weight:bold">${st?.failovers || 0} / ${st?.max_failovers || 200}</span></div>
+          <div style="margin-top:1rem">
+            <div class="panel-title" style="border:none;margin-bottom:0.5rem">Injecteurs Bloqués</div>
+            <div class="tags">${lockedHtml}</div>
+          </div>
+        </div>
+      </div>
 
-            <div class="card">
-              <div class="card-title">📡 Endpoints Echo API</div>
-              ${renderRow("/ping",           e.ping           || {})}
-              ${renderRow("/horizon",        e.horizon        || {})}
-              ${renderRow("/horizon-pre",    e.horizon_pre    || {})}
-              ${renderRow("/horizon-warmup", e.horizon_warmup || {})}
-              ${renderRow("/chat",           e.chat           || {})}
-              ${renderRow("/vitality",       e.vitality       || {})}
-            </div>
+      <div class="panel" style="margin-bottom: 1.5rem;">
+        <div class="panel-title">🏎️ Compte-Tours & Tachymètres (Vitesse Modèles)</div>
+        <div class="gauge-cluster">
+          ${gaugesHtml}
+        </div>
+      </div>
 
-            <div class="card models-card">
-              <div class="card-title">🤖 Modèles actifs</div>
-              <div class="models-list">
-                ${m.map(name => `<span class="model-tag">${name}</span>`).join("")}
-              </div>
-            </div>
+      <div class="dashboard-grid">
+        <div class="panel">
+          <div class="panel-title">📡 Canaux de Routage — Pages</div>
+          ${renderRow("/chat", e.chat || {})}
+          ${renderRow("/vitality", e.vitality || {})}
+          ${renderRow("/history", e.history || {})}
+          ${renderRow("/books", e.books || {})}
+          ${renderRow("/horizon", e.horizon || {})}
+        </div>
 
-          </div>`;
-      })
-      .catch(err => {
-        document.getElementById("globalBadge").className = "global-badge error";
-        document.getElementById("globalBadge").textContent = "✗ Monitoring inaccessible";
-        document.getElementById("content").innerHTML =
-          `<div class="loading-msg" style="color:#dc2626">Impossible de joindre le monitoring.<br>${err}</div>`;
-      });
-  }
+        <div class="panel">
+          <div class="panel-title">📡 Canaux de Routage — Kernel</div>
+          ${renderRow("/ping", e.ping || {})}
+          ${renderRow("/horizon-pre", e.horizon_pre || {})}
+          ${renderRow("/horizon-warmup", e.horizon_warmup || {})}
+          ${renderRow("/memory-summary", e.memory_summary || {status:"warn", label:"Non testé"})}
+        </div>
+      </div>
 
-  load();
-  setInterval(load, 30000); // auto-refresh 30s
+      <div class="dashboard-grid">
+        <div class="panel critical" style="grid-column: span 1;">
+          <div class="panel-title" style="color:#ff0055">⚠️ Rapport d'Avarie (Boîte Noire)</div>
+          ${errHtml}
+        </div>
+        <div class="panel" style="grid-column: span 2;">
+          <div class="panel-title">🤖 Carburants Compatibles (Modèles actifs)</div>
+          <div class="tags" style="gap:0.6rem">${m.map(n => `<span class="tag">${n}</span>`).join("")}</div>
+        </div>
+      </div>`;
+
+  }).catch(err => {
+    const badge = document.getElementById("globalBadge");
+    badge.className = "badge error"; badge.textContent = "✗ LINK DOWN";
+    document.getElementById("content").innerHTML =
+      `<div style="text-align:center;color:#ff0055;font-size:0.8rem;padding:5rem;letter-spacing:0.1em">CONNEXION COCKPIT ROMPUE<br><span style="color:#71717a;font-size:0.65rem">${err}</span></div>`;
+  });
+}
+
+load();
+setInterval(load, 15000); // Rafraîchissement toutes les 15s pour un look plus nerveux
 </script>
 </body>
 </html>
