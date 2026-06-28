@@ -20,6 +20,10 @@ load_dotenv()
 app = Flask(__name__)
 CORS(app)
 
+
+from site2 import site2_bp
+app.register_blueprint(site2_bp)
+
 # ── MODÈLES ────────────────────────────────────────────────────────────────────
 MODELS = {
     # Gemini (clé propre)
