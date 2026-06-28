@@ -27,7 +27,7 @@ MODELS = {
     "gemini_paid_ultra":    "gemini-3.1-flash-lite",
     "gemini_paid_standard": "gemini-2.5-flash-lite",
     # OpenRouter
-    "mistral":    "mistralai/mistral-small-24b-instruct-2501",
+    "mistral":    "amazon/nova-lite-v1",
     "hy3":        "tencent/hy3-preview",
     "owl":        "openrouter/owl-alpha",
     "llama":      "meta-llama/llama-3.3-70b-instruct",
