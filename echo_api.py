@@ -4,6 +4,7 @@ import re
 import json
 import base64
 import threading
+import time
 import requests as _requests_lib
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, send_file
@@ -22,19 +23,15 @@ CORS(app)
 
 # ── MODÈLES ────────────────────────────────────────────────────────────────────
 MODELS = {
-    # Gemini (clé propre)
     "gemini_paid_founder":  "gemini-3.5-flash",
     "gemini_paid_ultra":    "gemini-3.1-flash-lite",
     "gemini_paid_standard": "gemini-2.5-flash-lite",
-    # OpenRouter
     "mistral":    "mistralai/mistral-small-24b-instruct-2501",
     "hy3":        "tencent/hy3-preview",
     "owl":        "openrouter/owl-alpha",
     "llama":      "meta-llama/llama-3.3-70b-instruct",
-    "ling":       "inclusionai/ling-2.6-flash",   # mini-modèle warmup intention
-    # DeepSeek direct
+    "ling":       "inclusionai/ling-2.6-flash",
     "deepseek":   "deepseek-chat",
-    # Z.AI direct
     "glm":        "glm-4-32b-0414-128k",
 }
 
@@ -57,12 +54,10 @@ client_openrouter = (
     OpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_API_KEY, http_client=_shared_http_client)
     if OPENROUTER_API_KEY else None
 )
-
 client_deepseek = (
     OpenAI(base_url="https://api.deepseek.com", api_key=DEEPSEEK_API_KEY, http_client=_shared_http_client)
     if DEEPSEEK_API_KEY else None
 )
-
 client_zai = (
     OpenAI(base_url="https://api.z.ai/api/paas/v4", api_key=ZAI_API_KEY, http_client=_shared_http_client)
     if ZAI_API_KEY else None
@@ -70,9 +65,13 @@ client_zai = (
 
 _cf_session = _requests_lib.Session()
 
-# ── FAILOVER GLOBAL ────────────────────────────────────────────────────────────
+# ── STATS GLOBALES (pour monitoring) ──────────────────────────────────────────
 GLOBAL_FAILOVER_MEMORY_COUNT = 0
-MAX_FREE_FAILOVERS = 200
+MAX_FREE_FAILOVERS            = 200
+LAST_MODEL_USED: dict         = {}   # endpoint → model_key
+LAST_RESPONSE_MS: dict        = {}   # endpoint → ms
+LAST_ERROR: dict              = {}   # model_key → message
+START_TIME                    = datetime.now()
 
 def get_failover_count():
     global GLOBAL_FAILOVER_MEMORY_COUNT
@@ -83,7 +82,7 @@ def increment_failover_count():
     GLOBAL_FAILOVER_MEMORY_COUNT += 1
     print(f"[FAILOVER] {GLOBAL_FAILOVER_MEMORY_COUNT} / {MAX_FREE_FAILOVERS}")
 
-# ── LOCK MODÈLES — 30s ─────────────────────────────────────────────────────────
+# ── LOCK MODÈLES ───────────────────────────────────────────────────────────────
 MODELS_LOCK_REGISTRY = {}
 _lock_mutex = threading.Lock()
 
@@ -100,7 +99,23 @@ def is_model_locked(model_key: str) -> bool:
 def lock_model(model_key: str, seconds: int = 30):
     with _lock_mutex:
         MODELS_LOCK_REGISTRY[model_key] = datetime.now() + timedelta(seconds=seconds)
+    LAST_ERROR[model_key] = f"Locked {seconds}s à {datetime.now().strftime('%H:%M:%S')}"
     print(f"[LOCK] {model_key} hors circuit {seconds}s.")
+
+def get_locked_models() -> list:
+    with _lock_mutex:
+        now     = datetime.now()
+        locked  = []
+        expired = []
+        for key, until in MODELS_LOCK_REGISTRY.items():
+            if now < until:
+                secs_left = int((until - now).total_seconds())
+                locked.append({"model": key, "seconds_left": secs_left})
+            else:
+                expired.append(key)
+        for k in expired:
+            del MODELS_LOCK_REGISTRY[k]
+        return locked
 
 # ── TIERS ──────────────────────────────────────────────────────────────────────
 VALID_TIERS = {"connected_free", "basic", "premium", "ultra", "founder"}
@@ -268,8 +283,8 @@ def prepare_shared_context(data, source_override=None):
         system_prompt += f"\n\nLONG TERM MEMORY\n================\n{memory_summary}\n"
     system_prompt += "\n\nCRITICAL SAFETY DIRECTIVE: Only trigger actions explicitly demanded in the LATEST message."
 
-    taille_memoire  = 30 if user_tier in ("ultra", "founder") else (15 if user_tier in ("basic", "premium") else 5)
-    output_tokens   = PAID_MAX_TOKENS if is_paid_tier(user_tier) else FREE_MAX_TOKENS
+    taille_memoire    = 30 if user_tier in ("ultra", "founder") else (15 if user_tier in ("basic", "premium") else 5)
+    output_tokens     = PAID_MAX_TOKENS if is_paid_tier(user_tier) else FREE_MAX_TOKENS
     historique_ajuste = raw_history[-taille_memoire:]
     force_neutral     = len(selected_buttons) > 0 or source == "vitality"
     gemini_contents   = build_gemini_contents(historique_ajuste, image_b64, user_message, force_neutral)
@@ -306,10 +321,8 @@ def call_with_timeout(fn, timeout_sec):
     result = [None]
     error  = [None]
     def target():
-        try:
-            result[0] = fn()
-        except Exception as e:
-            error[0] = e
+        try:    result[0] = fn()
+        except Exception as e: error[0] = e
     t = threading.Thread(target=target, daemon=True)
     t.start()
     t.join(timeout=timeout_sec)
@@ -347,9 +360,8 @@ def call_gemini_with_search(client, model_key, ctx, timeout=30, temperature=0.5)
     return call_with_timeout(fn, timeout)
 
 def call_openrouter(model_key, ctx, temp=0.5, timeout=20.0):
-    """Appel OpenRouter — mistral, hy3, owl, llama passent par ici."""
     if client_openrouter is None:
-        raise RuntimeError("OpenRouter non configuré")
+        raise RuntimeError("OpenRouter non configure")
     res = client_openrouter.chat.completions.create(
         model=MODELS[model_key],
         messages=ctx["messages_openai"],
@@ -363,9 +375,8 @@ def call_openrouter(model_key, ctx, temp=0.5, timeout=20.0):
     return content
 
 def call_deepseek(ctx, temp=0.5, timeout=20.0):
-    """Appel DeepSeek direct via leur API OpenAI-compatible."""
     if client_deepseek is None:
-        raise RuntimeError("DeepSeek non configuré")
+        raise RuntimeError("DeepSeek non configure")
     res = client_deepseek.chat.completions.create(
         model=MODELS["deepseek"],
         messages=ctx["messages_openai"],
@@ -379,9 +390,8 @@ def call_deepseek(ctx, temp=0.5, timeout=20.0):
     return content
 
 def call_glm(ctx, temp=0.5, timeout=20.0):
-    """Appel GLM-4 via Z.AI — OpenAI-compatible."""
     if client_zai is None:
-        raise RuntimeError("Z.AI non configuré")
+        raise RuntimeError("Z.AI non configure")
     res = client_zai.chat.completions.create(
         model=MODELS["glm"],
         messages=ctx["messages_openai"],
@@ -394,55 +404,41 @@ def call_glm(ctx, temp=0.5, timeout=20.0):
         raise ValueError("Reponse vide de glm")
     return content
 
-# ── CASCADE PAYANTE par tier ───────────────────────────────────────────────────
+# ── CASCADE PAYANTE ────────────────────────────────────────────────────────────
 def run_paid_cascade(ctx, page_timeout: int = 10):
     tier = ctx["user_tier"]
     t    = page_timeout
 
     if tier == "basic":
-        steps = [
-            ("or", "mistral",              t),
-            ("or", "hy3",                  t),
-            ("z",  "glm",                 15),
-        ]
+        steps = [("or","mistral",t), ("or","hy3",t), ("z","glm",15)]
     elif tier == "premium":
-        steps = [
-            ("ds", "deepseek",             t),
-            ("or", "mistral",              t),
-            ("z",  "glm",                 15),
-        ]
+        steps = [("ds","deepseek",t), ("or","mistral",t), ("z","glm",15)]
     elif tier == "ultra":
-        steps = [
-            ("ds", "deepseek",             t),
-            ("or", "llama",                t),
-            ("z",  "glm",                 15),
-        ]
+        steps = [("ds","deepseek",t), ("or","llama",t), ("z","glm",15)]
     else:  # founder
-        steps = [
-            ("g",  "gemini_paid_founder",  t),
-            ("ds", "deepseek",             t),
-            ("z",  "glm",                 15),
-        ]
+        steps = [("g","gemini_paid_founder",t), ("ds","deepseek",t), ("z","glm",15)]
 
     for provider, model_key, timeout in steps:
-        if is_model_locked(model_key):
-            continue
+        if is_model_locked(model_key): continue
         try:
+            t0 = time.time()
             if provider == "g":
-                r      = call_gemini(client_gemini_paid, model_key, ctx, timeout=timeout, temperature=0.5)
+                r = call_gemini(client_gemini_paid, model_key, ctx, timeout=timeout, temperature=0.5)
                 result = clean_and_parse_json(r.text)
             elif provider == "ds":
-                r      = call_deepseek(ctx, temp=0.5, timeout=float(timeout))
+                r = call_deepseek(ctx, temp=0.5, timeout=float(timeout))
                 result = clean_and_parse_json(r)
             elif provider == "z":
-                r      = call_glm(ctx, temp=0.5, timeout=float(timeout))
+                r = call_glm(ctx, temp=0.5, timeout=float(timeout))
                 result = clean_and_parse_json(r)
             else:
-                r      = call_openrouter(model_key, ctx, temp=0.5, timeout=float(timeout))
+                r = call_openrouter(model_key, ctx, temp=0.5, timeout=float(timeout))
                 result = clean_and_parse_json(r)
+            LAST_RESPONSE_MS[model_key] = int((time.time() - t0) * 1000)
             return result
         except Exception as e:
             print(f"[PAID {tier}] Echec {model_key} ({e})")
+            LAST_ERROR[model_key] = str(e)[:80]
             lock_model(model_key, 30)
 
     return ERR_FINAL
@@ -455,50 +451,93 @@ def run_free_cascade(steps, ctx, parser=None, is_horizon=False):
         return ERR_QUOTA
 
     for i, (provider, model_key, timeout) in enumerate(steps):
-        if provider == "or" and client_openrouter is None:
-            continue
-        if provider == "ds" and client_deepseek is None:
-            continue
-        if provider == "z" and client_zai is None:
-            continue
-        if is_model_locked(model_key):
-            continue
+        if provider == "or" and client_openrouter is None: continue
+        if provider == "ds" and client_deepseek is None:   continue
+        if provider == "z"  and client_zai is None:        continue
+        if is_model_locked(model_key): continue
         is_last = (i == len(steps) - 1)
         try:
+            t0 = time.time()
             if provider == "g":
-                r      = call_gemini(client_gemini_paid, model_key, ctx, timeout=timeout, temperature=0.5)
+                r = call_gemini(client_gemini_paid, model_key, ctx, timeout=timeout, temperature=0.5)
                 result = parser(r.text)
             elif provider == "gs":
-                r      = call_gemini_with_search(client_gemini_paid, model_key, ctx, timeout=timeout, temperature=0.5)
+                r = call_gemini_with_search(client_gemini_paid, model_key, ctx, timeout=timeout, temperature=0.5)
                 result = parser(r.text)
             elif provider == "ds":
-                r      = call_deepseek(ctx, temp=0.5, timeout=float(timeout))
+                r = call_deepseek(ctx, temp=0.5, timeout=float(timeout))
                 result = parser(r)
             elif provider == "z":
-                r      = call_glm(ctx, temp=0.5, timeout=float(timeout))
+                r = call_glm(ctx, temp=0.5, timeout=float(timeout))
                 result = parser(r)
-            else:  # "or"
-                r      = call_openrouter(model_key, ctx, temp=0.5, timeout=float(timeout))
+            else:
+                r = call_openrouter(model_key, ctx, temp=0.5, timeout=float(timeout))
                 result = parser(r)
-
+            LAST_RESPONSE_MS[model_key] = int((time.time() - t0) * 1000)
             if is_last and not is_horizon:
                 increment_failover_count()
             return result
         except Exception as e:
             print(f"[FREE] Echec {model_key} ({e})")
+            LAST_ERROR[model_key] = str(e)[:80]
             lock_model(model_key, 30)
 
     return ERR_FINAL
 
-# ── ROUTES ─────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# ROUTES
+# ══════════════════════════════════════════════════════════════════════════════
 
 @app.route("/ping")
 def ping():
     return jsonify({"status": "awake"})
 
-# ── /horizon-warmup ───────────────────────────────────────────────────────────
-# Appelé dès que le user commence à taper — ling détecte l'intention
-# Résultat mis en cache côté serveur pour accélérer la vraie recherche
+# ── /stats — pour le monitoring ───────────────────────────────────────────────
+@app.route("/stats")
+def stats():
+    uptime_sec = int((datetime.now() - START_TIME).total_seconds())
+    uptime_str = f"{uptime_sec // 3600}h {(uptime_sec % 3600) // 60}m {uptime_sec % 60}s"
+    return jsonify({
+        "uptime":         uptime_str,
+        "failovers":      GLOBAL_FAILOVER_MEMORY_COUNT,
+        "max_failovers":  MAX_FREE_FAILOVERS,
+        "locked_models":  get_locked_models(),
+        "last_errors":    LAST_ERROR,
+        "response_ms":    LAST_RESPONSE_MS,
+        "models_registry": {k: v for k, v in MODELS.items()},
+    })
+
+# ── /horizon-pre — réveille toute la chaîne dès que le user tape ──────────────
+@app.route("/horizon-pre", methods=["POST"])
+def horizon_pre():
+    try:
+        data  = request.json or {}
+        query = (data.get("query") or "").strip()
+        if not query or len(query) < 4:
+            return jsonify({"status": "skip"}), 200
+
+        ctx = {
+            "system_prompt": "Tu es un assistant. Reponds en un mot.",
+            "output_tokens": 5,
+            "messages_openai": [
+                {"role": "system", "content": "Tu es un assistant. Reponds en un mot."},
+                {"role": "user",   "content": f"Sujet : {query[:80]}"},
+            ],
+            "user_tier": "connected_free",
+        }
+
+        threading.Thread(
+            target=lambda: call_openrouter("mistral", ctx, temp=0.1, timeout=15.0),
+            daemon=True
+        ).start()
+
+        return jsonify({"status": "heating"}), 200
+
+    except Exception as e:
+        print(f"[HORIZON-PRE] {e}")
+        return jsonify({"status": "error"}), 200
+
+# ── /horizon-warmup — classification d'intention via ling ─────────────────────
 HORIZON_WARMUP_CACHE: dict = {}
 
 @app.route("/horizon-warmup", methods=["POST"])
@@ -511,17 +550,17 @@ def horizon_warmup():
 
         prompt = (
             f"Analyse cette intention de recherche : \"{partial}\"\n\n"
-            f"Réponds en JSON avec exactement ces clés :\n"
+            f"Reponds en JSON avec exactement ces cles :\n"
             f"{{\"intent\": \"[recherche_locale|prix|comparaison|definition|actualite|autre]\","
             f" \"keywords\": [\"mot1\", \"mot2\"], \"lang\": \"fr|en\"}}\n"
             f"JSON uniquement, rien d'autre."
         )
 
         ctx = {
-            "system_prompt": "Tu es un classificateur d'intentions de recherche. Réponds uniquement en JSON valide.",
+            "system_prompt": "Tu es un classificateur d'intentions de recherche. Reponds uniquement en JSON valide.",
             "output_tokens": 150,
             "messages_openai": [
-                {"role": "system", "content": "Tu es un classificateur d'intentions de recherche. Réponds uniquement en JSON valide."},
+                {"role": "system", "content": "Tu es un classificateur d'intentions de recherche. Reponds uniquement en JSON valide."},
                 {"role": "user",   "content": prompt},
             ],
             "gemini_contents": [{"role": "user", "parts": [types.Part.from_text(text=prompt)]}],
@@ -531,10 +570,10 @@ def horizon_warmup():
             raw    = call_openrouter("ling", ctx, temp=0.1, timeout=4.0)
             parsed = clean_and_parse_json(raw)
             HORIZON_WARMUP_CACHE[partial[:50]] = parsed
-            print(f"[WARMUP] Intent détecté : {parsed.get('response', parsed)}")
+            print(f"[WARMUP] Intent : {parsed.get('response', parsed)}")
             return jsonify({"status": "ready", "intent": parsed})
         except Exception as e:
-            print(f"[WARMUP] Ling échec ({e})")
+            print(f"[WARMUP] Ling echec ({e})")
             return jsonify({"status": "fallback"})
 
     except Exception as e:
@@ -549,11 +588,7 @@ def home():
         ctx  = prepare_shared_context(data, source_override="home")
         if is_paid_tier(ctx["user_tier"]):
             return jsonify(run_paid_cascade(ctx, page_timeout=10))
-        steps = [
-            ("or", "mistral",              8),
-            ("or", "hy3",                 12),
-            ("z",  "glm",                 15),
-        ]
+        steps = [("or","mistral",8), ("or","hy3",12), ("z","glm",15)]
         return jsonify(run_free_cascade(steps, ctx))
     except Exception as e:
         print(f"Erreur /home: {e}")
@@ -567,11 +602,7 @@ def chat():
         ctx  = prepare_shared_context(data, source_override="chat")
         if is_paid_tier(ctx["user_tier"]):
             return jsonify(run_paid_cascade(ctx, page_timeout=10))
-        steps = [
-            ("or", "mistral",              8),
-            ("or", "hy3",                 12),
-            ("z",  "glm",                 15),
-        ]
+        steps = [("or","mistral",8), ("or","hy3",12), ("z","glm",15)]
         return jsonify(run_free_cascade(steps, ctx))
     except Exception as e:
         print(f"Erreur /chat: {e}")
@@ -585,15 +616,11 @@ def vitality():
         ctx  = prepare_shared_context(data, source_override="vitality")
         if is_paid_tier(ctx["user_tier"]):
             result = run_paid_cascade(ctx, page_timeout=20)
-            print(f"[VITALITY] action retournée: {result.get('action')}")
+            print(f"[VITALITY] action: {result.get('action')}")
             return jsonify(result)
-        steps = [
-            ("or", "hy3",                 20),
-            ("or", "mistral",             20),
-            ("z",  "glm",                 15),
-        ]
+        steps = [("or","hy3",20), ("or","mistral",20), ("z","glm",15)]
         result = run_free_cascade(steps, ctx)
-        print(f"[VITALITY] action retournée: {result.get('action')}")
+        print(f"[VITALITY] action: {result.get('action')}")
         return jsonify(result)
     except Exception as e:
         print(f"Erreur /vitality: {e}")
@@ -607,13 +634,9 @@ def history():
         ctx  = prepare_shared_context(data, source_override="history")
         if is_paid_tier(ctx["user_tier"]):
             return jsonify(run_paid_cascade(ctx, page_timeout=12))
-
         if get_failover_count() >= MAX_FREE_FAILOVERS:
             return jsonify(ERR_QUOTA)
-
         result = None
-
-        # owl-alpha : lock 60s après TOUTE réponse (succès ou échec)
         if not is_model_locked("owl"):
             try:
                 r      = call_openrouter("owl", ctx, temp=0.5, timeout=15.0)
@@ -621,16 +644,11 @@ def history():
                 print("[HISTORY] owl-alpha OK")
             except Exception as e:
                 print(f"[HISTORY] owl-alpha echec ({e})")
+                LAST_ERROR["owl"] = str(e)[:80]
             finally:
                 lock_model("owl", 60)
-
         if result is None:
-            fallback_steps = [
-                ("or", "mistral",              20),
-                ("z",  "glm",                 20),
-            ]
-            result = run_free_cascade(fallback_steps, ctx)
-
+            result = run_free_cascade([("or","mistral",20), ("z","glm",20)], ctx)
         return jsonify(result)
     except Exception as e:
         print(f"Erreur /history: {e}")
@@ -640,15 +658,15 @@ def history():
 @app.route("/books", methods=["POST"])
 def books():
     try:
-        data       = request.json or {}
-        message    = (data.get("message") or "").strip()
-        history    = data.get("history", [])
-        tier       = normalize_tier(data.get("userTier", "connected_free"))
-        buttons    = data.get("selectedButtons", [])
-        book_title = (data.get("bookTitle") or "").strip()
+        data          = request.json or {}
+        message       = (data.get("message") or "").strip()
+        history       = data.get("history", [])
+        tier          = normalize_tier(data.get("userTier", "connected_free"))
+        buttons       = data.get("selectedButtons", [])
+        book_title    = (data.get("bookTitle") or "").strip()
         output_tokens = 2048 if is_paid_tier(tier) else 1024
 
-        INJECT_KEYWORDS = ["inject", "injecte", "insere", "ecris ici", "write here", "add this"]
+        INJECT_KEYWORDS = ["inject","injecte","insere","ecris ici","write here","add this"]
         wants_inject    = any(kw in message.lower() for kw in INJECT_KEYWORDS)
 
         mode_prompts = {
@@ -656,8 +674,8 @@ def books():
             "ideas":    "Tu es en mode Idees. Propose des pistes narratives et rebondissements.",
             "critical": "Tu es en mode Critique. Analyse le texte : rythme, coherence, clarte.",
         }
-        active_mode      = buttons[0] if buttons else None
-        mode_instruction = mode_prompts.get(active_mode, "Tu es un assistant d'ecriture creatif et polyvalent.")
+        active_mode        = buttons[0] if buttons else None
+        mode_instruction   = mode_prompts.get(active_mode, "Tu es un assistant d'ecriture creatif et polyvalent.")
         inject_instruction = ""
         if wants_inject:
             inject_instruction = (
@@ -666,151 +684,95 @@ def books():
             )
         system_prompt = f"{mode_instruction}{inject_instruction}\n\nLivre : \"{book_title}\". Reponds en moins de 400 mots. Sois direct et elegant."
 
-        gemini_history = []
-        for msg in history[-10:]:
-            if msg.startswith("You: "):
-                gemini_history.append(types.Content(role="user",  parts=[types.Part.from_text(text=msg[5:])]))
-            elif msg.startswith("Echo: "):
-                if gemini_history:
-                    gemini_history.append(types.Content(role="model", parts=[types.Part.from_text(text=msg[6:])]))
-        gemini_history.append(types.Content(role="user", parts=[types.Part.from_text(text=message)]))
-
-        def run_books_call_gemini(model_key, timeout):
-            def fn():
-                return client_gemini_paid.models.generate_content(
-                    model=MODELS[model_key],
-                    contents=gemini_history,
-                    config=types.GenerateContentConfig(
-                        system_instruction=system_prompt,
-                        max_output_tokens=output_tokens,
-                        temperature=0.5,
-                    )
-                )
-            resp = call_with_timeout(fn, timeout)
-            if not resp or not resp.text:
-                raise ValueError("Reponse Gemini vide")
-            return resp.text
-
-        def run_books_call_openrouter(model_key, timeout):
-            openai_messages = [{"role": "system", "content": system_prompt}]
+        def build_openai_history(prefix_you="You: ", prefix_echo="Echo: "):
+            msgs = [{"role": "system", "content": system_prompt}]
             for msg in history[-10:]:
-                if msg.startswith("You: "):
-                    openai_messages.append({"role": "user",      "content": msg[5:]})
-                elif msg.startswith("Echo: "):
-                    openai_messages.append({"role": "assistant", "content": msg[6:]})
-            openai_messages.append({"role": "user", "content": message})
-            res = client_openrouter.chat.completions.create(
-                model=MODELS[model_key],
-                messages=openai_messages,
-                temperature=0.5,
-                max_tokens=output_tokens,
-                timeout=float(timeout),
-            )
-            content = res.choices[0].message.content
-            if not content:
-                raise ValueError(f"Reponse vide de {model_key}")
-            return content
-
-        def run_books_call_deepseek(timeout):
-            openai_messages = [{"role": "system", "content": system_prompt}]
-            for msg in history[-10:]:
-                if msg.startswith("You: "):
-                    openai_messages.append({"role": "user",      "content": msg[5:]})
-                elif msg.startswith("Echo: "):
-                    openai_messages.append({"role": "assistant", "content": msg[6:]})
-            openai_messages.append({"role": "user", "content": message})
-            res = client_deepseek.chat.completions.create(
-                model=MODELS["deepseek"],
-                messages=openai_messages,
-                temperature=0.5,
-                max_tokens=output_tokens,
-                timeout=float(timeout),
-            )
-            content = res.choices[0].message.content
-            if not content:
-                raise ValueError("Reponse vide de deepseek")
-            return content
-
-        def run_books_call_glm(timeout):
-            openai_messages = [{"role": "system", "content": system_prompt}]
-            for msg in history[-10:]:
-                if not isinstance(msg, str):
-                    continue
-                if msg.startswith("You:") or msg.startswith("Toi:"):
-                    clean_content = msg.split(":", 1)[1].strip()
-                    openai_messages.append({"role": "user", "content": clean_content})
-                elif msg.startswith("Echo:"):
-                    clean_content = msg.split(":", 1)[1].strip()
+                if not isinstance(msg, str): continue
+                if msg.startswith(prefix_you):
+                    msgs.append({"role": "user", "content": msg[len(prefix_you):]})
+                elif msg.startswith(prefix_echo):
+                    content = msg[len(prefix_echo):]
                     try:
-                        parsed = json.loads(clean_content)
-                        clean_content = parsed.get("response", clean_content)
+                        parsed  = json.loads(content)
+                        content = parsed.get("response", content)
                     except Exception:
                         pass
-                    openai_messages.append({"role": "assistant", "content": clean_content})
-            openai_messages.append({"role": "user", "content": message})
-            res = client_zai.chat.completions.create(
-                model=MODELS["glm"],
-                messages=openai_messages,
-                temperature=0.5,
-                max_tokens=output_tokens,
-                timeout=float(timeout),
+                    msgs.append({"role": "assistant", "content": content})
+            msgs.append({"role": "user", "content": message})
+            return msgs
+
+        def run_books_gemini(model_key, timeout):
+            gemini_history = []
+            for msg in history[-10:]:
+                if msg.startswith("You: "):
+                    gemini_history.append(types.Content(role="user",  parts=[types.Part.from_text(text=msg[5:])]))
+                elif msg.startswith("Echo: ") and gemini_history:
+                    gemini_history.append(types.Content(role="model", parts=[types.Part.from_text(text=msg[6:])]))
+            gemini_history.append(types.Content(role="user", parts=[types.Part.from_text(text=message)]))
+            def fn():
+                return client_gemini_paid.models.generate_content(
+                    model=MODELS[model_key], contents=gemini_history,
+                    config=types.GenerateContentConfig(system_instruction=system_prompt, max_output_tokens=output_tokens, temperature=0.5)
+                )
+            resp = call_with_timeout(fn, timeout)
+            if not resp or not resp.text: raise ValueError("Reponse Gemini vide")
+            return resp.text
+
+        def run_books_openrouter(model_key, timeout):
+            res = client_openrouter.chat.completions.create(
+                model=MODELS[model_key], messages=build_openai_history(),
+                temperature=0.5, max_tokens=output_tokens, timeout=float(timeout)
             )
             content = res.choices[0].message.content
-            if not content:
-                raise ValueError("Reponse vide de glm")
+            if not content: raise ValueError(f"Reponse vide de {model_key}")
             return content
 
-        # GLM en premier (Z.AI), filet = deepseek
-        books_steps = [
-            ("z",  "glm",     20),
-            ("or", "hy3",     25),
-            ("ds", "deepseek", 20),
-        ]
+        def run_books_deepseek(timeout):
+            res = client_deepseek.chat.completions.create(
+                model=MODELS["deepseek"], messages=build_openai_history(),
+                temperature=0.5, max_tokens=output_tokens, timeout=float(timeout)
+            )
+            content = res.choices[0].message.content
+            if not content: raise ValueError("Reponse vide de deepseek")
+            return content
+
+        def run_books_glm(timeout):
+            res = client_zai.chat.completions.create(
+                model=MODELS["glm"], messages=build_openai_history("You:", "Echo:"),
+                temperature=0.5, max_tokens=output_tokens, timeout=float(timeout)
+            )
+            content = res.choices[0].message.content
+            if not content: raise ValueError("Reponse vide de glm")
+            return content
+
+        books_steps = [("z","glm",20), ("or","hy3",25), ("ds","deepseek",20)]
         if is_paid_tier(tier):
             t = 20
             if tier == "founder":
-                books_steps = [
-                    ("g",  "gemini_paid_founder", t),
-                    ("ds", "deepseek",            t),
-                    ("z",  "glm",                 15),
-                ]
+                books_steps = [("g","gemini_paid_founder",t), ("ds","deepseek",t), ("z","glm",15)]
             elif tier == "ultra":
-                books_steps = [
-                    ("ds", "deepseek",  t),
-                    ("or", "llama",     t),
-                    ("z",  "glm",       15),
-                ]
+                books_steps = [("ds","deepseek",t), ("or","llama",t), ("z","glm",15)]
             elif tier == "premium":
-                books_steps = [
-                    ("ds", "deepseek",  t),
-                    ("or", "mistral",   t),
-                    ("z",  "glm",       15),
-                ]
-            else:  # basic
-                books_steps = [
-                    ("or", "mistral",  t),
-                    ("or", "hy3",      t),
-                    ("z",  "glm",      15),
-                ]
+                books_steps = [("ds","deepseek",t), ("or","mistral",t), ("z","glm",15)]
+            else:
+                books_steps = [("or","mistral",t), ("or","hy3",t), ("z","glm",15)]
 
         full_text = ""
         for i, (provider, model_key, timeout) in enumerate(books_steps):
-            if is_model_locked(model_key):
-                continue
+            if is_model_locked(model_key): continue
             try:
-                if provider == "g":
-                    full_text = run_books_call_gemini(model_key, timeout)
-                elif provider == "ds":
-                    full_text = run_books_call_deepseek(timeout)
-                elif provider == "z":
-                    full_text = run_books_call_glm(timeout)
-                else:
-                    full_text = run_books_call_openrouter(model_key, timeout)
+                t0 = time.time()
+                if provider == "g":   full_text = run_books_gemini(model_key, timeout)
+                elif provider == "ds": full_text = run_books_deepseek(timeout)
+                elif provider == "z":  full_text = run_books_glm(timeout)
+                else:                  full_text = run_books_openrouter(model_key, timeout)
+                LAST_RESPONSE_MS[model_key] = int((time.time() - t0) * 1000)
                 if i == len(books_steps) - 1 and not is_paid_tier(tier):
                     increment_failover_count()
                 break
             except Exception as e:
                 print(f"[BOOKS] Echec {model_key} ({e})")
+                LAST_ERROR[model_key] = str(e)[:80]
                 lock_model(model_key, 30)
 
         if not full_text:
@@ -828,9 +790,6 @@ def books():
         return jsonify({"response": ERR_CRASH["response"], "inject": False, "action": None}), 500
 
 # ── /horizon ──────────────────────────────────────────────────────────────────
-# CONTEXTE ISOLÉ — aucun historique de conversation pour ne pas polluer le grounding
-# Cascades : free/basic → mistral → llama → deepseek
-#            premium/ultra/founder → gemini+search → mistral → deepseek
 @app.route("/horizon", methods=["POST"])
 def horizon():
     try:
@@ -839,7 +798,6 @@ def horizon():
         if not query:
             return jsonify({"error": "L'intention d'exploration est vide."}), 400
 
-        # Warmup — retourner immédiatement sans appeler les modèles
         if data.get("warmup") or query == "...":
             return jsonify({"status": "warm"}), 200
 
@@ -847,8 +805,8 @@ def horizon():
         date_str   = maintenant.strftime("%A %d %B %Y")
         heure_str  = maintenant.strftime("%H:%M")
         user_tier  = normalize_tier(data.get("userTier", "connected_free"))
+        selected_buttons = data.get("selectedButtons", [])
 
-        # ── Contexte ISOLÉ — aucun historique, aucune pollution ──────────────
         horizon_message = (
             f"DATE ET HEURE ACTUELLES : {date_str}, {heure_str} (heure locale du serveur).\n"
             f"ANNEE EN COURS : 2026. Toutes les informations doivent etre actuelles et valides en 2026.\n\n"
@@ -860,7 +818,7 @@ def horizon():
             f"REQUETE : {query}\n\n"
             f"REGLES DE TRANSMISSION :\n"
             f"- Retourne uniquement des informations confirmees par ta recherche Google.\n"
-            f"- Si une donnee (adresse, telephone, horaire, prix, URL) est introuvable : utilise le jeton approprie.\n"
+            f"- Si une donnee (adresse, telephone, horaire, prix, URL) est introuvable : indique-le.\n"
             f"- Retourne jusqu'a 10 resultats confirmes — moins si tu n'en trouves pas davantage.\n"
             f"- Une reponse incomplete est acceptable. Une reponse inventee est un echec.\n\n"
             f"Reponds UNIQUEMENT en JSON valide avec les cles : response, attributes, matrix."
@@ -868,7 +826,7 @@ def horizon():
 
         horizon_system = generate_system_prompt(
             source="horizonweb",
-            selected_buttons=[],
+            selected_buttons=selected_buttons,
             date_aujourdhui=date_str,
             annee_en_cours="2026",
             user_tier=user_tier,
@@ -886,54 +844,45 @@ def horizon():
             "user_tier": user_tier,
         }
 
-        required_matrix_keys = [
-            "c_est_quoi", "est_ce_bon", "combien_ca_coute", "est_ce_disponible",
-            "qu_en_pensent_les_gens", "quelles_sont_les_alternatives",
-            "quels_sont_les_risques", "quelle_option_est_recommandee"
-        ]
-
-        # ── Horizon : cascade simple avec retry au début ──────────────────────
-        import time
         parsed = None
-
         horizon_steps = [
-            ("gs", "gemini_paid_standard", 8),   # gemini-2.5-flash-lite + grounding
-            ("gs", "gemini_paid_ultra",    8),   # gemini-3.1-flash-lite + grounding
-            ("ds", "deepseek",             8),   # deepseek direct (filet)
+            ("gs", "gemini_paid_standard", 8),
+            ("gs", "gemini_paid_ultra",    8),
+            ("ds", "deepseek",             8),
         ]
 
-        for attempt in range(3):  # max 3 passes complètes
+        for attempt in range(3):
             for provider, model_key, timeout in horizon_steps:
                 try:
                     print(f"[HORIZON] Pass {attempt+1} — {model_key}")
+                    t0 = time.time()
                     if provider == "gs":
                         r      = call_gemini_with_search(client_gemini_paid, model_key, ctx, timeout=timeout, temperature=0.5)
                         parsed = clean_and_parse_horizon_json(r.text)
                     else:
                         r      = call_deepseek(ctx, temp=0.5, timeout=float(timeout))
                         parsed = clean_and_parse_horizon_json(r)
-
+                    LAST_RESPONSE_MS[model_key] = int((time.time() - t0) * 1000)
                     if parsed.get("response", "").strip():
                         print(f"[HORIZON] Succes — {model_key}")
+                        LAST_MODEL_USED["horizon"] = model_key
                         break
                     else:
                         print(f"[HORIZON] Reponse vide — {model_key}")
                 except Exception as e:
                     print(f"[HORIZON] Echec {model_key} ({e})")
+                    LAST_ERROR[model_key] = str(e)[:80]
 
             if parsed and parsed.get("response", "").strip():
                 break
             if attempt < 2:
-                print(f"[HORIZON] Retry complet pass {attempt+2}...")
+                print(f"[HORIZON] Retry pass {attempt+2}...")
 
         if not parsed or not parsed.get("response", "").strip():
             return jsonify(ERR_HORIZON)
 
-        # Normaliser les champs
-        if not isinstance(parsed.get("matrix"), dict):
-            parsed["matrix"] = None
-        if not isinstance(parsed.get("attributes"), list):
-            parsed["attributes"] = []
+        if not isinstance(parsed.get("matrix"), dict):     parsed["matrix"] = None
+        if not isinstance(parsed.get("attributes"), list): parsed["attributes"] = []
 
         return jsonify(parsed)
 
@@ -955,24 +904,24 @@ def memory_summary():
 
         history_text = "\n".join(messages[-30:])
         prompt = (
-            "Tu es un système de compression de mémoire conversationnelle.\n"
-            "Ton rôle : produire un résumé dense et factuel de la conversation ci-dessous.\n"
-            "Ce résumé sera injecté comme mémoire long terme dans les prochaines conversations.\n\n"
-            f"RÉSUMÉ PRÉCÉDENT :\n{prev_summary or 'Aucun'}\n\n"
+            "Tu es un systeme de compression de memoire conversationnelle.\n"
+            "Ton role : produire un resume dense et factuel de la conversation ci-dessous.\n"
+            "Ce resume sera injecte comme memoire long terme dans les prochaines conversations.\n\n"
+            f"RESUME PRECEDENT :\n{prev_summary or 'Aucun'}\n\n"
             f"NOUVEAUX MESSAGES :\n{history_text}\n\n"
             "INSTRUCTIONS :\n"
-            "- Garde les faits importants, préférences, décisions, contexte clé.\n"
+            "- Garde les faits importants, preferences, decisions, contexte cle.\n"
             "- Ignore les salutations et messages vides.\n"
             "- Sois concis : max 300 mots.\n"
-            "- Réponds UNIQUEMENT avec le résumé, sans introduction ni explication."
+            "- Reponds UNIQUEMENT avec le resume, sans introduction ni explication."
         )
 
         ctx = {
-            "system_prompt":   "Tu es un compresseur de mémoire conversationnelle. Réponds uniquement avec le résumé demandé.",
+            "system_prompt":   "Tu es un compresseur de memoire conversationnelle.",
             "output_tokens":   600,
             "gemini_contents": [{"role": "user", "parts": [types.Part.from_text(text=prompt)]}],
             "messages_openai": [
-                {"role": "system", "content": "Tu es un compresseur de mémoire conversationnelle."},
+                {"role": "system", "content": "Tu es un compresseur de memoire conversationnelle."},
                 {"role": "user",   "content": prompt},
             ],
             "user_tier": user_tier,
@@ -981,16 +930,14 @@ def memory_summary():
         try:
             r       = call_gemini(client_gemini_paid, "gemini_paid_standard", ctx, timeout=20, temperature=0.1)
             summary = (r.text or "").strip() if r else ""
-            if summary:
-                return jsonify({"summary": summary})
+            if summary: return jsonify({"summary": summary})
         except Exception as e:
             print(f"[MEMORY] Gemini echec ({e}), fallback mistral")
 
         try:
             r       = call_openrouter("mistral", ctx, temp=0.1, timeout=15.0)
             summary = r.strip() if r else ""
-            if summary:
-                return jsonify({"summary": summary})
+            if summary: return jsonify({"summary": summary})
         except Exception as e:
             print(f"[MEMORY] Echec total ({e})")
 
@@ -1029,8 +976,9 @@ def export_route():
                 from docx import Document
                 from docx.shared import Pt, RGBColor
                 from docx.enum.text import WD_ALIGN_PARAGRAPH
-                doc = Document()
-                t_para = doc.add_paragraph(); run = t_para.add_run(title)
+                doc    = Document()
+                t_para = doc.add_paragraph()
+                run    = t_para.add_run(title)
                 run.font.size = Pt(24); run.font.bold = True; run.font.color.rgb = RGBColor(15, 23, 42)
                 clean = re.sub(r'<[^>]+>', '\n', html).replace('&nbsp;', ' ')
                 for line in clean.split('\n'):
@@ -1062,7 +1010,7 @@ def export_route():
         print(f"[EXPORT ERROR] {fmt}: {e}")
         return jsonify({"error": str(e)}), 500
 
-# ── WARMUP ────────────────────────────────────────────────────────────────────
+# ── BOOT WARMUP ───────────────────────────────────────────────────────────────
 def _warmup_api():
     try:
         print("[BOOST] Reveil des routes Echo...")

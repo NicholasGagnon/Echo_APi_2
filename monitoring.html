@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Echo API — Monitoring</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #09090b;
+      color: #e4e4e7;
+      font-family: 'Courier New', monospace;
+      min-height: 100vh;
+      padding: 2rem;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 2rem;
+      padding-bottom: 1rem;
+      border-bottom: 1px solid #27272a;
+    }
+
+    h1 {
+      font-size: 1.1rem;
+      font-weight: 900;
+      letter-spacing: 0.15em;
+      text-transform: uppercase;
+    }
+
+    h1 span.cyan  { color: #06b6d4; }
+    h1 span.red   { color: #dc2626; }
+
+    .global-badge {
+      font-size: 0.7rem;
+      font-weight: 900;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      padding: 0.3rem 0.9rem;
+      border-radius: 9999px;
+      border: 1px solid;
+    }
+    .global-badge.ok    { background: rgba(16,185,129,0.1); border-color: #10b981; color: #10b981; }
+    .global-badge.warn  { background: rgba(245,158,11,0.1); border-color: #f59e0b; color: #f59e0b; }
+    .global-badge.error { background: rgba(220,38,38,0.1);  border-color: #dc2626; color: #dc2626; }
+
+    .refresh-btn {
+      background: none;
+      border: 1px solid #3f3f46;
+      color: #a1a1aa;
+      padding: 0.3rem 0.8rem;
+      border-radius: 0.5rem;
+      cursor: pointer;
+      font-family: monospace;
+      font-size: 0.7rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      transition: all 0.2s;
+      margin-left: 0.75rem;
+    }
+    .refresh-btn:hover { border-color: #06b6d4; color: #06b6d4; }
+
+    .last-update {
+      font-size: 0.65rem;
+      color: #52525b;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1.25rem;
+      margin-bottom: 1.25rem;
+    }
+
+    @media (max-width: 700px) { .grid { grid-template-columns: 1fr; } }
+
+    .card {
+      background: #18181b;
+      border: 1px solid #27272a;
+      border-radius: 0.875rem;
+      padding: 1.25rem;
+    }
+
+    .card-title {
+      font-size: 0.65rem;
+      font-weight: 900;
+      letter-spacing: 0.15em;
+      text-transform: uppercase;
+      color: #71717a;
+      margin-bottom: 1rem;
+    }
+
+    .row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0.5rem 0;
+      border-bottom: 1px solid #27272a;
+    }
+    .row:last-child { border-bottom: none; }
+
+    .row-label {
+      font-size: 0.8rem;
+      color: #a1a1aa;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    .dot.ok    { background: #10b981; box-shadow: 0 0 6px #10b981; }
+    .dot.warn  { background: #f59e0b; box-shadow: 0 0 6px #f59e0b; }
+    .dot.error { background: #dc2626; box-shadow: 0 0 6px #dc2626; }
+    .dot.loading { background: #3f3f46; animation: pulse 1s infinite; }
+
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+
+    .row-value {
+      font-size: 0.75rem;
+      font-weight: 700;
+      color: #e4e4e7;
+    }
+    .row-value.ok    { color: #10b981; }
+    .row-value.warn  { color: #f59e0b; }
+    .row-value.error { color: #dc2626; }
+
+    .models-card { grid-column: 1 / -1; }
+
+    .models-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+    }
+
+    .model-tag {
+      font-size: 0.65rem;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      padding: 0.25rem 0.6rem;
+      border-radius: 0.4rem;
+      background: rgba(6,182,212,0.08);
+      border: 1px solid rgba(6,182,212,0.2);
+      color: #06b6d4;
+    }
+
+    .loading-msg {
+      text-align: center;
+      color: #52525b;
+      font-size: 0.75rem;
+      padding: 3rem;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1><span class="cyan">Echo</span> <span class="red">API</span> — Monitoring</h1>
+  <div style="display:flex;align-items:center;gap:1rem">
+    <span class="last-update" id="lastUpdate">—</span>
+    <span class="global-badge loading" id="globalBadge">Chargement...</span>
+    <button class="refresh-btn" onclick="load()">↻ Refresh</button>
+  </div>
+</header>
+
+<div id="content">
+  <div class="loading-msg">Connexion au monitoring...</div>
+</div>
+
+<script>
+  const API = "http://127.0.0.1:5001/api/monitoring";
+
+  function statusClass(s) {
+    if (s === "ok")    return "ok";
+    if (s === "warn")  return "warn";
+    return "error";
+  }
+
+  function renderRow(label, item) {
+    const sc = statusClass(item.status || (item.ok ? "ok" : "error"));
+    return `
+      <div class="row">
+        <span class="row-label">
+          <span class="dot ${sc}"></span>
+          ${label}
+        </span>
+        <span class="row-value ${sc}">${item.label || "—"}</span>
+      </div>`;
+  }
+
+  function load() {
+    document.getElementById("globalBadge").className = "global-badge loading";
+    document.getElementById("globalBadge").textContent = "...";
+
+    fetch(API)
+      .then(r => r.json())
+      .then(data => {
+        const g = data.global || "error";
+        const badge = document.getElementById("globalBadge");
+        badge.className = `global-badge ${g}`;
+        badge.textContent = g === "ok" ? "✓ Tout opérationnel" : g === "warn" ? "⚠ Dégradé" : "✗ Critique";
+
+        document.getElementById("lastUpdate").textContent =
+          "Mis à jour : " + new Date().toLocaleTimeString("fr-CA");
+
+        const p = data.providers || {};
+        const e = data.endpoints || {};
+        const m = data.models_active || [];
+
+        document.getElementById("content").innerHTML = `
+          <div class="grid">
+
+            <div class="card">
+              <div class="card-title">💳 Providers & Balances</div>
+              ${renderRow("OpenRouter", p.openrouter || {})}
+              ${renderRow("DeepSeek",   p.deepseek   || {})}
+              ${renderRow("Z.AI (GLM)", p.zai        || {})}
+              ${renderRow("Gemini",     p.gemini     || {})}
+            </div>
+
+            <div class="card">
+              <div class="card-title">📡 Endpoints Echo API</div>
+              ${renderRow("/ping",           e.ping           || {})}
+              ${renderRow("/horizon",        e.horizon        || {})}
+              ${renderRow("/horizon-pre",    e.horizon_pre    || {})}
+              ${renderRow("/horizon-warmup", e.horizon_warmup || {})}
+              ${renderRow("/chat",           e.chat           || {})}
+              ${renderRow("/vitality",       e.vitality       || {})}
+            </div>
+
+            <div class="card models-card">
+              <div class="card-title">🤖 Modèles actifs</div>
+              <div class="models-list">
+                ${m.map(name => `<span class="model-tag">${name}</span>`).join("")}
+              </div>
+            </div>
+
+          </div>`;
+      })
+      .catch(err => {
+        document.getElementById("globalBadge").className = "global-badge error";
+        document.getElementById("globalBadge").textContent = "✗ Monitoring inaccessible";
+        document.getElementById("content").innerHTML =
+          `<div class="loading-msg" style="color:#dc2626">Impossible de joindre le monitoring.<br>${err}</div>`;
+      });
+  }
+
+  load();
+  setInterval(load, 30000); // auto-refresh 30s
+</script>
+</body>
+</html>
