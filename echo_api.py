@@ -64,7 +64,7 @@ client_deepseek = (
 )
 
 client_zai = (
-    OpenAI(base_url="https://api.z.ai/api/v1", api_key=ZAI_API_KEY, http_client=_shared_http_client)
+    OpenAI(base_url="https://api.z.ai/api/paas/v4", api_key=ZAI_API_KEY, http_client=_shared_http_client)
     if ZAI_API_KEY else None
 )
 
@@ -730,10 +730,19 @@ def books():
         def run_books_call_glm(timeout):
             openai_messages = [{"role": "system", "content": system_prompt}]
             for msg in history[-10:]:
-                if msg.startswith("You: "):
-                    openai_messages.append({"role": "user",      "content": msg[5:]})
-                elif msg.startswith("Echo: "):
-                    openai_messages.append({"role": "assistant", "content": msg[6:]})
+                if not isinstance(msg, str):
+                    continue
+                if msg.startswith("You:") or msg.startswith("Toi:"):
+                    clean_content = msg.split(":", 1)[1].strip()
+                    openai_messages.append({"role": "user", "content": clean_content})
+                elif msg.startswith("Echo:"):
+                    clean_content = msg.split(":", 1)[1].strip()
+                    try:
+                        parsed = json.loads(clean_content)
+                        clean_content = parsed.get("response", clean_content)
+                    except Exception:
+                        pass
+                    openai_messages.append({"role": "assistant", "content": clean_content})
             openai_messages.append({"role": "user", "content": message})
             res = client_zai.chat.completions.create(
                 model=MODELS["glm"],
