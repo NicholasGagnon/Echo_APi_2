@@ -12,7 +12,6 @@ from google import genai
 from google.genai import types
 from openai import OpenAI
 from dotenv import load_dotenv
-from bs4 import BeautifulSoup, NavigableString, Tag
 
 from prompts import generate_system_prompt
 
@@ -21,20 +20,25 @@ load_dotenv()
 app = Flask(__name__)
 CORS(app)
 
+
 from site2 import site2_bp
 app.register_blueprint(site2_bp)
 
 # ── MODÈLES ────────────────────────────────────────────────────────────────────
 MODELS = {
+    # Gemini (clé propre)
     "gemini_paid_founder":  "gemini-3.5-flash",
     "gemini_paid_ultra":    "gemini-3.1-flash-lite",
     "gemini_paid_standard": "gemini-2.5-flash-lite",
+    # OpenRouter
     "mistral":    "amazon/nova-lite-v1",
     "hy3":        "tencent/hy3-preview",
     "owl":        "openrouter/owl-alpha",
     "llama":      "meta-llama/llama-3.3-70b-instruct",
-    "ling":       "inclusionai/ling-2.6-flash",
+    "ling":       "inclusionai/ling-2.6-flash",   # mini-modèle warmup intention
+    # DeepSeek direct
     "deepseek":   "deepseek-chat",
+    # Z.AI direct
     "glm":        "glm-4-32b-0414-128k",
 }
 
@@ -57,10 +61,12 @@ client_openrouter = (
     OpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_API_KEY, http_client=_shared_http_client)
     if OPENROUTER_API_KEY else None
 )
+
 client_deepseek = (
     OpenAI(base_url="https://api.deepseek.com", api_key=DEEPSEEK_API_KEY, http_client=_shared_http_client)
     if DEEPSEEK_API_KEY else None
 )
+
 client_zai = (
     OpenAI(base_url="https://api.z.ai/api/paas/v4", api_key=ZAI_API_KEY, http_client=_shared_http_client)
     if ZAI_API_KEY else None
@@ -266,8 +272,8 @@ def prepare_shared_context(data, source_override=None):
         system_prompt += f"\n\nLONG TERM MEMORY\n================\n{memory_summary}\n"
     system_prompt += "\n\nCRITICAL SAFETY DIRECTIVE: Only trigger actions explicitly demanded in the LATEST message."
 
-    taille_memoire    = 30 if user_tier in ("ultra", "founder") else (15 if user_tier in ("basic", "premium") else 5)
-    output_tokens     = PAID_MAX_TOKENS if is_paid_tier(user_tier) else FREE_MAX_TOKENS
+    taille_memoire  = 30 if user_tier in ("ultra", "founder") else (15 if user_tier in ("basic", "premium") else 5)
+    output_tokens   = PAID_MAX_TOKENS if is_paid_tier(user_tier) else FREE_MAX_TOKENS
     historique_ajuste = raw_history[-taille_memoire:]
     force_neutral     = len(selected_buttons) > 0 or source == "vitality"
     gemini_contents   = build_gemini_contents(historique_ajuste, image_b64, user_message, force_neutral)
@@ -345,6 +351,7 @@ def call_gemini_with_search(client, model_key, ctx, timeout=30, temperature=0.5)
     return call_with_timeout(fn, timeout)
 
 def call_openrouter(model_key, ctx, temp=0.5, timeout=20.0):
+    """Appel OpenRouter — mistral, hy3, owl, llama passent par ici."""
     if client_openrouter is None:
         raise RuntimeError("OpenRouter non configuré")
     res = client_openrouter.chat.completions.create(
@@ -360,6 +367,7 @@ def call_openrouter(model_key, ctx, temp=0.5, timeout=20.0):
     return content
 
 def call_deepseek(ctx, temp=0.5, timeout=20.0):
+    """Appel DeepSeek direct via leur API OpenAI-compatible."""
     if client_deepseek is None:
         raise RuntimeError("DeepSeek non configuré")
     res = client_deepseek.chat.completions.create(
@@ -375,6 +383,7 @@ def call_deepseek(ctx, temp=0.5, timeout=20.0):
     return content
 
 def call_glm(ctx, temp=0.5, timeout=20.0):
+    """Appel GLM-4 via Z.AI — OpenAI-compatible."""
     if client_zai is None:
         raise RuntimeError("Z.AI non configuré")
     res = client_zai.chat.completions.create(
@@ -389,16 +398,36 @@ def call_glm(ctx, temp=0.5, timeout=20.0):
         raise ValueError("Reponse vide de glm")
     return content
 
-# ── CASCADE PAYANTE ────────────────────────────────────────────────────────────
+# ── CASCADE PAYANTE par tier ───────────────────────────────────────────────────
 def run_paid_cascade(ctx, page_timeout: int = 10):
     tier = ctx["user_tier"]
     t    = page_timeout
-    # Même cascade pour tous les tiers payants : GLM → DeepSeek → Llama
-    steps = [
-        ("z",  "glm",      15),
-        ("ds", "deepseek",  t),
-        ("or", "llama",     t),
-    ]
+
+    if tier == "basic":
+        steps = [
+            ("ds", "deepseek",             t),
+            ("z",  "glm",                 15),
+            ("or", "llama",                t),
+        ]
+    elif tier == "premium":
+        steps = [
+            ("ds", "deepseek",             t),
+            ("z",  "glm",                 15),
+            ("or", "llama",                t),
+        ]
+    elif tier == "ultra":
+        steps = [
+            ("ds", "deepseek",             t),
+            ("z",  "glm",                 15),
+            ("or", "llama",                t),
+        ]
+    else:  # founder
+        steps = [
+            ("ds", "deepseek",             t),
+            ("z",  "glm",                 15),
+            ("or", "llama",                t),
+        ]
+
     for provider, model_key, timeout in steps:
         if is_model_locked(model_key):
             continue
@@ -419,6 +448,7 @@ def run_paid_cascade(ctx, page_timeout: int = 10):
         except Exception as e:
             print(f"[PAID {tier}] Echec {model_key} ({e})")
             lock_model(model_key, 30)
+
     return ERR_FINAL
 
 # ── CASCADE FREE ───────────────────────────────────────────────────────────────
@@ -427,6 +457,7 @@ def run_free_cascade(steps, ctx, parser=None, is_horizon=False):
         parser = clean_and_parse_json
     if not is_horizon and get_failover_count() >= MAX_FREE_FAILOVERS:
         return ERR_QUOTA
+
     for i, (provider, model_key, timeout) in enumerate(steps):
         if provider == "or" and client_openrouter is None:
             continue
@@ -450,15 +481,17 @@ def run_free_cascade(steps, ctx, parser=None, is_horizon=False):
             elif provider == "z":
                 r      = call_glm(ctx, temp=0.5, timeout=float(timeout))
                 result = parser(r)
-            else:
+            else:  # "or"
                 r      = call_openrouter(model_key, ctx, temp=0.5, timeout=float(timeout))
                 result = parser(r)
+
             if is_last and not is_horizon:
                 increment_failover_count()
             return result
         except Exception as e:
             print(f"[FREE] Echec {model_key} ({e})")
             lock_model(model_key, 30)
+
     return ERR_FINAL
 
 # ── ROUTES ─────────────────────────────────────────────────────────────────────
@@ -468,6 +501,8 @@ def ping():
     return jsonify({"status": "awake"})
 
 # ── /horizon-warmup ───────────────────────────────────────────────────────────
+# Appelé dès que le user commence à taper — ling détecte l'intention
+# Résultat mis en cache côté serveur pour accélérer la vraie recherche
 HORIZON_WARMUP_CACHE: dict = {}
 
 @app.route("/horizon-warmup", methods=["POST"])
@@ -477,6 +512,7 @@ def horizon_warmup():
         partial = (data.get("partial") or "").strip()
         if not partial or len(partial) < 3:
             return jsonify({"status": "too_short"}), 200
+
         prompt = (
             f"Analyse cette intention de recherche : \"{partial}\"\n\n"
             f"Réponds en JSON avec exactement ces clés :\n"
@@ -484,6 +520,7 @@ def horizon_warmup():
             f" \"keywords\": [\"mot1\", \"mot2\"], \"lang\": \"fr|en\"}}\n"
             f"JSON uniquement, rien d'autre."
         )
+
         ctx = {
             "system_prompt": "Tu es un classificateur d'intentions de recherche. Réponds uniquement en JSON valide.",
             "output_tokens": 150,
@@ -493,6 +530,7 @@ def horizon_warmup():
             ],
             "gemini_contents": [{"role": "user", "parts": [types.Part.from_text(text=prompt)]}],
         }
+
         try:
             raw    = call_openrouter("ling", ctx, temp=0.1, timeout=4.0)
             parsed = clean_and_parse_json(raw)
@@ -502,6 +540,7 @@ def horizon_warmup():
         except Exception as e:
             print(f"[WARMUP] Ling échec ({e})")
             return jsonify({"status": "fallback"})
+
     except Exception as e:
         print(f"[WARMUP] Erreur : {e}")
         return jsonify({"status": "error"})
@@ -515,9 +554,9 @@ def home():
         if is_paid_tier(ctx["user_tier"]):
             return jsonify(run_paid_cascade(ctx, page_timeout=10))
         steps = [
-            ("z",  "glm",      15),
-            ("ds", "deepseek",  8),
-            ("or", "llama",    12),
+            ("ds", "deepseek",             8),
+            ("z",  "glm",                 15),
+            ("or", "llama",               12),
         ]
         return jsonify(run_free_cascade(steps, ctx))
     except Exception as e:
@@ -533,9 +572,9 @@ def chat():
         if is_paid_tier(ctx["user_tier"]):
             return jsonify(run_paid_cascade(ctx, page_timeout=10))
         steps = [
-            ("z",  "glm",      15),
-            ("ds", "deepseek",  8),
-            ("or", "llama",    12),
+            ("ds", "deepseek",             8),
+            ("z",  "glm",                 15),
+            ("or", "llama",               12),
         ]
         return jsonify(run_free_cascade(steps, ctx))
     except Exception as e:
@@ -543,21 +582,21 @@ def chat():
         return jsonify(ERR_CRASH), 500
 
 # ── /vitality ─────────────────────────────────────────────────────────────────
-# FREE et PAYANT : GLM → DeepSeek → Llama (même ordre)
 @app.route("/vitality", methods=["POST"])
 def vitality():
     try:
         data = request.json or {}
         ctx  = prepare_shared_context(data, source_override="vitality")
-        steps = [
-            ("z",  "glm",      15),
-            ("ds", "deepseek", 20),
-            ("or", "llama",    20),
-        ]
         if is_paid_tier(ctx["user_tier"]):
             result = run_paid_cascade(ctx, page_timeout=20)
-        else:
-            result = run_free_cascade(steps, ctx)
+            print(f"[VITALITY] action retournée: {result.get('action')}")
+            return jsonify(result)
+        steps = [
+            ("ds", "deepseek",            20),
+            ("z",  "glm",                 15),
+            ("or", "llama",               20),
+        ]
+        result = run_free_cascade(steps, ctx)
         print(f"[VITALITY] action retournée: {result.get('action')}")
         return jsonify(result)
     except Exception as e:
@@ -572,9 +611,13 @@ def history():
         ctx  = prepare_shared_context(data, source_override="history")
         if is_paid_tier(ctx["user_tier"]):
             return jsonify(run_paid_cascade(ctx, page_timeout=12))
+
         if get_failover_count() >= MAX_FREE_FAILOVERS:
             return jsonify(ERR_QUOTA)
+
         result = None
+
+        # owl-alpha : lock 60s après TOUTE réponse (succès ou échec)
         if not is_model_locked("owl"):
             try:
                 r      = call_openrouter("owl", ctx, temp=0.5, timeout=15.0)
@@ -584,20 +627,21 @@ def history():
                 print(f"[HISTORY] owl-alpha echec ({e})")
             finally:
                 lock_model("owl", 60)
+
         if result is None:
             fallback_steps = [
-                ("z",  "glm",      20),
-                ("ds", "deepseek", 20),
-                ("or", "llama",    20),
+                ("ds", "deepseek",            20),
+                ("z",  "glm",                 20),
+                ("or", "llama",               20),
             ]
             result = run_free_cascade(fallback_steps, ctx)
+
         return jsonify(result)
     except Exception as e:
         print(f"Erreur /history: {e}")
         return jsonify(ERR_CRASH), 500
 
 # ── /books ────────────────────────────────────────────────────────────────────
-# Tous tiers : DeepSeek → Gemini 3.1 Flash Lite → DeepSeek (filet)
 @app.route("/books", methods=["POST"])
 def books():
     try:
@@ -627,46 +671,20 @@ def books():
             )
         system_prompt = f"{mode_instruction}{inject_instruction}\n\nLivre : \"{book_title}\". Reponds en moins de 400 mots. Sois direct et elegant."
 
-        def build_openai_messages(hist):
-            msgs = [{"role": "system", "content": system_prompt}]
-            for msg in hist[-10:]:
-                if not isinstance(msg, str): continue
-                if msg.startswith("You: ") or msg.startswith("Toi: "):
-                    msgs.append({"role": "user", "content": msg.split(":", 1)[1].strip()})
-                elif msg.startswith("Echo: "):
-                    msgs.append({"role": "assistant", "content": msg.split(":", 1)[1].strip()})
-            msgs.append({"role": "user", "content": message})
-            return msgs
+        gemini_history = []
+        for msg in history[-10:]:
+            if msg.startswith("You: "):
+                gemini_history.append(types.Content(role="user",  parts=[types.Part.from_text(text=msg[5:])]))
+            elif msg.startswith("Echo: "):
+                if gemini_history:
+                    gemini_history.append(types.Content(role="model", parts=[types.Part.from_text(text=msg[6:])]))
+        gemini_history.append(types.Content(role="user", parts=[types.Part.from_text(text=message)]))
 
-        def run_books_call_deepseek(timeout):
-            if client_deepseek is None:
-                raise RuntimeError("DeepSeek non configuré")
-            res = client_deepseek.chat.completions.create(
-                model=MODELS["deepseek"],
-                messages=build_openai_messages(history),
-                temperature=0.5,
-                max_tokens=output_tokens,
-                timeout=float(timeout),
-            )
-            content = res.choices[0].message.content
-            if not content:
-                raise ValueError("Reponse vide de deepseek")
-            return content
-
-        def run_books_call_gemini_flash(timeout):
-            # gemini-3.1-flash-lite
-            gemini_hist = []
-            for msg in history[-10:]:
-                if msg.startswith("You: "):
-                    gemini_hist.append(types.Content(role="user",  parts=[types.Part.from_text(text=msg[5:])]))
-                elif msg.startswith("Echo: "):
-                    if gemini_hist:
-                        gemini_hist.append(types.Content(role="model", parts=[types.Part.from_text(text=msg[6:])]))
-            gemini_hist.append(types.Content(role="user", parts=[types.Part.from_text(text=message)]))
+        def run_books_call_gemini(model_key, timeout):
             def fn():
                 return client_gemini_paid.models.generate_content(
-                    model=MODELS["gemini_paid_ultra"],  # gemini-3.1-flash-lite
-                    contents=gemini_hist,
+                    model=MODELS[model_key],
+                    contents=gemini_history,
                     config=types.GenerateContentConfig(
                         system_instruction=system_prompt,
                         max_output_tokens=output_tokens,
@@ -678,30 +696,127 @@ def books():
                 raise ValueError("Reponse Gemini vide")
             return resp.text
 
-        # Cascade universelle Books : DeepSeek → Gemini 3.1 Flash Lite → DeepSeek
+        def run_books_call_openrouter(model_key, timeout):
+            openai_messages = [{"role": "system", "content": system_prompt}]
+            for msg in history[-10:]:
+                if msg.startswith("You: "):
+                    openai_messages.append({"role": "user",      "content": msg[5:]})
+                elif msg.startswith("Echo: "):
+                    openai_messages.append({"role": "assistant", "content": msg[6:]})
+            openai_messages.append({"role": "user", "content": message})
+            res = client_openrouter.chat.completions.create(
+                model=MODELS[model_key],
+                messages=openai_messages,
+                temperature=0.5,
+                max_tokens=output_tokens,
+                timeout=float(timeout),
+            )
+            content = res.choices[0].message.content
+            if not content:
+                raise ValueError(f"Reponse vide de {model_key}")
+            return content
+
+        def run_books_call_deepseek(timeout):
+            openai_messages = [{"role": "system", "content": system_prompt}]
+            for msg in history[-10:]:
+                if msg.startswith("You: "):
+                    openai_messages.append({"role": "user",      "content": msg[5:]})
+                elif msg.startswith("Echo: "):
+                    openai_messages.append({"role": "assistant", "content": msg[6:]})
+            openai_messages.append({"role": "user", "content": message})
+            res = client_deepseek.chat.completions.create(
+                model=MODELS["deepseek"],
+                messages=openai_messages,
+                temperature=0.5,
+                max_tokens=output_tokens,
+                timeout=float(timeout),
+            )
+            content = res.choices[0].message.content
+            if not content:
+                raise ValueError("Reponse vide de deepseek")
+            return content
+
+        def run_books_call_glm(timeout):
+            openai_messages = [{"role": "system", "content": system_prompt}]
+            for msg in history[-10:]:
+                if not isinstance(msg, str):
+                    continue
+                if msg.startswith("You:") or msg.startswith("Toi:"):
+                    clean_content = msg.split(":", 1)[1].strip()
+                    openai_messages.append({"role": "user", "content": clean_content})
+                elif msg.startswith("Echo:"):
+                    clean_content = msg.split(":", 1)[1].strip()
+                    try:
+                        parsed = json.loads(clean_content)
+                        clean_content = parsed.get("response", clean_content)
+                    except Exception:
+                        pass
+                    openai_messages.append({"role": "assistant", "content": clean_content})
+            openai_messages.append({"role": "user", "content": message})
+            res = client_zai.chat.completions.create(
+                model=MODELS["glm"],
+                messages=openai_messages,
+                temperature=0.5,
+                max_tokens=output_tokens,
+                timeout=float(timeout),
+            )
+            content = res.choices[0].message.content
+            if not content:
+                raise ValueError("Reponse vide de glm")
+            return content
+
+        # GLM en premier (Z.AI), filet = deepseek
         books_steps = [
-            ("ds_books",     20),
-            ("gemini_flash", 20),
-            ("ds_books",     25),  # deuxième tentative DeepSeek
+            ("z",  "glm",     20),
+            ("or", "hy3",     25),
+            ("ds", "deepseek", 20),
         ]
+        if is_paid_tier(tier):
+            t = 20
+            if tier == "founder":
+                books_steps = [
+                    ("g",  "gemini_paid_founder", t),
+                    ("ds", "deepseek",            t),
+                    ("z",  "glm",                 15),
+                ]
+            elif tier == "ultra":
+                books_steps = [
+                    ("ds", "deepseek",  t),
+                    ("or", "llama",     t),
+                    ("z",  "glm",       15),
+                ]
+            elif tier == "premium":
+                books_steps = [
+                    ("ds", "deepseek",  t),
+                    ("or", "mistral",   t),
+                    ("z",  "glm",       15),
+                ]
+            else:  # basic
+                books_steps = [
+                    ("or", "mistral",  t),
+                    ("or", "hy3",      t),
+                    ("z",  "glm",      15),
+                ]
 
         full_text = ""
-        for provider, timeout in books_steps:
+        for i, (provider, model_key, timeout) in enumerate(books_steps):
+            if is_model_locked(model_key):
+                continue
             try:
-                if provider == "ds_books":
-                    if is_model_locked("deepseek"):
-                        continue
+                if provider == "g":
+                    full_text = run_books_call_gemini(model_key, timeout)
+                elif provider == "ds":
                     full_text = run_books_call_deepseek(timeout)
-                elif provider == "gemini_flash":
-                    if is_model_locked("gemini_paid_ultra"):
-                        continue
-                    full_text = run_books_call_gemini_flash(timeout)
-                if full_text:
-                    break
+                elif provider == "z":
+                    full_text = run_books_call_glm(timeout)
+                else:
+                    full_text = run_books_call_openrouter(model_key, timeout)
+                if i == len(books_steps) - 1 and not is_paid_tier(tier):
+                    increment_failover_count()
+                break
             except Exception as e:
-                model_tag = "deepseek" if provider == "ds_books" else "gemini_paid_ultra"
-                print(f"[BOOKS] Echec {model_tag} ({e})")
-                lock_model(model_tag, 30)
+                print(f"[BOOKS] Echec {model_key} ({e})")
+                lock_model(model_key, 30)
 
         if not full_text:
             return jsonify({"response": ERR_FINAL["response"], "inject": False, "action": None})
@@ -718,6 +833,9 @@ def books():
         return jsonify({"response": ERR_CRASH["response"], "inject": False, "action": None}), 500
 
 # ── /horizon ──────────────────────────────────────────────────────────────────
+# CONTEXTE ISOLÉ — aucun historique de conversation pour ne pas polluer le grounding
+# Cascades : free/basic → mistral → llama → deepseek
+#            premium/ultra/founder → gemini+search → mistral → deepseek
 @app.route("/horizon", methods=["POST"])
 def horizon():
     try:
@@ -725,6 +843,8 @@ def horizon():
         query = (data.get("query") or "").strip()
         if not query:
             return jsonify({"error": "L'intention d'exploration est vide."}), 400
+
+        # Warmup — retourner immédiatement sans appeler les modèles
         if data.get("warmup") or query == "...":
             return jsonify({"status": "warm"}), 200
 
@@ -733,6 +853,7 @@ def horizon():
         heure_str  = maintenant.strftime("%H:%M")
         user_tier  = normalize_tier(data.get("userTier", "connected_free"))
 
+        # ── Contexte ISOLÉ — aucun historique, aucune pollution ──────────────
         horizon_message = (
             f"DATE ET HEURE ACTUELLES : {date_str}, {heure_str} (heure locale du serveur).\n"
             f"ANNEE EN COURS : 2026. Toutes les informations doivent etre actuelles et valides en 2026.\n\n"
@@ -770,14 +891,23 @@ def horizon():
             "user_tier": user_tier,
         }
 
-        parsed = None
-        horizon_steps = [
-            ("gs", "gemini_paid_standard", 8),
-            ("gs", "gemini_paid_ultra",    8),
-            ("ds", "deepseek",             8),
+        required_matrix_keys = [
+            "c_est_quoi", "est_ce_bon", "combien_ca_coute", "est_ce_disponible",
+            "qu_en_pensent_les_gens", "quelles_sont_les_alternatives",
+            "quels_sont_les_risques", "quelle_option_est_recommandee"
         ]
 
-        for attempt in range(3):
+        # ── Horizon : cascade simple avec retry au début ──────────────────────
+        import time
+        parsed = None
+
+        horizon_steps = [
+            ("gs", "gemini_paid_standard", 8),   # gemini-2.5-flash-lite + grounding
+            ("gs", "gemini_paid_ultra",    8),   # gemini-3.1-flash-lite + grounding
+            ("ds", "deepseek",             8),   # deepseek direct (filet)
+        ]
+
+        for attempt in range(3):  # max 3 passes complètes
             for provider, model_key, timeout in horizon_steps:
                 try:
                     print(f"[HORIZON] Pass {attempt+1} — {model_key}")
@@ -787,6 +917,7 @@ def horizon():
                     else:
                         r      = call_deepseek(ctx, temp=0.5, timeout=float(timeout))
                         parsed = clean_and_parse_horizon_json(r)
+
                     if parsed.get("response", "").strip():
                         print(f"[HORIZON] Succes — {model_key}")
                         break
@@ -794,6 +925,7 @@ def horizon():
                         print(f"[HORIZON] Reponse vide — {model_key}")
                 except Exception as e:
                     print(f"[HORIZON] Echec {model_key} ({e})")
+
             if parsed and parsed.get("response", "").strip():
                 break
             if attempt < 2:
@@ -802,6 +934,7 @@ def horizon():
         if not parsed or not parsed.get("response", "").strip():
             return jsonify(ERR_HORIZON)
 
+        # Normaliser les champs
         if not isinstance(parsed.get("matrix"), dict):
             parsed["matrix"] = None
         if not isinstance(parsed.get("attributes"), list):
@@ -814,8 +947,6 @@ def horizon():
         return jsonify(ERR_HORIZON), 500
 
 # ── /memory-summary ───────────────────────────────────────────────────────────
-# 1er : amazon/nova-lite-v1 (mistral key)
-# 2e  : gemini-2.5-flash-lite
 @app.route("/memory-summary", methods=["POST"])
 def memory_summary():
     try:
@@ -852,19 +983,17 @@ def memory_summary():
             "user_tier": user_tier,
         }
 
-        # 1er : amazon/nova-lite-v1 via OpenRouter
-        try:
-            r       = call_openrouter("mistral", ctx, temp=0.1, timeout=15.0)
-            summary = r.strip() if r else ""
-            if summary:
-                return jsonify({"summary": summary})
-        except Exception as e:
-            print(f"[MEMORY] nova-lite echec ({e}), fallback gemini-2.5-flash-lite")
-
-        # 2e : gemini-2.5-flash-lite
         try:
             r       = call_gemini(client_gemini_paid, "gemini_paid_standard", ctx, timeout=20, temperature=0.1)
             summary = (r.text or "").strip() if r else ""
+            if summary:
+                return jsonify({"summary": summary})
+        except Exception as e:
+            print(f"[MEMORY] Gemini echec ({e}), fallback mistral")
+
+        try:
+            r       = call_openrouter("mistral", ctx, temp=0.1, timeout=15.0)
+            summary = r.strip() if r else ""
             if summary:
                 return jsonify({"summary": summary})
         except Exception as e:
@@ -877,142 +1006,6 @@ def memory_summary():
         return jsonify({"summary": ""}), 500
 
 # ── /export ───────────────────────────────────────────────────────────────────
-# Parser BeautifulSoup — respecte font-size, bold, italic, align, h1/h2/h3
-def px_to_pt(px_str: str) -> float:
-    try:
-        return round(float(str(px_str).replace("px","").strip()) * 0.75, 1)
-    except Exception:
-        return 11.0
-
-def parse_style(style_str: str) -> dict:
-    result = {}
-    for part in (style_str or "").split(";"):
-        part = part.strip()
-        if ":" in part:
-            k, v = part.split(":", 1)
-            result[k.strip().lower()] = v.strip()
-    return result
-
-def html_to_docx(html: str, title: str) -> io.BytesIO:
-    from docx import Document
-    from docx.shared import Pt
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
-
-    doc   = Document()
-    style = doc.styles["Normal"]
-    style.font.name = "Georgia"
-    style.font.size = Pt(11)
-
-    title_para = doc.add_paragraph()
-    title_run  = title_para.add_run(title)
-    title_run.font.size = Pt(24)
-    title_run.font.bold = True
-    doc.add_paragraph()
-
-    soup = BeautifulSoup(html, "html.parser")
-
-    global_font_size_pt = 11.0
-    global_font_family  = "Georgia"
-    wrapper = soup.find("div", style=True)
-    if wrapper:
-        ws = parse_style(wrapper.get("style", ""))
-        if "font-size" in ws:
-            global_font_size_pt = px_to_pt(ws["font-size"])
-        if "font-family" in ws:
-            global_font_family = ws["font-family"].split(",")[0].strip().strip('"\'')
-
-    ALIGN_MAP = {
-        "left":    WD_ALIGN_PARAGRAPH.LEFT,
-        "center":  WD_ALIGN_PARAGRAPH.CENTER,
-        "right":   WD_ALIGN_PARAGRAPH.RIGHT,
-        "justify": WD_ALIGN_PARAGRAPH.JUSTIFY,
-    }
-
-    def add_run_from_node(para, node, inherited: dict):
-        if isinstance(node, NavigableString):
-            text = str(node)
-            if not text.strip() and text != " ":
-                return
-            run = para.add_run(text)
-            run.font.size = Pt(inherited.get("font_size_pt", global_font_size_pt))
-            run.font.name = inherited.get("font_family", global_font_family)
-            run.bold      = inherited.get("bold", False)
-            run.italic    = inherited.get("italic", False)
-            return
-        if not isinstance(node, Tag):
-            return
-        tag  = node.name.lower() if node.name else ""
-        styl = parse_style(node.get("style", ""))
-        ctx  = dict(inherited)
-        if "font-size"   in styl: ctx["font_size_pt"] = px_to_pt(styl["font-size"])
-        if "font-family" in styl: ctx["font_family"]  = styl["font-family"].split(",")[0].strip().strip('"\'')
-        if "font-weight" in styl and styl["font-weight"] in ("bold","700","800","900"): ctx["bold"]   = True
-        if "font-style"  in styl and styl["font-style"] == "italic":                   ctx["italic"] = True
-        if tag in ("strong", "b"): ctx["bold"]   = True
-        if tag in ("em", "i"):     ctx["italic"] = True
-        if tag == "br":
-            para.add_run().add_break(); return
-        for child in node.children:
-            add_run_from_node(para, child, ctx)
-
-    def process_block(node):
-        if isinstance(node, NavigableString):
-            text = str(node).strip()
-            if text:
-                p   = doc.add_paragraph()
-                run = p.add_run(text)
-                run.font.size = Pt(global_font_size_pt)
-                run.font.name = global_font_family
-            return
-        if not isinstance(node, Tag):
-            return
-        tag  = node.name.lower() if node.name else ""
-        styl = parse_style(node.get("style", ""))
-        if node.get("data-page-break"):
-            doc.add_page_break(); return
-        if tag in ("script", "style", "head"):
-            return
-        if tag in ("div", "section", "article", "main", "body", "html"):
-            for child in node.children:
-                process_block(child)
-            return
-        heading_sizes = {"h1": 24.0, "h2": 18.0, "h3": 14.0}
-        if tag in heading_sizes:
-            para = doc.add_paragraph()
-            ctx  = {"font_size_pt": heading_sizes[tag], "bold": True, "font_family": global_font_family}
-            if "text-align" in styl:
-                para.alignment = ALIGN_MAP.get(styl["text-align"], WD_ALIGN_PARAGRAPH.LEFT)
-            for child in node.children:
-                add_run_from_node(para, child, ctx)
-            return
-        if tag in ("p", "li"):
-            para = doc.add_paragraph()
-            ctx  = {"font_size_pt": global_font_size_pt, "font_family": global_font_family}
-            if "text-align" in styl:
-                para.alignment = ALIGN_MAP.get(styl["text-align"], WD_ALIGN_PARAGRAPH.LEFT)
-            if "font-size"  in styl:
-                ctx["font_size_pt"] = px_to_pt(styl["font-size"])
-            for child in node.children:
-                add_run_from_node(para, child, ctx)
-            return
-        if tag in ("span", "strong", "em", "b", "i", "u"):
-            para = doc.add_paragraph()
-            ctx  = {"font_size_pt": global_font_size_pt, "font_family": global_font_family}
-            add_run_from_node(para, node, ctx)
-            return
-        for child in node.children:
-            process_block(child)
-
-    root = wrapper if wrapper else soup
-    for child in root.children:
-        process_block(child)
-
-    buf = io.BytesIO()
-    doc.save(buf)
-    buf.seek(0)
-    return buf
-
-
 @app.route("/export", methods=["POST"])
 def export_route():
     data  = request.get_json(silent=True) or {}
@@ -1024,42 +1017,36 @@ def export_route():
     safe = "".join(c for c in title if c.isalnum() or c in " _-").strip().replace(" ", "_") or "document"
     try:
         if fmt == "txt":
-            soup = BeautifulSoup(html, "html.parser")
-            txt  = soup.get_text(separator="\n").replace('&nbsp;', ' ')
+            txt = re.sub(r'<[^>]+>', '', html).replace('&nbsp;', ' ').replace('&amp;', '&')
             return send_file(io.BytesIO(txt.encode("utf-8")), mimetype="text/plain", as_attachment=True, download_name=f"{safe}.txt")
-
         elif fmt == "pdf":
             try:
                 from xhtml2pdf import pisa
-                soup    = BeautifulSoup(html, "html.parser")
-                wrapper = soup.find("div", style=True)
-                fs_pt   = "11pt"
-                ff      = "Georgia, serif"
-                if wrapper:
-                    ws = parse_style(wrapper.get("style", ""))
-                    if "font-size"   in ws: fs_pt = f"{px_to_pt(ws['font-size'])}pt"
-                    if "font-family" in ws: ff    = ws["font-family"]
-                styled = (
-                    f'<html><head><meta charset="utf-8">'
-                    f'<style>body{{font-family:{ff};font-size:{fs_pt};line-height:1.6;color:#18181b}}'
-                    f'h1{{font-size:24pt}}h2{{font-size:18pt}}h3{{font-size:14pt}}'
-                    f'p{{margin-bottom:10px}}</style></head>'
-                    f'<body><h1>{title}</h1>{html}</body></html>'
-                )
+                styled = f'<html><head><meta charset="utf-8"><style>body{{font-family:sans-serif;font-size:11pt;line-height:1.6;color:#18181b}}h1{{font-size:22pt;border-bottom:1px solid #e4e4e7;padding-bottom:8px}}p{{margin-bottom:12px;text-align:justify}}</style></head><body><h1>{title}</h1>{html}</body></html>'
                 buf = io.BytesIO()
                 pisa.CreatePDF(io.StringIO(styled), dest=buf)
                 buf.seek(0)
                 return send_file(buf, mimetype="application/pdf", as_attachment=True, download_name=f"{safe}.pdf")
             except ImportError:
                 return jsonify({"error": "xhtml2pdf non installe."}), 503
-
         elif fmt == "docx":
             try:
-                buf = html_to_docx(html, title)
+                from docx import Document
+                from docx.shared import Pt, RGBColor
+                from docx.enum.text import WD_ALIGN_PARAGRAPH
+                doc = Document()
+                t_para = doc.add_paragraph(); run = t_para.add_run(title)
+                run.font.size = Pt(24); run.font.bold = True; run.font.color.rgb = RGBColor(15, 23, 42)
+                clean = re.sub(r'<[^>]+>', '\n', html).replace('&nbsp;', ' ')
+                for line in clean.split('\n'):
+                    line = line.strip()
+                    if line:
+                        p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+                        p.add_run(line).font.size = Pt(11)
+                buf = io.BytesIO(); doc.save(buf); buf.seek(0)
                 return send_file(buf, mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document", as_attachment=True, download_name=f"{safe}.docx")
             except ImportError:
-                return jsonify({"error": "python-docx ou beautifulsoup4 non installe."}), 503
-
+                return jsonify({"error": "python-docx non installe."}), 503
         elif fmt == "epub":
             try:
                 from ebooklib import epub
@@ -1068,19 +1055,14 @@ def export_route():
                 book.set_title(title); book.set_language("fr"); book.add_author("Echo AI")
                 ch = epub.EpubHtml(title=title, file_name="ch1.xhtml", lang="fr")
                 ch.content = f"<html><body><h1>{title}</h1>{html}</body></html>"
-                book.add_item(ch)
-                book.toc   = (epub.Link("ch1.xhtml", title, "ch1"),)
-                book.spine = ["nav", ch]
-                book.add_item(epub.EpubNav())
-                book.add_item(epub.EpubNcx())
+                book.add_item(ch); book.toc = (epub.Link("ch1.xhtml", title, "ch1"),)
+                book.spine = ["nav", ch]; book.add_item(epub.EpubNav()); book.add_item(epub.EpubNcx())
                 buf = io.BytesIO(); epub.write_epub(buf, book, {}); buf.seek(0)
                 return send_file(buf, mimetype="application/epub+zip", as_attachment=True, download_name=f"{safe}.epub")
             except ImportError:
                 return jsonify({"error": "EbookLib non installe."}), 503
-
         else:
             return jsonify({"error": f"Format '{fmt}' non supporte."}), 400
-
     except Exception as e:
         print(f"[EXPORT ERROR] {fmt}: {e}")
         return jsonify({"error": str(e)}), 500
