@@ -12,7 +12,6 @@ from google import genai
 from google.genai import types
 from openai import OpenAI
 from dotenv import load_dotenv
-from bs4 import BeautifulSoup, NavigableString, Tag
 
 from prompts import generate_system_prompt
 
@@ -897,6 +896,7 @@ def html_to_docx(html: str, title: str) -> io.BytesIO:
     from docx import Document
     from docx.shared import Pt
     from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from bs4 import BeautifulSoup, NavigableString, Tag
 
     doc   = Document()
     style = doc.styles["Normal"]
@@ -1024,6 +1024,7 @@ def export_route():
     safe = "".join(c for c in title if c.isalnum() or c in " _-").strip().replace(" ", "_") or "document"
     try:
         if fmt == "txt":
+            from bs4 import BeautifulSoup
             soup = BeautifulSoup(html, "html.parser")
             txt  = soup.get_text(separator="\n").replace('&nbsp;', ' ')
             return send_file(io.BytesIO(txt.encode("utf-8")), mimetype="text/plain", as_attachment=True, download_name=f"{safe}.txt")
@@ -1031,6 +1032,7 @@ def export_route():
         elif fmt == "pdf":
             try:
                 from xhtml2pdf import pisa
+                from bs4 import BeautifulSoup
                 soup    = BeautifulSoup(html, "html.parser")
                 wrapper = soup.find("div", style=True)
                 fs_pt   = "11pt"
