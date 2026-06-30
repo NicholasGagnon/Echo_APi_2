@@ -27,8 +27,8 @@ def check_recovery_rate_limit(email: str) -> bool:
 
 # ── MODÈLES SITE2 — propre cascade, indépendante d'Echo ─────────────────────────
 SITE2_MODELS = {
-    "grok":  "x-ai/grok-4.1-fast-non-reasoning",
-    "qwen3": "Qwen/Qwen3-235B-A22B-Instruct-2507",
+    "grok":  "xai/grok-4-fast-non-reasoning",
+    "qwen3": "qwen/qwen3-235b-a22b-instruct-2507",
 }
 
 REQUESTY_API_KEY = os.getenv("REQUESTY_API_KEY", "").strip()

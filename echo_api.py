@@ -33,8 +33,8 @@ MODELS = {
     "owl":        "openrouter/owl-alpha",
     "llama":      "meta-llama/llama-3.3-70b-instruct",
     "ling":       "inclusionai/ling-2.6-flash",
-    "deepseek":   "deepseek-chat",
-    "glm":        "glm-4-32b-0414-128k",
+    "deepseek":   "deepseek-v4-flash",
+    "glm":        "GLM-4.5-Air",
 }
 
 FREE_MAX_TOKENS = 2_500
@@ -388,33 +388,61 @@ def call_glm(ctx, temp=0.5, timeout=20.0):
         raise ValueError("Reponse vide de glm")
     return content
 
-# ── CASCADE PAYANTE ────────────────────────────────────────────────────────────
+# ── DISPATCH COMMUN POUR LES CASCADES ──────────────────────────────────────────
+def _dispatch_step(provider, model_key, ctx, timeout, parser):
+    """Exécute une étape de cascade et retourne le résultat parsé."""
+    if provider == "g":
+        r = call_gemini(client_gemini_paid, model_key, ctx, timeout=timeout, temperature=0.5)
+        return parser(r.text)
+    elif provider == "gs":
+        r = call_gemini_with_search(client_gemini_paid, model_key, ctx, timeout=timeout, temperature=0.5)
+        return parser(r.text)
+    elif provider == "ds":
+        r = call_deepseek(ctx, temp=0.5, timeout=float(timeout))
+        return parser(r)
+    elif provider == "z":
+        r = call_glm(ctx, temp=0.5, timeout=float(timeout))
+        return parser(r)
+    else:  # "or"
+        r = call_openrouter(model_key, ctx, temp=0.5, timeout=float(timeout))
+        return parser(r)
+
+# ── CASCADE PAYANTE PAR TIER (NE COUVRE PAS /vitality) ─────────────────────────
+# Utilisée par /home, /chat, /history (payant). Cascade différente selon basic/premium/ultra/founder.
 def run_paid_cascade(ctx, page_timeout: int = 10):
     tier = ctx["user_tier"]
     t    = page_timeout
-    # Même cascade pour tous les tiers payants : GLM → DeepSeek → Llama
-    steps = [
-        ("z",  "glm",      15),
-        ("ds", "deepseek",  t),
-        ("or", "llama",     t),
-    ]
+
+    if tier == "basic":
+        steps = [
+            ("ds", "deepseek", t),
+            ("or", "llama",    t),
+            ("or", "hy3",      t),
+        ]
+    elif tier == "premium":
+        steps = [
+            ("ds", "deepseek", t),
+            ("or", "llama",    t),
+            ("ds", "deepseek", t),
+        ]
+    elif tier == "ultra":
+        steps = [
+            ("ds", "deepseek",          t),
+            ("g",  "gemini_paid_ultra", t),
+            ("ds", "deepseek",          t),
+        ]
+    else:  # founder
+        steps = [
+            ("g",  "gemini_paid_founder", t),
+            ("g",  "gemini_paid_ultra",   t),
+            ("ds", "deepseek",            t),
+        ]
+
     for provider, model_key, timeout in steps:
         if is_model_locked(model_key):
             continue
         try:
-            if provider == "g":
-                r      = call_gemini(client_gemini_paid, model_key, ctx, timeout=timeout, temperature=0.5)
-                result = clean_and_parse_json(r.text)
-            elif provider == "ds":
-                r      = call_deepseek(ctx, temp=0.5, timeout=float(timeout))
-                result = clean_and_parse_json(r)
-            elif provider == "z":
-                r      = call_glm(ctx, temp=0.5, timeout=float(timeout))
-                result = clean_and_parse_json(r)
-            else:
-                r      = call_openrouter(model_key, ctx, temp=0.5, timeout=float(timeout))
-                result = clean_and_parse_json(r)
-            return result
+            return _dispatch_step(provider, model_key, ctx, timeout, clean_and_parse_json)
         except Exception as e:
             print(f"[PAID {tier}] Echec {model_key} ({e})")
             lock_model(model_key, 30)
@@ -437,21 +465,7 @@ def run_free_cascade(steps, ctx, parser=None, is_horizon=False):
             continue
         is_last = (i == len(steps) - 1)
         try:
-            if provider == "g":
-                r      = call_gemini(client_gemini_paid, model_key, ctx, timeout=timeout, temperature=0.5)
-                result = parser(r.text)
-            elif provider == "gs":
-                r      = call_gemini_with_search(client_gemini_paid, model_key, ctx, timeout=timeout, temperature=0.5)
-                result = parser(r.text)
-            elif provider == "ds":
-                r      = call_deepseek(ctx, temp=0.5, timeout=float(timeout))
-                result = parser(r)
-            elif provider == "z":
-                r      = call_glm(ctx, temp=0.5, timeout=float(timeout))
-                result = parser(r)
-            else:
-                r      = call_openrouter(model_key, ctx, temp=0.5, timeout=float(timeout))
-                result = parser(r)
+            result = _dispatch_step(provider, model_key, ctx, timeout, parser)
             if is_last and not is_horizon:
                 increment_failover_count()
             return result
@@ -506,6 +520,7 @@ def horizon_warmup():
         return jsonify({"status": "error"})
 
 # ── /home ──────────────────────────────────────────────────────────────────────
+# FREE : DeepSeek → tencent (hy3) → Llama
 @app.route("/home", methods=["POST"])
 def home():
     try:
@@ -514,9 +529,9 @@ def home():
         if is_paid_tier(ctx["user_tier"]):
             return jsonify(run_paid_cascade(ctx, page_timeout=10))
         steps = [
-            ("z",  "glm",      15),
             ("ds", "deepseek",  8),
-            ("or", "llama",    12),
+            ("or", "hy3",      12),
+            ("or", "llama",    15),
         ]
         return jsonify(run_free_cascade(steps, ctx))
     except Exception as e:
@@ -524,6 +539,7 @@ def home():
         return jsonify(ERR_CRASH), 500
 
 # ── /chat ──────────────────────────────────────────────────────────────────────
+# FREE : DeepSeek → tencent (hy3) → Llama
 @app.route("/chat", methods=["POST"])
 def chat():
     try:
@@ -532,9 +548,9 @@ def chat():
         if is_paid_tier(ctx["user_tier"]):
             return jsonify(run_paid_cascade(ctx, page_timeout=10))
         steps = [
-            ("z",  "glm",      15),
             ("ds", "deepseek",  8),
-            ("or", "llama",    12),
+            ("or", "hy3",      12),
+            ("or", "llama",    15),
         ]
         return jsonify(run_free_cascade(steps, ctx))
     except Exception as e:
@@ -542,7 +558,24 @@ def chat():
         return jsonify(ERR_CRASH), 500
 
 # ── /vitality ─────────────────────────────────────────────────────────────────
-# FREE et PAYANT : GLM → DeepSeek → Llama (même ordre)
+# INTACT : seule route où GLM → DeepSeek → Llama reste en place, FREE et PAYANT.
+def _run_vitality_paid_cascade(ctx, page_timeout: int = 20):
+    tier = ctx["user_tier"]
+    steps = [
+        ("z",  "glm",      15),
+        ("ds", "deepseek", page_timeout),
+        ("or", "llama",    page_timeout),
+    ]
+    for provider, model_key, timeout in steps:
+        if is_model_locked(model_key):
+            continue
+        try:
+            return _dispatch_step(provider, model_key, ctx, timeout, clean_and_parse_json)
+        except Exception as e:
+            print(f"[PAID VITALITY {tier}] Echec {model_key} ({e})")
+            lock_model(model_key, 30)
+    return ERR_FINAL
+
 @app.route("/vitality", methods=["POST"])
 def vitality():
     try:
@@ -554,7 +587,7 @@ def vitality():
             ("or", "llama",    20),
         ]
         if is_paid_tier(ctx["user_tier"]):
-            result = run_paid_cascade(ctx, page_timeout=20)
+            result = _run_vitality_paid_cascade(ctx, page_timeout=20)
         else:
             result = run_free_cascade(steps, ctx)
         print(f"[VITALITY] action retournée: {result.get('action')}")
@@ -564,6 +597,7 @@ def vitality():
         return jsonify(ERR_CRASH), 500
 
 # ── /history ──────────────────────────────────────────────────────────────────
+# FREE fallback (après owl) : DeepSeek garde sa place, GLM passe en dernier
 @app.route("/history", methods=["POST"])
 def history():
     try:
@@ -585,9 +619,8 @@ def history():
                 lock_model("owl", 60)
         if result is None:
             fallback_steps = [
-                ("z",  "glm",      20),
+                ("or", "mistral",  20),
                 ("ds", "deepseek", 20),
-                ("or", "llama",    20),
             ]
             result = run_free_cascade(fallback_steps, ctx)
         return jsonify(result)
@@ -596,7 +629,7 @@ def history():
         return jsonify(ERR_CRASH), 500
 
 # ── /books ────────────────────────────────────────────────────────────────────
-# Tous tiers : DeepSeek → Gemini 3.1 Flash Lite → DeepSeek (filet)
+# Tous tiers : DeepSeek → Gemini 3.1 Flash Lite → DeepSeek (filet) — INTACT, pas de GLM ici
 @app.route("/books", methods=["POST"])
 def books():
     try:
@@ -653,7 +686,6 @@ def books():
             return content
 
         def run_books_call_gemini_flash(timeout):
-            # gemini-3.1-flash-lite
             gemini_hist = []
             for msg in history[-10:]:
                 if msg.startswith("You: "):
@@ -664,7 +696,7 @@ def books():
             gemini_hist.append(types.Content(role="user", parts=[types.Part.from_text(text=message)]))
             def fn():
                 return client_gemini_paid.models.generate_content(
-                    model=MODELS["gemini_paid_ultra"],  # gemini-3.1-flash-lite
+                    model=MODELS["gemini_paid_ultra"],
                     contents=gemini_hist,
                     config=types.GenerateContentConfig(
                         system_instruction=system_prompt,
@@ -677,11 +709,10 @@ def books():
                 raise ValueError("Reponse Gemini vide")
             return resp.text
 
-        # Cascade universelle Books : DeepSeek → Gemini 3.1 Flash Lite → DeepSeek
         books_steps = [
             ("ds_books",     20),
             ("gemini_flash", 20),
-            ("ds_books",     25),  # deuxième tentative DeepSeek
+            ("ds_books",     25),
         ]
 
         full_text = ""
@@ -717,6 +748,7 @@ def books():
         return jsonify({"response": ERR_CRASH["response"], "inject": False, "action": None}), 500
 
 # ── /horizon ──────────────────────────────────────────────────────────────────
+# INTACT : pas de GLM dans cette route
 @app.route("/horizon", methods=["POST"])
 def horizon():
     try:
@@ -813,8 +845,7 @@ def horizon():
         return jsonify(ERR_HORIZON), 500
 
 # ── /memory-summary ───────────────────────────────────────────────────────────
-# 1er : amazon/nova-lite-v1 (mistral key)
-# 2e  : gemini-2.5-flash-lite
+# INTACT : pas de GLM dans cette route
 @app.route("/memory-summary", methods=["POST"])
 def memory_summary():
     try:
@@ -851,19 +882,17 @@ def memory_summary():
             "user_tier": user_tier,
         }
 
-        # 1er : amazon/nova-lite-v1 via OpenRouter
         try:
-            r       = call_openrouter("mistral", ctx, temp=0.1, timeout=15.0)
+            r       = call_openrouter("ling", ctx, temp=0.1, timeout=15.0)
             summary = r.strip() if r else ""
             if summary:
                 return jsonify({"summary": summary})
         except Exception as e:
-            print(f"[MEMORY] nova-lite echec ({e}), fallback gemini-2.5-flash-lite")
+            print(f"[MEMORY] ling echec ({e}), fallback nova-lite")
 
-        # 2e : gemini-2.5-flash-lite
         try:
-            r       = call_gemini(client_gemini_paid, "gemini_paid_standard", ctx, timeout=20, temperature=0.1)
-            summary = (r.text or "").strip() if r else ""
+            r       = call_openrouter("mistral", ctx, temp=0.1, timeout=15.0)
+            summary = r.strip() if r else ""
             if summary:
                 return jsonify({"summary": summary})
         except Exception as e:
@@ -876,7 +905,6 @@ def memory_summary():
         return jsonify({"summary": ""}), 500
 
 # ── /export ───────────────────────────────────────────────────────────────────
-# Parser BeautifulSoup — respecte font-size, bold, italic, align, h1/h2/h3
 def px_to_pt(px_str: str) -> float:
     try:
         return round(float(str(px_str).replace("px","").strip()) * 0.75, 1)
