@@ -9,7 +9,7 @@ site2_bp = Blueprint("site2", __name__)
 ERR_CRASH = {"action": None, "response": "Une erreur inattendue s'est produite. Reessaie dans quelques secondes."}
 
 resend.api_key = os.getenv("RESEND_API_KEY", "")
-RESEND_FROM = os.getenv("RESEND_FROM", "Echo AI <onboarding@resend.dev>")
+RESEND_FROM = os.getenv("RESEND_FROM", "Echo AI <support@echosai.ca>")
 
 # ── RATE LIMIT récupération Key — 2x/heure max par email ─────────────────────
 _recovery_attempts = {}  # { email: [timestamp1, timestamp2, ...] }
@@ -286,86 +286,9 @@ def supprimer_fiche():
         print(f"Erreur /1/supprimer-fiche: {e}")
         return jsonify(ERR_CRASH), 500
 
-# ── STRIPE — déblocage de fiche (1,50$) ───────────────────────────────────────
-@site2_bp.route("/1/checkout-fiche", methods=["POST"])
-def checkout_fiche():
-    try:
-        import stripe
-        stripe.api_key = os.getenv("STRIPE_SECRET_KEY", "")
-        price_id       = os.getenv("STRIPE_FICHE_PRICE_ID", "")
-
-        data        = request.json or {}
-        fiche_id    = (data.get("fiche_id") or "").strip()
-        acheteur_id = (data.get("acheteur_id") or "").strip()  # user_id Supabase de l'acheteur
-        success_url = data.get("success_url") or "http://localhost:3000/1/fiche?success=true"
-        cancel_url  = data.get("cancel_url")  or "http://localhost:3000/1/fiche?canceled=true"
-
-        if not fiche_id or not acheteur_id:
-            return jsonify({"error": "fiche_id et acheteur_id requis"}), 400
-        if not price_id:
-            return jsonify({"error": "STRIPE_FICHE_PRICE_ID non configuré"}), 500
-
-        session = stripe.checkout.Session.create(
-            mode="payment",
-            line_items=[{"price": price_id, "quantity": 1}],
-            success_url=f"{success_url}&fiche_id={fiche_id}",
-            cancel_url=cancel_url,
-            metadata={"fiche_id": fiche_id, "acheteur_id": acheteur_id, "type": "unlock_fiche"},
-        )
-        return jsonify({"url": session.url})
-    except Exception as e:
-        print(f"Erreur /1/checkout-fiche: {e}")
-        return jsonify(ERR_CRASH), 500
-
-# ── STRIPE WEBHOOK — confirme le paiement et ouvre le tunnel ──────────────────
-@site2_bp.route("/1/stripe-webhook-fiche", methods=["POST"])
-def stripe_webhook_fiche():
-    try:
-        import stripe, requests as req
-        stripe.api_key = os.getenv("STRIPE_SECRET_KEY", "")
-        webhook_secret = os.getenv("STRIPE_FICHE_WEBHOOK_SECRET", "")
-
-        payload    = request.data
-        sig_header = request.headers.get("Stripe-Signature", "")
-
-        try:
-            event = stripe.Webhook.construct_event(payload, sig_header, webhook_secret)
-        except Exception as e:
-            print(f"[STRIPE] Signature invalide: {e}")
-            return jsonify({"error": "invalid_signature"}), 400
-
-        if event["type"] == "checkout.session.completed":
-            session  = event["data"]["object"]
-            metadata = session.get("metadata", {})
-            if metadata.get("type") == "unlock_fiche":
-                fiche_id    = metadata.get("fiche_id")
-                acheteur_id = metadata.get("acheteur_id")
-
-                supabase_url = os.getenv("SUPABASE_URL", "")
-                supabase_key = os.getenv("SUPABASE_SERVICE_KEY", "") or os.getenv("SUPABASE_ANON_KEY", "")
-                headers = {"apikey": supabase_key, "Authorization": f"Bearer {supabase_key}", "Content-Type": "application/json"}
-
-                # Récupérer le propriétaire de la fiche (inscrit_id = user_id de la fiche)
-                res = req.get(
-                    f"{supabase_url}/rest/v1/fiches",
-                    params={"id": f"eq.{fiche_id}", "select": "user_id"},
-                    headers=headers,
-                )
-                rows = res.json() if res.ok else []
-                inscrit_id = rows[0]["user_id"] if rows else None
-
-                # Créer le tunnel — débloque la fiche pour cet acheteur
-                req.post(
-                    f"{supabase_url}/rest/v1/tunnels",
-                    headers=headers,
-                    json={"fiche_id": fiche_id, "acheteur_id": acheteur_id, "inscrit_id": inscrit_id},
-                )
-                print(f"[STRIPE] Tunnel ouvert — fiche {fiche_id} débloquée pour {acheteur_id}")
-
-        return jsonify({"received": True})
-    except Exception as e:
-        print(f"Erreur /1/stripe-webhook-fiche: {e}")
-        return jsonify(ERR_CRASH), 500
+# ── NOTE ── Le checkout Stripe et le webhook de déblocage de fiche vivent
+# maintenant dans Next.js (app/api/checkout-fiche/route.ts + le webhook
+# Stripe fusionné existant), pas ici. Flask garde seulement la vérification.
 
 # ── VÉRIFIER SI UNE FICHE EST DÉBLOQUÉE POUR UN USER ─────────────────────────
 @site2_bp.route("/1/check-unlock", methods=["POST"])
