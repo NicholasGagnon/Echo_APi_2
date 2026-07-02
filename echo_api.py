@@ -1146,27 +1146,66 @@ def analyse_avis():
         if not JINA_API_KEY:
             return jsonify({"error": "Jina API Key non configurée sur le serveur"}), 503
         
-        # ── Étape 1 : Appeler Jina Reader pour extraire le contenu ──────────────
+        # ── Étape 1 : Appeler Jina Reader avec headers anti-bot Amazon ────────
         print(f"[JINA] Extraction du contenu de {url}")
         jina_url = f"https://r.jina.ai/{url}"
         jina_headers = {
             "Authorization": f"Bearer {JINA_API_KEY}",
+            "X-Return-Format": "markdown",
+            "X-With-Generated-Alt": "true",
+            "X-No-Cache": "true",
         }
-        
+
+        raw_markdown = None
         try:
             jina_response = _requests_lib.get(jina_url, headers=jina_headers, timeout=30)
-            if not jina_response.ok:
+            if jina_response.ok:
+                raw_markdown = jina_response.text
+                print(f"[JINA] Contenu recu: {len(raw_markdown)} chars")
+            else:
                 print(f"[JINA] Erreur {jina_response.status_code}: {jina_response.text[:200]}")
-                return jsonify({"error": f"Jina Reader a échoué ({jina_response.status_code})"}), 503
-            
-            raw_markdown = jina_response.text
-            if not raw_markdown or len(raw_markdown) < 50:
-                return jsonify({"error": "Jina n'a pu extraire qu'un contenu minime"}), 400
         except _requests_lib.exceptions.Timeout:
-            return jsonify({"error": "Jina Reader timeout — URL trop volumineuse"}), 504
+            print("[JINA] Timeout sur requete principale")
         except Exception as e:
             print(f"[JINA] Exception: {e}")
-            return jsonify({"error": f"Erreur Jina: {str(e)}"}), 503
+
+        # ── Détection blocage Amazon → fallback ASIN scrape direct ─────────
+        AMAZON_BLOCKED_SIGNALS = [
+            "Sign in", "robot", "captcha", "api.amazon", "Enable JavaScript",
+            "Sorry, we just need to make sure", "Enter the characters you see"
+        ]
+        is_amazon = "amazon." in url.lower()
+        is_blocked = (
+            not raw_markdown
+            or len(raw_markdown) < 200
+            or any(sig.lower() in raw_markdown.lower() for sig in AMAZON_BLOCKED_SIGNALS)
+        )
+
+        if is_amazon and is_blocked:
+            print("[JINA] Amazon bloque — tentative via ASIN + ScrapeAPI fallback")
+            # Extraire l'ASIN depuis l'URL
+            import re as _re
+            asin_match = _re.search(r"/dp/([A-Z0-9]{10})", url)
+            if asin_match:
+                asin = asin_match.group(1)
+                # Essayer avec l'URL courte Amazon (moins bloquée)
+                short_url = f"https://www.amazon.ca/dp/{asin}"
+                try:
+                    jina_response2 = _requests_lib.get(
+                        f"https://r.jina.ai/{short_url}",
+                        headers={**jina_headers, "X-No-Cache": "true"},
+                        timeout=30,
+                    )
+                    if jina_response2.ok and len(jina_response2.text) > 200:
+                        raw_markdown = jina_response2.text
+                        print(f"[JINA] Fallback URL courte OK: {len(raw_markdown)} chars")
+                except Exception as e2:
+                    print(f"[JINA] Fallback URL courte echec: {e2}")
+
+        if not raw_markdown or len(raw_markdown) < 100:
+            return jsonify({
+                "error": "Amazon bloque l'extraction automatique sur cette page. Essaie une URL de page d'avis directe (ex: amazon.ca/product-reviews/ASIN) ou un autre site."
+            }), 400
         
         # ── Étape 2 : Construire le prompt pour DeepSeek ──────────────────────
         system_prompt = (
@@ -1191,21 +1230,56 @@ def analyse_avis():
         ]
         
         # ── Étape 3 : Appeler DeepSeek pour l'analyse ─────────────────────────
-        print("[DEEPSEEK] Analyse des avis...")
-        try:
-            response = client_deepseek.chat.completions.create(
-                model=MODELS["deepseek"],
-                messages=deepseek_messages,
-                temperature=0.3,
-                max_tokens=1500,
-                timeout=25.0,
-            )
-            raw_response = response.choices[0].message.content
-            if not raw_response:
-                return jsonify({"error": "DeepSeek n'a pas retourné de réponse"}), 503
-        except Exception as e:
-            print(f"[DEEPSEEK] Exception: {e}")
-            return jsonify({"error": f"Erreur DeepSeek: {str(e)}"}), 503
+        print("[ANALYSE] Lancement cascade DeepSeek → Llama → Hy3...")
+        raw_response = None
+
+        # Tentative 1 : DeepSeek direct
+        if client_deepseek is not None:
+            try:
+                res = client_deepseek.chat.completions.create(
+                    model=MODELS["deepseek"],
+                    messages=deepseek_messages,
+                    temperature=0.3,
+                    max_tokens=1500,
+                    timeout=25.0,
+                )
+                raw_response = res.choices[0].message.content
+                print("[ANALYSE] DeepSeek OK")
+            except Exception as e:
+                print(f"[ANALYSE] DeepSeek echec ({e}), fallback Llama...")
+
+        # Tentative 2 : Llama via OpenRouter
+        if not raw_response and client_openrouter is not None:
+            try:
+                res = client_openrouter.chat.completions.create(
+                    model=MODELS["llama"],
+                    messages=deepseek_messages,
+                    temperature=0.3,
+                    max_tokens=1500,
+                    timeout=25.0,
+                )
+                raw_response = res.choices[0].message.content
+                print("[ANALYSE] Llama/OpenRouter OK")
+            except Exception as e:
+                print(f"[ANALYSE] Llama echec ({e}), fallback Hy3...")
+
+        # Tentative 3 : Hy3 via OpenRouter
+        if not raw_response and client_openrouter is not None:
+            try:
+                res = client_openrouter.chat.completions.create(
+                    model=MODELS["hy3"],
+                    messages=deepseek_messages,
+                    temperature=0.3,
+                    max_tokens=1500,
+                    timeout=25.0,
+                )
+                raw_response = res.choices[0].message.content
+                print("[ANALYSE] Hy3/OpenRouter OK")
+            except Exception as e:
+                print(f"[ANALYSE] Hy3 echec ({e})")
+
+        if not raw_response:
+            return jsonify({"error": "Tous les modeles d'analyse sont indisponibles"}), 503
         
         # ── Étape 4 : Parser la réponse JSON de DeepSeek ────────────────────────
         try:
