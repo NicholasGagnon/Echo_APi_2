@@ -1126,187 +1126,108 @@ def export_route():
         print(f"[EXPORT ERROR] {fmt}: {e}")
         return jsonify({"error": str(e)}), 500
 
-# ── /api/analyse-avis — Scanner Jina + Analyse DeepSeek ─────────────────────
-JINA_API_KEY = os.getenv("JINA_API_KEY", "").strip()
-
+# ── /api/analyse-avis — Scanner Sonar (Perplexity) via OpenRouter ───────────
 @app.route("/api/analyse-avis", methods=["POST"])
 def analyse_avis():
     """
-    Route pour analyser les avis d'un produit via Jina Reader + DeepSeek.
+    Route pour analyser les avis d'un produit via Perplexity Sonar (web search natif).
     Accepte : {"url": "https://amazon.ca/..."}
     Retourne : {"product_name": "...", "positives": [...], "negatives": [...]}
     """
     try:
         data = request.json or {}
         url = (data.get("url") or "").strip()
-        
+
         if not url:
             return jsonify({"error": "URL requise"}), 400
-        
-        if not JINA_API_KEY:
-            return jsonify({"error": "Jina API Key non configurée sur le serveur"}), 503
-        
-        # ── Étape 1 : Appeler Jina Reader avec headers anti-bot Amazon ────────
-        print(f"[JINA] Extraction du contenu de {url}")
-        jina_url = f"https://r.jina.ai/{url}"
-        jina_headers = {
-            "Authorization": f"Bearer {JINA_API_KEY}",
-            "X-Return-Format": "markdown",
-            "X-With-Generated-Alt": "true",
-            "X-No-Cache": "true",
-        }
 
-        raw_markdown = None
-        try:
-            jina_response = _requests_lib.get(jina_url, headers=jina_headers, timeout=30)
-            if jina_response.ok:
-                raw_markdown = jina_response.text
-                print(f"[JINA] Contenu recu: {len(raw_markdown)} chars")
-            else:
-                print(f"[JINA] Erreur {jina_response.status_code}: {jina_response.text[:200]}")
-        except _requests_lib.exceptions.Timeout:
-            print("[JINA] Timeout sur requete principale")
-        except Exception as e:
-            print(f"[JINA] Exception: {e}")
+        if client_openrouter is None:
+            return jsonify({"error": "OpenRouter non configure"}), 503
 
-        # ── Détection blocage Amazon → fallback ASIN scrape direct ─────────
-        AMAZON_BLOCKED_SIGNALS = [
-            "Sign in", "robot", "captcha", "api.amazon", "Enable JavaScript",
-            "Sorry, we just need to make sure", "Enter the characters you see"
-        ]
-        is_amazon = "amazon." in url.lower()
-        is_blocked = (
-            not raw_markdown
-            or len(raw_markdown) < 200
-            or any(sig.lower() in raw_markdown.lower() for sig in AMAZON_BLOCKED_SIGNALS)
-        )
-
-        if is_amazon and is_blocked:
-            print("[JINA] Amazon bloque — tentative via ASIN + ScrapeAPI fallback")
-            # Extraire l'ASIN depuis l'URL
-            import re as _re
-            asin_match = _re.search(r"/dp/([A-Z0-9]{10})", url)
-            if asin_match:
-                asin = asin_match.group(1)
-                # Essayer avec l'URL courte Amazon (moins bloquée)
-                short_url = f"https://www.amazon.ca/dp/{asin}"
-                try:
-                    jina_response2 = _requests_lib.get(
-                        f"https://r.jina.ai/{short_url}",
-                        headers={**jina_headers, "X-No-Cache": "true"},
-                        timeout=30,
-                    )
-                    if jina_response2.ok and len(jina_response2.text) > 200:
-                        raw_markdown = jina_response2.text
-                        print(f"[JINA] Fallback URL courte OK: {len(raw_markdown)} chars")
-                except Exception as e2:
-                    print(f"[JINA] Fallback URL courte echec: {e2}")
-
-        if not raw_markdown or len(raw_markdown) < 100:
-            return jsonify({
-                "error": "Amazon bloque l'extraction automatique sur cette page. Essaie une URL de page d'avis directe (ex: amazon.ca/product-reviews/ASIN) ou un autre site."
-            }), 400
-        
-        # ── Étape 2 : Construire le prompt pour DeepSeek ──────────────────────
         system_prompt = (
-            "Tu es un extracteur de données ultra-précis spécialisé dans l'analyse de produits. "
-            "Tu reçois un contenu brut (avis, descriptions, commentaires d'utilisateurs) "
-            "et tu dois extraire EXACTEMENT 5 points forts réels et EXACTEMENT 5 pires défauts. "
-            "Sois chirurgical, factuel, anti-bullshit. "
-            "Chaque point doit être une phrase claire et courte (max 12 mots). "
-            "Réponds UNIQUEMENT en JSON valide avec ces clés : "
-            '{"product_name": "string", "positives": ["point1", ...], "negatives": ["point1", ...]}'
+            "Tu es un extracteur d'avis produit ultra-precis et anti-bullshit. "
+            "Tu recois une URL de produit. Tu dois rechercher les vrais avis clients sur ce produit. "
+            "Extrais EXACTEMENT 5 points forts reels et EXACTEMENT 5 pires defauts venant des avis clients. "
+            "Chaque point = une phrase courte et factuelle (max 12 mots). "
+            "Reponds UNIQUEMENT en JSON valide avec ces cles exactes : "
+            "{"product_name": "string", "positives": ["point1", ...], "negatives": ["point1", ...]}"
         )
-        
+
         user_prompt = (
-            f"Voici le contenu brut d'une page produit/avis :\n\n{raw_markdown[:4000]}\n\n"
-            f"Extrais EXACTEMENT 5 points forts et 5 défauts. Identifie aussi le nom du produit. "
-            f"Réponds UNIQUEMENT en JSON valide."
+            f"Recherche les avis clients sur ce produit : {url}\n\n"
+            f"Identifie le nom du produit, puis extrais EXACTEMENT 5 points forts "
+            f"et 5 defauts reels bases sur les avis clients. "
+            f"Reponds UNIQUEMENT en JSON valide."
         )
-        
-        deepseek_messages = [
+
+        messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
-        
-        # ── Étape 3 : Appeler DeepSeek pour l'analyse ─────────────────────────
-        print("[ANALYSE] Lancement cascade DeepSeek → Llama → Hy3...")
+
+        print(f"[SONAR] Analyse via Perplexity Sonar : {url}")
         raw_response = None
 
-        # Tentative 1 : DeepSeek direct
-        if client_deepseek is not None:
-            try:
-                res = client_deepseek.chat.completions.create(
-                    model=MODELS["deepseek"],
-                    messages=deepseek_messages,
-                    temperature=0.3,
-                    max_tokens=1500,
-                    timeout=25.0,
-                )
-                raw_response = res.choices[0].message.content
-                print("[ANALYSE] DeepSeek OK")
-            except Exception as e:
-                print(f"[ANALYSE] DeepSeek echec ({e}), fallback Llama...")
+        # Tentative 1 : Perplexity Sonar (web search natif)
+        try:
+            res = client_openrouter.chat.completions.create(
+                model="perplexity/sonar",
+                messages=messages,
+                temperature=0.3,
+                max_tokens=1500,
+                timeout=30.0,
+            )
+            raw_response = res.choices[0].message.content
+            print("[SONAR] OK")
+        except Exception as e:
+            print(f"[SONAR] Echec ({e}), fallback Llama...")
 
         # Tentative 2 : Llama via OpenRouter
-        if not raw_response and client_openrouter is not None:
+        if not raw_response:
             try:
                 res = client_openrouter.chat.completions.create(
                     model=MODELS["llama"],
-                    messages=deepseek_messages,
+                    messages=messages,
                     temperature=0.3,
                     max_tokens=1500,
                     timeout=25.0,
                 )
                 raw_response = res.choices[0].message.content
-                print("[ANALYSE] Llama/OpenRouter OK")
+                print("[SONAR] Fallback Llama OK")
             except Exception as e:
-                print(f"[ANALYSE] Llama echec ({e}), fallback Hy3...")
-
-        # Tentative 3 : Hy3 via OpenRouter
-        if not raw_response and client_openrouter is not None:
-            try:
-                res = client_openrouter.chat.completions.create(
-                    model=MODELS["hy3"],
-                    messages=deepseek_messages,
-                    temperature=0.3,
-                    max_tokens=1500,
-                    timeout=25.0,
-                )
-                raw_response = res.choices[0].message.content
-                print("[ANALYSE] Hy3/OpenRouter OK")
-            except Exception as e:
-                print(f"[ANALYSE] Hy3 echec ({e})")
+                print(f"[SONAR] Fallback Llama echec ({e})")
 
         if not raw_response:
-            return jsonify({"error": "Tous les modeles d'analyse sont indisponibles"}), 503
-        
-        # ── Étape 4 : Parser la réponse JSON de DeepSeek ────────────────────────
+            return jsonify({"error": "Analyse indisponible, reessaie dans quelques secondes"}), 503
+
+        # Parser la reponse
         try:
             parsed = clean_and_parse_json(raw_response)
-            
-            # Valider la structure
-            if not isinstance(parsed.get("positives"), list) or len(parsed["positives"]) == 0:
-                parsed["positives"] = ["Données insuffisantes"]
-            if not isinstance(parsed.get("negatives"), list) or len(parsed["negatives"]) == 0:
-                parsed["negatives"] = ["Données insuffisantes"]
-            
-            product_name = parsed.get("product_name") or "Produit Analysé"
-            
-            # Retourner la réponse au frontend
+
+            # Sonar peut repondre en texte libre — extraire depuis "response" si besoin
+            positives = parsed.get("positives")
+            negatives = parsed.get("negatives")
+            product_name = parsed.get("product_name") or "Produit Analyse"
+
+            if not isinstance(positives, list) or len(positives) == 0:
+                positives = ["Donnees insuffisantes"]
+            if not isinstance(negatives, list) or len(negatives) == 0:
+                negatives = ["Donnees insuffisantes"]
+
             return jsonify({
                 "product_name": product_name,
-                "positives": parsed["positives"][:5],
-                "negatives": parsed["negatives"][:5],
+                "positives": positives[:5],
+                "negatives": negatives[:5],
             })
-        
+
         except Exception as e:
-            print(f"[ANALYSE] Erreur parsing: {e}")
-            return jsonify({"error": f"Erreur lors du parsing de la réponse: {str(e)}"}), 500
-    
+            print(f"[SONAR] Erreur parsing: {e} — raw: {raw_response[:200]}")
+            return jsonify({"error": "Erreur parsing reponse"}), 500
+
     except Exception as e:
-        print(f"[ANALYSE] Erreur critique: {e}")
+        print(f"[SONAR] Erreur critique: {e}")
         return jsonify({"error": "Erreur serveur interne"}), 500
+
 
 # ── WARMUP AVEC LING ──────────────────────────────────────────────────────────
 def _warmup_api():
