@@ -135,6 +135,9 @@ def clean_and_parse_json(raw_text):
     try:
         parsed = json.loads(text)
         if isinstance(parsed, dict) and "response" in parsed:
+            # Nettoyer les \n littéraux dans la réponse
+            if isinstance(parsed["response"], str):
+                parsed["response"] = parsed["response"].replace("\\n", "\n").replace("\\\\n", "\n")
             return parsed
     except Exception:
         pass
@@ -143,13 +146,16 @@ def clean_and_parse_json(raw_text):
         try:
             parsed = json.loads(match.group(0))
             if isinstance(parsed, dict) and "response" in parsed:
+                if isinstance(parsed["response"], str):
+                    parsed["response"] = parsed["response"].replace("\\n", "\n").replace("\\\\n", "\n")
                 return parsed
         except Exception:
             pass
     if '"response":' in text:
         res_match = re.search(r'"response"\s*:\s*"([^"]+)"', text)
         if res_match:
-            return {"action": None, "response": res_match.group(1)}
+            response_text = res_match.group(1).replace("\\n", "\n").replace("\\\\n", "\n")
+            return {"action": None, "response": response_text}
     return {"action": None, "response": text}
 
 def clean_and_parse_horizon_json(raw_text):
@@ -165,6 +171,8 @@ def clean_and_parse_horizon_json(raw_text):
     try:
         parsed = json.loads(text)
         if isinstance(parsed, dict):
+            if isinstance(parsed.get("response"), str):
+                parsed["response"] = parsed["response"].replace("\\n", "\n").replace("\\\\n", "\n")
             return parsed
     except Exception:
         pass
@@ -173,12 +181,15 @@ def clean_and_parse_horizon_json(raw_text):
         try:
             parsed = json.loads(match.group(0))
             if isinstance(parsed, dict):
+                if isinstance(parsed.get("response"), str):
+                    parsed["response"] = parsed["response"].replace("\\n", "\n").replace("\\\\n", "\n")
                 return parsed
         except Exception:
             pass
     resp_match = re.search(r'"response"\s*:\s*"(.*?)"(?:\s*,|\s*\})', text, re.DOTALL)
     if resp_match:
-        return {"response": resp_match.group(1).replace('\\n', '\n').replace('\\"', '"'), "attributes": [], "matrix": None}
+        response_text = resp_match.group(1).replace('\\n', '\n').replace('\\"', '"').replace("\\\\n", "\n")
+        return {"response": response_text, "attributes": [], "matrix": None}
     return {"response": text.replace("**", "").replace("##", "").replace("# ", ""), "attributes": [], "matrix": None}
 
 # ── BUILD CONTENTS ─────────────────────────────────────────────────────────────
@@ -265,7 +276,7 @@ def prepare_shared_context(data, source_override=None):
         system_prompt += f"\n\nLONG TERM MEMORY\n================\n{memory_summary}\n"
     system_prompt += "\n\nCRITICAL SAFETY DIRECTIVE: Only trigger actions explicitly demanded in the LATEST message."
 
-    taille_memoire    = 30 if user_tier in ("ultra", "founder") else (15 if user_tier in ("basic", "premium") else 5)
+    taille_memoire    = 30 if user_tier in ("ultra", "founder") else (15 if user_tier in ("basic", "premium") else 12)
     output_tokens     = PAID_MAX_TOKENS if is_paid_tier(user_tier) else FREE_MAX_TOKENS
     historique_ajuste = raw_history[-taille_memoire:]
     force_neutral     = len(selected_buttons) > 0 or source == "vitality"
@@ -1115,11 +1126,142 @@ def export_route():
         print(f"[EXPORT ERROR] {fmt}: {e}")
         return jsonify({"error": str(e)}), 500
 
-# ── WARMUP ────────────────────────────────────────────────────────────────────
+# ── /api/analyse-avis — Scanner Jina + Analyse DeepSeek ─────────────────────
+JINA_API_KEY = os.getenv("JINA_API_KEY", "").strip()
+
+@app.route("/api/analyse-avis", methods=["POST"])
+def analyse_avis():
+    """
+    Route pour analyser les avis d'un produit via Jina Reader + DeepSeek.
+    Accepte : {"url": "https://amazon.ca/..."}
+    Retourne : {"product_name": "...", "positives": [...], "negatives": [...]}
+    """
+    try:
+        data = request.json or {}
+        url = (data.get("url") or "").strip()
+        
+        if not url:
+            return jsonify({"error": "URL requise"}), 400
+        
+        if not JINA_API_KEY:
+            return jsonify({"error": "Jina API Key non configurée sur le serveur"}), 503
+        
+        # ── Étape 1 : Appeler Jina Reader pour extraire le contenu ──────────────
+        print(f"[JINA] Extraction du contenu de {url}")
+        jina_url = f"https://r.jina.ai/{url}"
+        jina_headers = {
+            "Authorization": f"Bearer {JINA_API_KEY}",
+        }
+        
+        try:
+            jina_response = _requests_lib.get(jina_url, headers=jina_headers, timeout=30)
+            if not jina_response.ok:
+                print(f"[JINA] Erreur {jina_response.status_code}: {jina_response.text[:200]}")
+                return jsonify({"error": f"Jina Reader a échoué ({jina_response.status_code})"}), 503
+            
+            raw_markdown = jina_response.text
+            if not raw_markdown or len(raw_markdown) < 50:
+                return jsonify({"error": "Jina n'a pu extraire qu'un contenu minime"}), 400
+        except _requests_lib.exceptions.Timeout:
+            return jsonify({"error": "Jina Reader timeout — URL trop volumineuse"}), 504
+        except Exception as e:
+            print(f"[JINA] Exception: {e}")
+            return jsonify({"error": f"Erreur Jina: {str(e)}"}), 503
+        
+        # ── Étape 2 : Construire le prompt pour DeepSeek ──────────────────────
+        system_prompt = (
+            "Tu es un extracteur de données ultra-précis spécialisé dans l'analyse de produits. "
+            "Tu reçois un contenu brut (avis, descriptions, commentaires d'utilisateurs) "
+            "et tu dois extraire EXACTEMENT 5 points forts réels et EXACTEMENT 5 pires défauts. "
+            "Sois chirurgical, factuel, anti-bullshit. "
+            "Chaque point doit être une phrase claire et courte (max 12 mots). "
+            "Réponds UNIQUEMENT en JSON valide avec ces clés : "
+            '{"product_name": "string", "positives": ["point1", ...], "negatives": ["point1", ...]}'
+        )
+        
+        user_prompt = (
+            f"Voici le contenu brut d'une page produit/avis :\n\n{raw_markdown[:4000]}\n\n"
+            f"Extrais EXACTEMENT 5 points forts et 5 défauts. Identifie aussi le nom du produit. "
+            f"Réponds UNIQUEMENT en JSON valide."
+        )
+        
+        deepseek_messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        
+        # ── Étape 3 : Appeler DeepSeek pour l'analyse ─────────────────────────
+        print("[DEEPSEEK] Analyse des avis...")
+        try:
+            response = client_deepseek.chat.completions.create(
+                model=MODELS["deepseek"],
+                messages=deepseek_messages,
+                temperature=0.3,
+                max_tokens=1500,
+                timeout=25.0,
+            )
+            raw_response = response.choices[0].message.content
+            if not raw_response:
+                return jsonify({"error": "DeepSeek n'a pas retourné de réponse"}), 503
+        except Exception as e:
+            print(f"[DEEPSEEK] Exception: {e}")
+            return jsonify({"error": f"Erreur DeepSeek: {str(e)}"}), 503
+        
+        # ── Étape 4 : Parser la réponse JSON de DeepSeek ────────────────────────
+        try:
+            parsed = clean_and_parse_json(raw_response)
+            
+            # Valider la structure
+            if not isinstance(parsed.get("positives"), list) or len(parsed["positives"]) == 0:
+                parsed["positives"] = ["Données insuffisantes"]
+            if not isinstance(parsed.get("negatives"), list) or len(parsed["negatives"]) == 0:
+                parsed["negatives"] = ["Données insuffisantes"]
+            
+            product_name = parsed.get("product_name") or "Produit Analysé"
+            
+            # Retourner la réponse au frontend
+            return jsonify({
+                "product_name": product_name,
+                "positives": parsed["positives"][:5],
+                "negatives": parsed["negatives"][:5],
+            })
+        
+        except Exception as e:
+            print(f"[ANALYSE] Erreur parsing: {e}")
+            return jsonify({"error": f"Erreur lors du parsing de la réponse: {str(e)}"}), 500
+    
+    except Exception as e:
+        print(f"[ANALYSE] Erreur critique: {e}")
+        return jsonify({"error": "Erreur serveur interne"}), 500
+
+# ── WARMUP AVEC LING ──────────────────────────────────────────────────────────
 def _warmup_api():
+    """Warmup initial : réveille Ling et Echo au démarrage du serveur"""
     try:
         print("[BOOST] Reveil des routes Echo...")
         _requests_lib.get("http://127.0.0.1:5000/ping", timeout=2)
+        
+        # Warmup Ling pour la classification d'intentions
+        print("[BOOST] Warmup de Ling (classification d'intentions)...")
+        try:
+            if client_openrouter is not None:
+                warmup_ctx = {
+                    "system_prompt": "Tu es un classificateur d'intentions. Réponds en JSON minimaliste.",
+                    "output_tokens": 100,
+                    "messages_openai": [
+                        {"role": "system", "content": "Tu es un classificateur d'intentions."},
+                        {"role": "user", "content": "Classifie ceci : 'comment faire un gâteau'"},
+                    ],
+                }
+                _requests_lib.post(
+                    "http://127.0.0.1:5000/horizon-warmup",
+                    json={"partial": "comment"},
+                    timeout=5,
+                )
+                print("[BOOST] Ling warmup réussi")
+        except Exception as e:
+            print(f"[BOOST] Ling warmup optionnel échoué: {e}")
+    
     except Exception:
         pass
 

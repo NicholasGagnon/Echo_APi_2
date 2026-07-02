@@ -54,6 +54,47 @@ def call_requesty(model_key: str, messages_openai, temp=0.5, timeout=20.0, max_t
         raise ValueError(f"Reponse vide de {model_key}")
     return content
 
+# ── PARSER JSON AVEC NETTOYAGE DES \n ────────────────────────────────────────
+def clean_and_parse_json_site2(raw_text):
+    """Parser JSON unifié pour site2 — identique à echo_api.py"""
+    import json
+    import re
+    
+    if not raw_text or not isinstance(raw_text, str):
+        raise ValueError("Reponse vide ou invalide.")
+    text = raw_text.strip()
+    if text.startswith("```json"): text = text[7:]
+    elif text.startswith("```"):   text = text[3:]
+    if text.endswith("```"):       text = text[:-3]
+    text = text.strip()
+    if not text:
+        raise ValueError("Reponse vide apres nettoyage.")
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict) and "response" in parsed:
+            # Nettoyer les \n littéraux dans la réponse
+            if isinstance(parsed["response"], str):
+                parsed["response"] = parsed["response"].replace("\\n", "\n").replace("\\\\n", "\n")
+            return parsed
+    except Exception:
+        pass
+    match = re.search(r'\{.*\}', text, re.DOTALL)
+    if match:
+        try:
+            parsed = json.loads(match.group(0))
+            if isinstance(parsed, dict) and "response" in parsed:
+                if isinstance(parsed["response"], str):
+                    parsed["response"] = parsed["response"].replace("\\n", "\n").replace("\\\\n", "\n")
+                return parsed
+        except Exception:
+            pass
+    if '"response":' in text:
+        res_match = re.search(r'"response"\s*:\s*"([^"]+)"', text)
+        if res_match:
+            response_text = res_match.group(1).replace("\\n", "\n").replace("\\\\n", "\n")
+            return {"action": None, "response": response_text}
+    return {"action": None, "response": text}
+
 # ── ENVOYER LA KEY PAR COURRIEL ──────────────────────────────────────────────
 def send_key_email(to_email: str, key: str, is_recovery: bool = False):
     subject = "Ta clé Echo AI 🔑" if not is_recovery else "Récupération de ta clé Echo AI"
@@ -215,7 +256,7 @@ def notifier_interet():
 @site2_bp.route("/1/conversation", methods=["POST"])
 def site2_conversation():
     # Import ici pour éviter le circular import — on réutilise l'infra Echo en filet de sécurité
-    from echo_api import prepare_shared_context, run_paid_cascade, run_free_cascade, is_paid_tier, clean_and_parse_json
+    from echo_api import prepare_shared_context, run_paid_cascade, run_free_cascade, is_paid_tier
     try:
         data = request.json or {}
         ctx  = prepare_shared_context(data, source_override="chat")
@@ -228,7 +269,7 @@ def site2_conversation():
             for model_key in ("grok", "qwen3"):
                 try:
                     raw    = call_requesty(model_key, ctx["messages_openai"], temp=0.5, timeout=20.0, max_tokens=ctx.get("output_tokens", 2500))
-                    result = clean_and_parse_json(raw)
+                    result = clean_and_parse_json_site2(raw)
                     return jsonify(result)
                 except Exception as e:
                     print(f"[SITE2] {model_key}/Requesty echec ({e})")
