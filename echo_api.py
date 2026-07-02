@@ -1144,20 +1144,25 @@ def analyse_avis():
         if client_openrouter is None:
             return jsonify({"error": "OpenRouter non configure"}), 503
 
+        # Extraire l'ASIN si URL Amazon
+        import re as _re
+        asin_match = _re.search(r"/dp/([A-Z0-9]{10})", url)
+        asin_hint = f" (ASIN: {asin_match.group(1)})" if asin_match else ""
+
         system_prompt = (
-            "Tu es un extracteur d'avis produit ultra-precis et anti-bullshit. "
-            "Tu recois une URL de produit. Tu dois rechercher les vrais avis clients sur ce produit. "
-            "Extrais EXACTEMENT 5 points forts reels et EXACTEMENT 5 pires defauts venant des avis clients. "
-            "Chaque point = une phrase courte et factuelle (max 12 mots). "
-            "Reponds UNIQUEMENT en JSON valide avec ces cles exactes : "
-            "{"product_name": "string", "positives": ["point1", ...], "negatives": ["point1", ...]}"
+            "Tu es un expert en analyse produit e-commerce. "
+            "A partir d'une URL ou d'un ASIN Amazon, identifie le produit "
+            "et fournis une analyse honnete basee sur ta connaissance des avis clients. "
+            "Sois factuel, chirurgical, anti-bullshit. "
+            "Reponds UNIQUEMENT avec ce JSON : "
+            "{\"product_name\": \"nom complet\", \"positives\": [\"p1\",\"p2\",\"p3\",\"p4\",\"p5\"], \"negatives\": [\"n1\",\"n2\",\"n3\",\"n4\",\"n5\"]}"
         )
 
         user_prompt = (
-            f"Recherche les avis clients sur ce produit : {url}\n\n"
-            f"Identifie le nom du produit, puis extrais EXACTEMENT 5 points forts "
-            f"et 5 defauts reels bases sur les avis clients. "
-            f"Reponds UNIQUEMENT en JSON valide."
+            f"Analyse ce produit{asin_hint} : {url}\n\n"
+            f"Donne EXACTEMENT 5 points forts et 5 defauts reels "
+            f"bases sur les avis clients connus. Chaque point max 12 mots. "
+            f"JSON uniquement."
         )
 
         messages = [
@@ -1165,37 +1170,53 @@ def analyse_avis():
             {"role": "user", "content": user_prompt},
         ]
 
-        print(f"[SONAR] Analyse via Perplexity Sonar : {url}")
+        print(f"[ANALYSE] gpt-4o-mini-search-preview : {url}")
         raw_response = None
 
-        # Tentative 1 : Perplexity Sonar (web search natif)
-        try:
-            res = client_openrouter.chat.completions.create(
-                model="perplexity/sonar",
-                messages=messages,
-                temperature=0.3,
-                max_tokens=1500,
-                timeout=30.0,
-            )
-            raw_response = res.choices[0].message.content
-            print("[SONAR] OK")
-        except Exception as e:
-            print(f"[SONAR] Echec ({e}), fallback Llama...")
+        # Tentative 1 : GPT-4o Mini Search (web search natif, cheap)
+        if client_openrouter is not None:
+            try:
+                res = client_openrouter.chat.completions.create(
+                    model="openai/gpt-4o-mini-search-preview",
+                    messages=messages,
+                    temperature=0.3,
+                    max_tokens=700,
+                    timeout=30.0,
+                )
+                raw_response = res.choices[0].message.content
+                print("[ANALYSE] GPT-4o-mini-search OK")
+            except Exception as e:
+                print(f"[ANALYSE] GPT-4o-mini-search echec ({e}), fallback DeepSeek...")
 
-        # Tentative 2 : Llama via OpenRouter
-        if not raw_response:
+        # Tentative 2 : DeepSeek (connaissance training)
+        if not raw_response and client_deepseek is not None:
+            try:
+                res = client_deepseek.chat.completions.create(
+                    model=MODELS["deepseek"],
+                    messages=messages,
+                    temperature=0.3,
+                    max_tokens=700,
+                    timeout=20.0,
+                )
+                raw_response = res.choices[0].message.content
+                print("[ANALYSE] DeepSeek fallback OK")
+            except Exception as e:
+                print(f"[ANALYSE] DeepSeek echec ({e})")
+
+        # Tentative 3 : Llama
+        if not raw_response and client_openrouter is not None:
             try:
                 res = client_openrouter.chat.completions.create(
                     model=MODELS["llama"],
                     messages=messages,
                     temperature=0.3,
-                    max_tokens=1500,
-                    timeout=25.0,
+                    max_tokens=700,
+                    timeout=20.0,
                 )
                 raw_response = res.choices[0].message.content
-                print("[SONAR] Fallback Llama OK")
+                print("[ANALYSE] Llama fallback OK")
             except Exception as e:
-                print(f"[SONAR] Fallback Llama echec ({e})")
+                print(f"[ANALYSE] Llama echec ({e})")
 
         if not raw_response:
             return jsonify({"error": "Analyse indisponible, reessaie dans quelques secondes"}), 503
