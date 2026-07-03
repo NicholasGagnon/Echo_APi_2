@@ -1230,12 +1230,29 @@ def analyse_avis():
 
         # Parser la reponse
         try:
-            parsed = clean_and_parse_json(raw_response)
+            import json as _json
+            # Parser dédié — cherche directement product_name/positives/negatives
+            text = raw_response.strip()
+            if text.startswith("```json"): text = text[7:]
+            elif text.startswith("```"):   text = text[3:]
+            if text.endswith("```"):       text = text[:-3]
+            text = text.strip()
 
-            # Sonar peut repondre en texte libre — extraire depuis "response" si besoin
-            positives = parsed.get("positives")
-            negatives = parsed.get("negatives")
+            parsed = {}
+            try:
+                parsed = _json.loads(text)
+            except Exception:
+                import re as _re2
+                m = _re2.search(r"\{.*\}", text, _re2.DOTALL)
+                if m:
+                    try: parsed = _json.loads(m.group(0))
+                    except Exception: pass
+
+            positives    = parsed.get("positives")
+            negatives    = parsed.get("negatives")
             product_name = parsed.get("product_name") or "Produit Analyse"
+
+            logging.info(f"[ANALYSE] Parsed: {product_name} | pos={positives} | neg={negatives}")
 
             if not isinstance(positives, list) or len(positives) == 0:
                 positives = ["Donnees insuffisantes"]
@@ -1249,7 +1266,7 @@ def analyse_avis():
             })
 
         except Exception as e:
-            logging.info(f"[SONAR] Erreur parsing: {e} — raw: {raw_response[:200]}")
+            logging.info(f"[ANALYSE] Erreur parsing: {e} — raw: {raw_response[:300]}")
             return jsonify({"error": "Erreur parsing reponse"}), 500
 
     except Exception as e:
