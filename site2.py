@@ -286,6 +286,124 @@ def site2_conversation():
         print(f"Erreur /1/conversation: {e}")
         return jsonify(ERR_CRASH), 500
 
+
+# ── /1/generate-invoice — Cascade DeepSeek → Grok → GLM ─────────────────────
+@site2_bp.route("/1/generate-invoice", methods=["POST"])
+def generate_invoice():
+    from echo_api import client_deepseek, client_openrouter, client_zai, MODELS
+    import json, re
+
+    try:
+        data        = request.json or {}
+        description = (data.get("description") or "").strip()
+        emetteur    = (data.get("emetteur") or "").strip()
+        client_name = (data.get("client") or "").strip()
+        montantHT   = float(data.get("montantHT") or 0)
+        currency    = (data.get("currency") or "CAD").strip()
+        status      = (data.get("status") or "pending").strip()
+        lang        = (data.get("lang") or "fr").strip()
+        totalTTC    = float(data.get("totalTTC") or montantHT)
+        numero      = (data.get("numero") or "INV-001").strip()
+
+        lang_instruction = "Réponds en français." if lang == "fr" else "Answer in English."
+
+        system_prompt = (
+            "Tu es un assistant de facturation professionnel. "
+            "À partir d'une description de prestation, tu génères les éléments textuels d'une facture. "
+            f"{lang_instruction} "
+            "Sois concis, professionnel, sans bullshit. "
+            "Réponds UNIQUEMENT avec ce JSON : "
+            '{"emetteur": "string", "client": "string", "description": "description professionnelle reformulée", "notes": "conditions de paiement courtes"}'
+        )
+
+        status_label = {"pending": "En attente" if lang == "fr" else "Pending", "paid": "Payée" if lang == "fr" else "Paid", "late": "En retard" if lang == "fr" else "Overdue"}.get(status, "")
+        user_prompt = (
+            "Genere les elements textuels pour cette facture :\n"
+            f"- Emetteur : {emetteur_txt}\n"
+            f"- Client : {client_txt}\n"
+            f"- Description : {description}\n"
+            f"- Montant HT : {montantHT} {currency}\n"
+            f"- Total TTC : {totalTTC} {currency}\n"
+            f"- Statut : {status_label}\n"
+            f"- Numero : {numero}\n\n"
+            "Reformule la description de facon professionnelle. "
+            f"Ajoute des notes de paiement adaptees au statut ({status_label}). "
+            "JSON uniquement."
+        )
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_prompt},
+        ]
+
+        raw = None
+
+        # Tentative 1 : DeepSeek
+        if client_deepseek is not None:
+            try:
+                res = client_deepseek.chat.completions.create(
+                    model=MODELS["deepseek"], messages=messages,
+                    temperature=0.3, max_tokens=600, timeout=20.0,
+                )
+                raw = res.choices[0].message.content
+                print("[INVOICE] DeepSeek OK")
+            except Exception as e:
+                print(f"[INVOICE] DeepSeek echec ({e})")
+
+        # Tentative 2 : Grok via OpenRouter
+        if not raw and client_openrouter is not None:
+            try:
+                res = client_openrouter.chat.completions.create(
+                    model="xai/grok-4-fast-non-reasoning", messages=messages,
+                    temperature=0.3, max_tokens=600, timeout=20.0,
+                )
+                raw = res.choices[0].message.content
+                print("[INVOICE] Grok OK")
+            except Exception as e:
+                print(f"[INVOICE] Grok echec ({e})")
+
+        # Tentative 3 : GLM via Z.AI
+        if not raw and client_zai is not None:
+            try:
+                res = client_zai.chat.completions.create(
+                    model=MODELS["glm"], messages=messages,
+                    temperature=0.3, max_tokens=600, timeout=20.0,
+                )
+                raw = res.choices[0].message.content
+                print("[INVOICE] GLM OK")
+            except Exception as e:
+                print(f"[INVOICE] GLM echec ({e})")
+
+        if not raw:
+            return jsonify({"emetteur": emetteur, "client": client_name, "description": description, "notes": ""})
+
+        # Parser JSON
+        text = raw.strip()
+        if text.startswith("```json"): text = text[7:]
+        elif text.startswith("```"):   text = text[3:]
+        if text.endswith("```"):       text = text[:-3]
+        text = text.strip()
+
+        parsed = {}
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            m = re.search(r'\{.*\}', text, re.DOTALL)
+            if m:
+                try: parsed = json.loads(m.group(0))
+                except Exception: pass
+
+        return jsonify({
+            "emetteur":    parsed.get("emetteur")    or emetteur,
+            "client":      parsed.get("client")      or client_name,
+            "description": parsed.get("description") or description,
+            "notes":       parsed.get("notes")       or "",
+        })
+
+    except Exception as e:
+        print(f"[INVOICE] Erreur critique: {e}")
+        return jsonify({"emetteur": "", "client": "", "description": description, "notes": ""}), 500
+
 # ── /1/supprimer-fiche — par Key + email, sans session requise ───────────────
 @site2_bp.route("/1/supprimer-fiche", methods=["POST"])
 def supprimer_fiche():
