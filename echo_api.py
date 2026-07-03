@@ -1139,8 +1139,9 @@ def analyse_avis():
     """
     try:
         data = request.json or {}
-        url = (data.get("url") or "").strip()
-        logging.info(f"[ANALYSE] URL reçue: {url[:80]}")
+        url  = (data.get("url")  or "").strip()
+        lang = (data.get("lang") or "fr").strip()
+        logging.info(f"[ANALYSE] URL reçue [{lang}]: {url[:80]}")
 
         if not url:
             return jsonify({"error": "URL requise"}), 400
@@ -1156,20 +1157,28 @@ def analyse_avis():
         asin_hint = f" (ASIN: {asin_match.group(1)})" if asin_match else ""
         logging.info(f"[ANALYSE] ASIN: {asin_hint or 'non detecte'}")
 
+        lang_instruction = (
+            "Réponds en français. Les points doivent être en français."
+            if lang == "fr" else
+            "Answer in English. All points must be in English."
+        )
+
         system_prompt = (
             "Tu es un expert en analyse produit e-commerce. "
-            "A partir d'une URL ou d'un ASIN Amazon, identifie le produit "
-            "et fournis une analyse honnete basee sur ta connaissance des avis clients. "
+            "A partir d'une URL ou d'un ASIN, identifie le produit "
+            "et fournis une analyse honnete basee sur les avis clients reels. "
             "Sois factuel, chirurgical, anti-bullshit. "
+            f"{lang_instruction} "
             "Reponds UNIQUEMENT avec ce JSON : "
             "{\"product_name\": \"nom complet\", \"positives\": [\"p1\",\"p2\",\"p3\",\"p4\",\"p5\"], \"negatives\": [\"n1\",\"n2\",\"n3\",\"n4\",\"n5\"]}"
         )
 
+        lang_hint = "en français" if lang == "fr" else "in English"
         user_prompt = (
             f"Analyse ce produit{asin_hint} : {url}\n\n"
             f"Donne EXACTEMENT 5 points forts et 5 defauts reels "
-            f"bases sur les avis clients connus. Chaque point max 12 mots. "
-            f"JSON uniquement."
+            f"bases sur les avis clients. Chaque point max 12 mots. "
+            f"Reponds {lang_hint}. JSON uniquement."
         )
 
         messages = [
@@ -1231,28 +1240,72 @@ def analyse_avis():
         # Parser la reponse
         try:
             import json as _json
-            # Parser dédié — cherche directement product_name/positives/negatives
+
             text = raw_response.strip()
+            # Nettoyer les blocs markdown
             if text.startswith("```json"): text = text[7:]
             elif text.startswith("```"):   text = text[3:]
             if text.endswith("```"):       text = text[:-3]
             text = text.strip()
 
             parsed = {}
+            # Tentative 1 : JSON direct
             try:
                 parsed = _json.loads(text)
             except Exception:
-                import re as _re2
-                m = _re2.search(r"\{.*\}", text, _re2.DOTALL)
+                pass
+
+            # Tentative 2 : extraire le bloc JSON du texte libre
+            if not parsed or "positives" not in parsed:
+                m = re.search(r'\{[^{}]*"positives"[^{}]*\}', text, re.DOTALL)
                 if m:
                     try: parsed = _json.loads(m.group(0))
                     except Exception: pass
 
-            positives    = parsed.get("positives")
-            negatives    = parsed.get("negatives")
+            # Tentative 3 : GPT a répondu en texte libre — parser les listes numérotées
+            if not parsed or "positives" not in parsed:
+                logging.info(f"[ANALYSE] Fallback extraction texte libre: {text[:200]}")
+
+                def extract_list(marker, stop_marker, raw):
+                    """Extrait une liste numérotée entre deux marqueurs"""
+                    items = []
+                    in_section = False
+                    for line in raw.split("\n"):
+                        l = line.strip()
+                        if marker.lower() in l.lower():
+                            in_section = True; continue
+                        if in_section and stop_marker and stop_marker.lower() in l.lower():
+                            break
+                        if in_section and l:
+                            # Nettoyer : "1. texte", "- texte", "• texte"
+                            cleaned = re.sub(r"^[\d]+[.)\s]+|^[-•*]+\s*", "", l).strip()
+                            if cleaned and len(cleaned) > 5:
+                                items.append(cleaned)
+                    return items[:5]
+
+                # Chercher sections positives / negatives dans texte libre
+                positives_raw = extract_list("point fort", "défaut", text) or extract_list("positive", "negative", text) or extract_list("avantage", "inconvénient", text)
+                negatives_raw = extract_list("défaut", "xxx_fin", text) or extract_list("negative", "xxx_fin", text) or extract_list("inconvénient", "xxx_fin", text)
+
+                # Extraire le nom du produit depuis la première ligne non vide
+                product_raw = "Produit Analyse"
+                for line in text.split("\n"):
+                    l = line.strip()
+                    if l and not l.startswith("#") and len(l) < 80 and "point fort" not in l.lower() and "défaut" not in l.lower():
+                        product_raw = re.sub(r"^#+\s*|[*_]+", "", l).strip()
+                        if product_raw: break
+
+                parsed = {
+                    "product_name": parsed.get("product_name") or product_raw,
+                    "positives": parsed.get("positives") or positives_raw,
+                    "negatives": parsed.get("negatives") or negatives_raw,
+                }
+
+            positives    = parsed.get("positives") or []
+            negatives    = parsed.get("negatives") or []
             product_name = parsed.get("product_name") or "Produit Analyse"
 
-            logging.info(f"[ANALYSE] Parsed: {product_name} | pos={positives} | neg={negatives}")
+            logging.info(f"[ANALYSE] OK: {product_name} | {len(positives)}pos {len(negatives)}neg")
 
             if not isinstance(positives, list) or len(positives) == 0:
                 positives = ["Donnees insuffisantes"]
@@ -1261,8 +1314,8 @@ def analyse_avis():
 
             return jsonify({
                 "product_name": product_name,
-                "positives": positives[:5],
-                "negatives": negatives[:5],
+                "positives": [p for p in positives if p][:5],
+                "negatives": [n for n in negatives if n][:5],
             })
 
         except Exception as e:
