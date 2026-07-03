@@ -1149,9 +1149,9 @@ def analyse_avis():
         print(f"[ANALYSE] OpenRouter OK, DeepSeek: {client_deepseek is not None}")
 
         # Extraire l'ASIN si URL Amazon
-        import re as _re
-        asin_match = _re.search(r"/dp/([A-Z0-9]{10})", url)
+        asin_match = re.search(r"/dp/([A-Z0-9]{10})", url)
         asin_hint = f" (ASIN: {asin_match.group(1)})" if asin_match else ""
+        print(f"[ANALYSE] ASIN: {asin_hint or 'non detecte'}")
 
         system_prompt = (
             "Tu es un expert en analyse produit e-commerce. "
@@ -1250,7 +1250,9 @@ def analyse_avis():
             return jsonify({"error": "Erreur parsing reponse"}), 500
 
     except Exception as e:
-        print(f"[SONAR] Erreur critique: {e}")
+        import traceback
+        print(f"[ANALYSE] Erreur critique: {e}")
+        print(f"[ANALYSE] Traceback: {traceback.format_exc()}")
         return jsonify({"error": "Erreur serveur interne"}), 500
 
 
