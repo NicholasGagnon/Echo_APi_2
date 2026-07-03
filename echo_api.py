@@ -1,6 +1,9 @@
 ﻿import os
 import io
 import re
+import sys
+import logging
+logging.basicConfig(level=logging.INFO, stream=sys.stdout, force=True)
 import json
 import base64
 import threading
@@ -1137,21 +1140,21 @@ def analyse_avis():
     try:
         data = request.json or {}
         url = (data.get("url") or "").strip()
-        print(f"[ANALYSE] URL reçue: {url[:80]}")
+        logging.info(f"[ANALYSE] URL reçue: {url[:80]}")
 
         if not url:
             return jsonify({"error": "URL requise"}), 400
 
         if client_openrouter is None:
-            print("[ANALYSE] ERREUR: client_openrouter est None")
+            logging.info("[ANALYSE] ERREUR: client_openrouter est None")
             return jsonify({"error": "OpenRouter non configure"}), 503
 
-        print(f"[ANALYSE] OpenRouter OK, DeepSeek: {client_deepseek is not None}")
+        logging.info(f"[ANALYSE] OpenRouter OK, DeepSeek: {client_deepseek is not None}")
 
         # Extraire l'ASIN si URL Amazon
         asin_match = re.search(r"/dp/([A-Z0-9]{10})", url)
         asin_hint = f" (ASIN: {asin_match.group(1)})" if asin_match else ""
-        print(f"[ANALYSE] ASIN: {asin_hint or 'non detecte'}")
+        logging.info(f"[ANALYSE] ASIN: {asin_hint or 'non detecte'}")
 
         system_prompt = (
             "Tu es un expert en analyse produit e-commerce. "
@@ -1174,7 +1177,7 @@ def analyse_avis():
             {"role": "user", "content": user_prompt},
         ]
 
-        print(f"[ANALYSE] gpt-4o-mini-search-preview : {url}")
+        logging.info(f"[ANALYSE] gpt-4o-mini-search-preview : {url}")
         raw_response = None
 
         # Tentative 1 : GPT-4o Mini Search (web search natif, cheap)
@@ -1188,9 +1191,9 @@ def analyse_avis():
                     timeout=30.0,
                 )
                 raw_response = res.choices[0].message.content
-                print("[ANALYSE] GPT-4o-mini-search OK")
+                logging.info("[ANALYSE] GPT-4o-mini-search OK")
             except Exception as e:
-                print(f"[ANALYSE] GPT-4o-mini-search echec ({e}), fallback DeepSeek...")
+                logging.info(f"[ANALYSE] GPT-4o-mini-search echec ({e}), fallback DeepSeek...")
 
         # Tentative 2 : DeepSeek (connaissance training)
         if not raw_response and client_deepseek is not None:
@@ -1203,9 +1206,9 @@ def analyse_avis():
                     timeout=20.0,
                 )
                 raw_response = res.choices[0].message.content
-                print("[ANALYSE] DeepSeek fallback OK")
+                logging.info("[ANALYSE] DeepSeek fallback OK")
             except Exception as e:
-                print(f"[ANALYSE] DeepSeek echec ({e})")
+                logging.info(f"[ANALYSE] DeepSeek echec ({e})")
 
         # Tentative 3 : Llama
         if not raw_response and client_openrouter is not None:
@@ -1218,9 +1221,9 @@ def analyse_avis():
                     timeout=20.0,
                 )
                 raw_response = res.choices[0].message.content
-                print("[ANALYSE] Llama fallback OK")
+                logging.info("[ANALYSE] Llama fallback OK")
             except Exception as e:
-                print(f"[ANALYSE] Llama echec ({e})")
+                logging.info(f"[ANALYSE] Llama echec ({e})")
 
         if not raw_response:
             return jsonify({"error": "Analyse indisponible, reessaie dans quelques secondes"}), 503
@@ -1246,14 +1249,18 @@ def analyse_avis():
             })
 
         except Exception as e:
-            print(f"[SONAR] Erreur parsing: {e} — raw: {raw_response[:200]}")
+            logging.info(f"[SONAR] Erreur parsing: {e} — raw: {raw_response[:200]}")
             return jsonify({"error": "Erreur parsing reponse"}), 500
 
     except Exception as e:
         import traceback
-        print(f"[ANALYSE] Erreur critique: {e}")
-        print(f"[ANALYSE] Traceback: {traceback.format_exc()}")
-        return jsonify({"error": "Erreur serveur interne"}), 500
+        tb = traceback.format_exc()
+        tb_last = [l for l in tb.split("\n") if l.strip()][-1] if tb else "vide"
+        return jsonify({
+            "product_name": "ERREUR DEBUG",
+            "positives": [f"Exception: {str(e)}"],
+            "negatives": [f"Ligne: {tb_last}"],
+        })
 
 
 # ── WARMUP AVEC LING ──────────────────────────────────────────────────────────
