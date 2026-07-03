@@ -520,15 +520,34 @@ def horizon_warmup():
             ],
             "gemini_contents": [{"role": "user", "parts": [types.Part.from_text(text=prompt)]}],
         }
-        try:
-            raw    = call_openrouter("ling", ctx, temp=0.1, timeout=4.0)
-            parsed = clean_and_parse_json(raw)
-            HORIZON_WARMUP_CACHE[partial[:50]] = parsed
-            print(f"[WARMUP] Intent détecté : {parsed.get('response', parsed)}")
-            return jsonify({"status": "ready", "intent": parsed})
-        except Exception as e:
-            print(f"[WARMUP] Ling échec ({e})")
-            return jsonify({"status": "fallback"})
+        raw = None
+        for wm_name, wm_id in [
+            ("ling",         "inclusionai/ling-2.6-flash"),
+            ("nova-lite",    "amazon/nova-lite-v1"),
+            ("ministral-3b", "mistralai/ministral-3b-2512"),
+        ]:
+            try:
+                if client_openrouter is None: break
+                res = client_openrouter.chat.completions.create(
+                    model=wm_id,
+                    messages=ctx["messages_openai"],
+                    temperature=0.1, max_tokens=150, timeout=4.0,
+                )
+                raw = res.choices[0].message.content
+                if raw:
+                    print(f"[WARMUP] {wm_name} OK")
+                    break
+            except Exception as e:
+                print(f"[WARMUP] {wm_name} echec ({e})")
+        if raw:
+            try:
+                parsed = clean_and_parse_json(raw)
+                HORIZON_WARMUP_CACHE[partial[:50]] = parsed
+                print(f"[WARMUP] Intent detecte : {parsed.get('response', parsed)}")
+                return jsonify({"status": "ready", "intent": parsed})
+            except Exception:
+                pass
+        return jsonify({"status": "fallback"})
     except Exception as e:
         print(f"[WARMUP] Erreur : {e}")
         return jsonify({"status": "error"})
@@ -896,21 +915,25 @@ def memory_summary():
             "user_tier": user_tier,
         }
 
-        try:
-            r       = call_openrouter("ling", ctx, temp=0.1, timeout=15.0)
-            summary = r.strip() if r else ""
-            if summary:
-                return jsonify({"summary": summary})
-        except Exception as e:
-            print(f"[MEMORY] ling echec ({e}), fallback nova-lite")
+        for mm_name, mm_id in [
+            ("ling",         "inclusionai/ling-2.6-flash"),
+            ("nova-lite",    "amazon/nova-lite-v1"),
+            ("ministral-3b", "mistralai/ministral-3b-2512"),
+        ]:
+            try:
+                if client_openrouter is None: break
+                res = client_openrouter.chat.completions.create(
+                    model=mm_id,
+                    messages=ctx["messages_openai"],
+                    temperature=0.1, max_tokens=600, timeout=15.0,
+                )
+                summary = (res.choices[0].message.content or "").strip()
+                if summary:
+                    print(f"[MEMORY] {mm_name} OK")
+                    return jsonify({"summary": summary})
+            except Exception as e:
+                print(f"[MEMORY] {mm_name} echec ({e})")
 
-        try:
-            r       = call_openrouter("mistral", ctx, temp=0.1, timeout=15.0)
-            summary = r.strip() if r else ""
-            if summary:
-                return jsonify({"summary": summary})
-        except Exception as e:
-            print(f"[MEMORY] Echec total ({e})")
 
         return jsonify({"summary": prev_summary or ""})
 

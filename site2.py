@@ -287,10 +287,10 @@ def site2_conversation():
         return jsonify(ERR_CRASH), 500
 
 
-# ── /1/generate-invoice — Cascade DeepSeek → Grok → GLM ─────────────────────
+# ── /1/generate-invoice — Cascade DeepSeek → Grok → GLM via Requesty ────────
 @site2_bp.route("/1/generate-invoice", methods=["POST"])
 def generate_invoice():
-    from echo_api import client_deepseek, client_openrouter, client_zai, MODELS
+    from echo_api import client_zai, MODELS
     import json, re
 
     try:
@@ -305,32 +305,38 @@ def generate_invoice():
         totalTTC    = float(data.get("totalTTC") or montantHT)
         numero      = (data.get("numero") or "INV-001").strip()
 
-        lang_instruction = "Réponds en français." if lang == "fr" else "Answer in English."
+        emetteur_txt = emetteur or "Non specifie"
+        client_txt   = client_name or "Non specifie"
+        lang_instr   = "Reponds en francais." if lang == "fr" else "Answer in English."
+        status_map   = {"pending": "En attente" if lang == "fr" else "Pending",
+                        "paid":    "Payee"      if lang == "fr" else "Paid",
+                        "late":    "En retard"  if lang == "fr" else "Overdue"}
+        status_label = status_map.get(status, "")
 
         system_prompt = (
             "Tu es un assistant de facturation professionnel. "
-            "À partir d'une description de prestation, tu génères les éléments textuels d'une facture. "
-            f"{lang_instruction} "
-            "Sois concis, professionnel, sans bullshit. "
-            "Réponds UNIQUEMENT avec ce JSON : "
-            '{"emetteur": "string", "client": "string", "description": "description professionnelle reformulée", "notes": "conditions de paiement courtes"}'
+            "A partir d'une description de prestation, tu generes les elements textuels d'une facture. "
+            + lang_instr +
+            " Sois concis, professionnel. "
+            "Reponds UNIQUEMENT avec ce JSON valide : "
+            '{"emetteur": "string", "client": "string", "description": "description pro reformulee", "notes": "conditions de paiement courtes"}'
         )
 
-        status_label = {"pending": "En attente" if lang == "fr" else "Pending", "paid": "Payée" if lang == "fr" else "Paid", "late": "En retard" if lang == "fr" else "Overdue"}.get(status, "")
-        user_prompt = (
-            "Genere les elements textuels pour cette facture :\n"
-            f"- Emetteur : {emetteur_txt}\n"
-            f"- Client : {client_txt}\n"
-            f"- Description : {description}\n"
-            f"- Montant HT : {montantHT} {currency}\n"
-            f"- Total TTC : {totalTTC} {currency}\n"
-            f"- Statut : {status_label}\n"
-            f"- Numero : {numero}\n\n"
-            "Reformule la description de facon professionnelle. "
-            f"Ajoute des notes de paiement adaptees au statut ({status_label}). "
-            "JSON uniquement."
-        )
-
+        lines_prompt = [
+            "Genere les elements pour cette facture:",
+            "- Emetteur: " + emetteur_txt,
+            "- Client: " + client_txt,
+            "- Description: " + description,
+            "- Montant HT: " + str(montantHT) + " " + currency,
+            "- Total TTC: " + str(totalTTC) + " " + currency,
+            "- Statut: " + status_label,
+            "- Numero: " + numero,
+            "",
+            "Reformule la description de facon professionnelle.",
+            "Ajoute des notes de paiement adaptees au statut.",
+            "JSON uniquement.",
+        ]
+        user_prompt = "\n".join(lines_prompt)
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user",   "content": user_prompt},
@@ -338,41 +344,21 @@ def generate_invoice():
 
         raw = None
 
-        # Tentative 1 : DeepSeek
-        if client_deepseek is not None:
+        # Tentative 1 : Grok via Requesty
+        if client_requesty is not None:
             try:
-                res = client_deepseek.chat.completions.create(
-                    model=MODELS["deepseek"], messages=messages,
-                    temperature=0.3, max_tokens=600, timeout=20.0,
-                )
-                raw = res.choices[0].message.content
-                print("[INVOICE] DeepSeek OK")
-            except Exception as e:
-                print(f"[INVOICE] DeepSeek echec ({e})")
-
-        # Tentative 2 : Grok via OpenRouter
-        if not raw and client_openrouter is not None:
-            try:
-                res = client_openrouter.chat.completions.create(
-                    model="xai/grok-4-1-fast-non-reasoning", messages=messages,
-                    temperature=0.3, max_tokens=600, timeout=20.0,
-                )
-                raw = res.choices[0].message.content
-                print("[INVOICE] Grok OK")
+                raw = call_requesty("grok", messages, temp=0.3, timeout=20.0, max_tokens=600)
+                print("[INVOICE] Grok/Requesty OK")
             except Exception as e:
                 print(f"[INVOICE] Grok echec ({e})")
 
-        # Tentative 3 : GLM via Z.AI
-        if not raw and client_zai is not None:
+        # Tentative 2 : Qwen via Requesty
+        if not raw and client_requesty is not None:
             try:
-                res = client_zai.chat.completions.create(
-                    model=MODELS["glm"], messages=messages,
-                    temperature=0.3, max_tokens=600, timeout=20.0,
-                )
-                raw = res.choices[0].message.content
-                print("[INVOICE] GLM OK")
+                raw = call_requesty("qwen3", messages, temp=0.3, timeout=20.0, max_tokens=600)
+                print("[INVOICE] Qwen/Requesty OK")
             except Exception as e:
-                print(f"[INVOICE] GLM echec ({e})")
+                print(f"[INVOICE] Qwen echec ({e})")
 
         if not raw:
             return jsonify({"emetteur": emetteur, "client": client_name, "description": description, "notes": ""})
@@ -402,7 +388,7 @@ def generate_invoice():
 
     except Exception as e:
         print(f"[INVOICE] Erreur critique: {e}")
-        return jsonify({"emetteur": "", "client": "", "description": description, "notes": ""}), 500
+        return jsonify({"emetteur": emetteur, "client": client_name, "description": description, "notes": ""}), 500
 
 # ── /1/supprimer-fiche — par Key + email, sans session requise ───────────────
 @site2_bp.route("/1/supprimer-fiche", methods=["POST"])
