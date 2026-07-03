@@ -1137,12 +1137,16 @@ def analyse_avis():
     try:
         data = request.json or {}
         url = (data.get("url") or "").strip()
+        print(f"[ANALYSE] URL reçue: {url[:80]}")
 
         if not url:
             return jsonify({"error": "URL requise"}), 400
 
         if client_openrouter is None:
+            print("[ANALYSE] ERREUR: client_openrouter est None")
             return jsonify({"error": "OpenRouter non configure"}), 503
+
+        print(f"[ANALYSE] OpenRouter OK, DeepSeek: {client_deepseek is not None}")
 
         # Extraire l'ASIN si URL Amazon
         import re as _re
