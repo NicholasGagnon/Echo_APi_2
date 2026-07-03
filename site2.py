@@ -27,8 +27,8 @@ def check_recovery_rate_limit(email: str) -> bool:
 
 # ── MODÈLES SITE2 — propre cascade, indépendante d'Echo ─────────────────────────
 SITE2_MODELS = {
-    "grok":  "xai/grok-4-fast-non-reasoning",
-    "qwen3": "qwen/qwen3-235b-a22b-instruct-2507",
+    "grok":  "xai/grok-4-1-fast-non-reasoning",
+    "qwen3": "deepinfra/Qwen/Qwen3-235B-A22B-Instruct-2507",
 }
 
 REQUESTY_API_KEY = os.getenv("REQUESTY_API_KEY", "").strip()
@@ -354,7 +354,7 @@ def generate_invoice():
         if not raw and client_openrouter is not None:
             try:
                 res = client_openrouter.chat.completions.create(
-                    model="xai/grok-4-fast-non-reasoning", messages=messages,
+                    model="xai/grok-4-1-fast-non-reasoning", messages=messages,
                     temperature=0.3, max_tokens=600, timeout=20.0,
                 )
                 raw = res.choices[0].message.content
