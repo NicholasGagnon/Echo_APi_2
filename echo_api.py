@@ -59,6 +59,13 @@ client_openrouter = (
     OpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_API_KEY, http_client=_shared_http_client)
     if OPENROUTER_API_KEY else None
 )
+# Client sans retry pour warmup — évite les messages d'erreur rouge sur Render
+_no_retry_http = httpx.Client(timeout=6.0)
+client_openrouter_warmup = (
+    OpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_API_KEY,
+           http_client=_no_retry_http, max_retries=0)
+    if OPENROUTER_API_KEY else None
+)
 client_deepseek = (
     OpenAI(base_url="https://api.deepseek.com", api_key=DEEPSEEK_API_KEY, http_client=_shared_http_client)
     if DEEPSEEK_API_KEY else None
@@ -527,8 +534,8 @@ def horizon_warmup():
             ("ministral-3b", "mistralai/ministral-3b-2512"),
         ]:
             try:
-                if client_openrouter is None: break
-                res = client_openrouter.chat.completions.create(
+                if client_openrouter_warmup is None: break
+                res = client_openrouter_warmup.chat.completions.create(
                     model=wm_id,
                     messages=ctx["messages_openai"],
                     temperature=0.1, max_tokens=150, timeout=4.0,
@@ -921,8 +928,8 @@ def memory_summary():
             ("ministral-3b", "mistralai/ministral-3b-2512"),
         ]:
             try:
-                if client_openrouter is None: break
-                res = client_openrouter.chat.completions.create(
+                if client_openrouter_warmup is None: break
+                res = client_openrouter_warmup.chat.completions.create(
                     model=mm_id,
                     messages=ctx["messages_openai"],
                     temperature=0.1, max_tokens=600, timeout=15.0,
