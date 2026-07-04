@@ -27,6 +27,8 @@ def check_recovery_rate_limit(email: str) -> bool:
 
 # ── MODÈLES SITE2 — propre cascade, indépendante d'Echo ─────────────────────────
 SITE2_MODELS = {
+    "nova":  "amazon/nova-lite-v1",
+    "nova":  "amazon/nova-lite-v1",
     "grok":  "xai/grok-4-1-fast-non-reasoning",
     "qwen3": "deepinfra/Qwen/Qwen3-235B-A22B-Instruct-2507",
 }
@@ -265,6 +267,20 @@ def site2_conversation():
         # 1. Grok-4.1-fast (non-reasoning) via Requesty — en test
         # 2. Qwen3-235B via Requesty en filet
         # 3. Fallback sur la cascade Echo si Requesty échoue ou n'est pas configuré
+        # 0. Nova Lite via OpenRouter — en premier
+        if client_openrouter is not None:
+            try:
+                _nova_res = client_openrouter.chat.completions.create(
+                    model=SITE2_MODELS["nova"],
+                    messages=ctx["messages_openai"],
+                    temperature=0.5, max_tokens=ctx.get("output_tokens", 2500), timeout=18.0,
+                )
+                _nova_raw = _nova_res.choices[0].message.content
+                if _nova_raw:
+                    return jsonify(clean_and_parse_json_site2(_nova_raw))
+            except Exception as e:
+                print(f"[SITE2] Nova echec ({e})")
+
         if client_requesty is not None:
             for model_key in ("grok", "qwen3"):
                 try:
@@ -351,6 +367,18 @@ def generate_invoice():
             {"role": "user",   "content": user_prompt},
         ]
         raw = None
+
+        # Tentative 0 : Nova Lite via OpenRouter
+        if not raw and client_openrouter is not None:
+            try:
+                _nr = client_openrouter.chat.completions.create(
+                    model=SITE2_MODELS["nova"], messages=messages,
+                    temperature=0.2, max_tokens=800, timeout=18.0,
+                )
+                raw = _nr.choices[0].message.content
+                print("[INVOICE] Nova-Lite/OpenRouter OK")
+            except Exception as e:
+                print(f"[INVOICE] Nova echec ({e})")
 
         # Tentative 1 : Grok via Requesty
         if client_requesty is not None:
