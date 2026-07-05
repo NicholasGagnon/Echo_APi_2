@@ -4,6 +4,7 @@ import time
 import resend
 from openai import OpenAI
 
+
 site2_bp = Blueprint("site2", __name__)
 
 ERR_CRASH = {"action": None, "response": "Une erreur inattendue s'est produite. Reessaie dans quelques secondes."}
@@ -595,3 +596,192 @@ def check_unlock():
     except Exception as e:
         print(f"Erreur /1/check-unlock: {e}")
         return jsonify({"unlocked": False})
+    
+    # ── À AJOUTER DANS site2.py ──────────────────────────────────────────────────
+# Colle ce bloc à la fin de site2.py, avant la dernière ligne si y'en a une.
+#
+# Les clients (client_requesty, client_deepseek, client_zai, client_openrouter)
+# sont déjà déclarés plus haut dans site2.py / echo_api.py — on les réutilise.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── MODÈLES WORLD (noms exacts — ne jamais modifier) ─────────────────────────
+WORLD_MODELS = {
+    # Nord Amérique
+    "na_1": "xai/grok-4-fast-non-reasoning",     # Requesty
+    "na_2": "gemini-3.1-flash-lite",              # Requesty (Gemini via Requesty)
+    "na_3": "openai/gpt-4o-mini-search-preview",  # OpenRouter
+
+    # Chine
+    "cn_1": "deepseek-v4-flash",                  # DeepSeek direct
+    "cn_2": "GLM-4.5-Air",                        # Z.AI direct
+
+    # Europe / France
+    "eu_1": "mistral/mistral-small-latest",        # Requesty
+    "eu_2": "mistralai/mistral-small-2603",        # OpenRouter
+    "eu_3": "mistral/mistral-small-2603",          # Requesty
+}
+
+# ── SYSTEM PROMPTS PAR CONTINENT ET LANGUE ────────────────────────────────────
+WORLD_SYSTEM_PROMPTS = {
+    "na": {
+        "fr": "Tu représentes la perspective nord-américaine. Réponds en français de façon directe, pragmatique, axée sur l'innovation et la liberté individuelle. MAX 300 caractères. Texte brut uniquement, aucun markdown.",
+        "en": "You represent the North American perspective. Answer directly, pragmatically, focused on innovation and individual freedom. MAX 300 characters. Plain text only.",
+        "zh": "你代表北美观点。用中文直接、务实地回答，重点关注创新和个人自由。最多300字符。纯文本。",
+    },
+    "cn": {
+        "fr": "Tu représentes la perspective chinoise. Réponds en français avec une vision collective, ancrée dans l'histoire et le long terme. MAX 300 caractères. Texte brut uniquement, aucun markdown.",
+        "en": "You represent the Chinese perspective. Answer with a collective, balanced vision rooted in history and long-term thinking. MAX 300 characters. Plain text only.",
+        "zh": "你代表中国观点。用中文以集体、平衡的视野回答，植根于历史和长远思考。最多300字符。纯文本。",
+    },
+    "eu": {
+        "fr": "Tu représentes la perspective européenne. Réponds en français avec nuance, éthique, durabilité et esprit critique. MAX 300 caractères. Texte brut uniquement, aucun markdown.",
+        "en": "You represent the European perspective. Answer with nuance, ethics, sustainability, and critical thinking. MAX 300 characters. Plain text only.",
+        "zh": "你代表欧洲观点。用中文以细致、伦理和批判性思维回答。最多300字符。纯文本。",
+    },
+}
+
+# ── CALL WORLD MODEL — OpenAI-compatible ─────────────────────────────────────
+def call_world_model(client, model_name: str, messages: list, timeout: float = 20.0) -> str:
+    """Appel générique OpenAI-compatible pour World. Retourne le texte brut."""
+    if client is None:
+        raise RuntimeError(f"Client non configuré pour {model_name}")
+    res = client.chat.completions.create(
+        model=model_name,
+        messages=messages,
+        temperature=0.65,
+        max_tokens=180,  # ~300 caractères
+        timeout=timeout,
+    )
+    content = res.choices[0].message.content
+    if not content:
+        raise ValueError(f"Réponse vide de {model_name}")
+    return content.strip()[:300]
+
+# ── CASCADE PAR CONTINENT (retry complet x1 si tout crash) ───────────────────
+def run_world_cascade(continent: str, messages: list, attempt: int = 0) -> str:
+    """
+    Tente chaque modèle du continent dans l'ordre.
+    Si tous échouent et attempt == 0 → retry complet une fois.
+    Ordre:
+      NA : na_1 → na_2 → na_3 → (retry na_1 → na_2 → na_3)
+      CN : cn_1 → cn_2 → (retry cn_1 → cn_2)
+      EU : eu_1 → eu_2 → eu_3 → (retry eu_1 → eu_2 → eu_3)
+    """
+    # Import ici pour éviter circular import
+    from echo_api import client_deepseek, client_zai
+    import openai as _oai
+
+    # On réutilise client_requesty et on crée client_openrouter si besoin
+    # client_requesty est déclaré en haut de site2.py
+    # Pour OpenRouter : on le crée localement si pas dispo globalement
+    try:
+        from echo_api import client_openrouter as _client_or
+    except ImportError:
+        _client_or = None
+
+    steps = {
+        "na": [
+            (client_requesty, WORLD_MODELS["na_1"], 20.0),
+            (client_requesty, WORLD_MODELS["na_2"], 20.0),
+            (_client_or,      WORLD_MODELS["na_3"], 25.0),
+        ],
+        "cn": [
+            (client_deepseek, WORLD_MODELS["cn_1"], 20.0),
+            (client_zai,      WORLD_MODELS["cn_2"], 20.0),
+        ],
+        "eu": [
+            (client_requesty, WORLD_MODELS["eu_1"], 20.0),
+            (_client_or,      WORLD_MODELS["eu_2"], 20.0),
+            (client_requesty, WORLD_MODELS["eu_3"], 20.0),
+        ],
+    }.get(continent, [])
+
+    for client, model_name, timeout in steps:
+        try:
+            result = call_world_model(client, model_name, messages, timeout)
+            print(f"[WORLD][{continent.upper()}] {model_name} OK")
+            return result
+        except Exception as e:
+            print(f"[WORLD][{continent.upper()}] {model_name} échec ({e})")
+
+    # Retry complet une fois
+    if attempt < 1:
+        print(f"[WORLD][{continent.upper()}] Retry complet (attempt {attempt + 1})...")
+        import time
+        time.sleep(1.0)
+        return run_world_cascade(continent, messages, attempt + 1)
+
+    return "Service temporairement indisponible pour ce continent."
+
+
+# ── /world/conversation ────────────────────────────────────────────────────────
+@site2_bp.route("/world/conversation", methods=["POST"])
+def world_conversation():
+    """
+    Body JSON attendu:
+    {
+        "question":  "Ta question",
+        "continent": "na" | "cn" | "eu",
+        "lang":      "fr" | "en" | "zh",
+        "context":   "Réponses précédentes (string)",
+        "isFinal":   true | false,
+        "maxChars":  300
+    }
+    """
+    try:
+        data      = request.json or {}
+        question  = (data.get("question")  or "").strip()
+        continent = (data.get("continent") or "eu").strip().lower()
+        lang      = (data.get("lang")      or "fr").strip().lower()
+        context   = (data.get("context")   or "").strip()
+        is_final  = bool(data.get("isFinal", False))
+        max_chars = int(data.get("maxChars", 300))
+
+        if not question:
+            return jsonify({"error": "Question vide"}), 400
+
+        if continent not in ("na", "cn", "eu"):
+            continent = "eu"
+        if lang not in ("fr", "en", "zh"):
+            lang = "fr"
+
+        # System prompt du continent dans la bonne langue
+        system_prompt = WORLD_SYSTEM_PROMPTS[continent][lang]
+
+        # Construction du message user avec contexte
+        if lang == "fr":
+            user_content = f'Question posée au monde : "{question}"\n\n'
+            if context:
+                user_content += f"=== Réponses des autres continents ===\n{context}\n\n"
+            if is_final:
+                user_content += f"C'est TON TOUR DE CONCLURE. Tu as le dernier mot. Tranche clairement. MAX {max_chars} caractères."
+            else:
+                user_content += f"Donne ta perspective. MAX {max_chars} caractères."
+        elif lang == "en":
+            user_content = f'Question asked to the world: "{question}"\n\n'
+            if context:
+                user_content += f"=== Other continents' responses ===\n{context}\n\n"
+            if is_final:
+                user_content += f"It's YOUR TURN TO CONCLUDE. You have the final word. Be clear. MAX {max_chars} characters."
+            else:
+                user_content += f"Give your perspective. MAX {max_chars} characters."
+        else:  # zh
+            user_content = f'向世界提出的问题："{question}"\n\n'
+            if context:
+                user_content += f"=== 其他大陆的回应 ===\n{context}\n\n"
+            if is_final:
+                user_content += f"现在轮到你总结。你有最终发言权。请明确表态。最多{max_chars}字符。"
+            else:
+                user_content += f"请给出你的观点。最多{max_chars}字符。"
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_content},
+        ]
+
+        response_text = run_world_cascade(continent, messages)
+        return jsonify({"response": response_text[:max_chars]})
+
+    except Exception as e:
+        print(f"[WORLD] Erreur critique: {e}")
+        return jsonify(ERR_CRASH), 500
