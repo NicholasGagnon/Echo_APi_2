@@ -6,13 +6,13 @@ from openai import OpenAI
 
 site2_bp = Blueprint("site2", __name__)
 
-ERR_CRASH = {"action": None, "response": "Une erreur inattendue s'est produite. Réessaie dans quelques secondes."}
+ERR_CRASH = {"action": None, "response": "Une erreur inattendue s'est produite. Reessaie dans quelques secondes."}
 
 resend.api_key = os.getenv("RESEND_API_KEY", "")
 RESEND_FROM = os.getenv("RESEND_FROM", "Echo AI <support@echosai.ca>")
 
 # ── RATE LIMIT récupération Key — 2x/heure max par email ─────────────────────
-_recovery_attempts = {}
+_recovery_attempts = {}  # { email: [timestamp1, timestamp2, ...] }
 
 def check_recovery_rate_limit(email: str) -> bool:
     now = time.time()
@@ -51,41 +51,33 @@ def call_requesty(model_key: str, messages_openai, temp=0.5, timeout=20.0, max_t
     )
     content = res.choices[0].message.content
     if content is None:
-        raise ValueError(f"Réponse vide de {model_key}")
+        raise ValueError(f"Reponse vide de {model_key}")
     return content
 
-# ── PARSER JSON AVEC NETTOYAGE ULTRA-ROBUSTE ──────────────────────────────────
+# ── PARSER JSON AVEC NETTOYAGE DES \n ────────────────────────────────────────
 def clean_and_parse_json_site2(raw_text):
-    """Parser JSON unifié pour site2 qui nettoie les backticks et gère les structures complexes."""
+    """Parser JSON unifié pour site2 — identique à echo_api.py"""
     import json
     import re
     
     if not raw_text or not isinstance(raw_text, str):
-        raise ValueError("Réponse vide ou invalide.")
-    
+        raise ValueError("Reponse vide ou invalide.")
     text = raw_text.strip()
-    if text.startswith("```json"): 
-        text = text[7:]
-    elif text.startswith("```"):   
-        text = text[3:]
-    if text.endswith("```"):       
-        text = text[:-3]
+    if text.startswith("```json"): text = text[7:]
+    elif text.startswith("```"):   text = text[3:]
+    if text.endswith("```"):       text = text[:-3]
     text = text.strip()
-    
     if not text:
-        raise ValueError("Réponse vide après nettoyage.")
-    
-    # Tentative 1: Parsing direct du bloc complet
+        raise ValueError("Reponse vide apres nettoyage.")
     try:
         parsed = json.loads(text)
         if isinstance(parsed, dict) and "response" in parsed:
+            # Nettoyer les \n littéraux dans la réponse
             if isinstance(parsed["response"], str):
                 parsed["response"] = parsed["response"].replace("\\n", "\n").replace("\\\\n", "\n")
-        return parsed
+            return parsed
     except Exception:
         pass
-        
-    # Tentative 2: Extraction par Regex du premier dictionnaire valide
     match = re.search(r'\{.*\}', text, re.DOTALL)
     if match:
         try:
@@ -93,17 +85,14 @@ def clean_and_parse_json_site2(raw_text):
             if isinstance(parsed, dict) and "response" in parsed:
                 if isinstance(parsed["response"], str):
                     parsed["response"] = parsed["response"].replace("\\n", "\n").replace("\\\\n", "\n")
-            return parsed
+                return parsed
         except Exception:
             pass
-            
-    # Tentative 3: Extraction manuelle de secours si l'IA renvoie un format plat mal échappé
     if '"response":' in text:
         res_match = re.search(r'"response"\s*:\s*"([^"]+)"', text)
         if res_match:
             response_text = res_match.group(1).replace("\\n", "\n").replace("\\\\n", "\n")
             return {"action": None, "response": response_text}
-            
     return {"action": None, "response": text}
 
 # ── ENVOYER LA KEY PAR COURRIEL ──────────────────────────────────────────────
@@ -142,7 +131,7 @@ def send_interet_email(to_email: str, fiche_nom: str, sender_key: str, type_inte
     <div style="font-family: sans-serif; max-width: 480px; margin: 0 auto;">
         <h2>{emoji} Nouvelle activité sur ta fiche</h2>
         <p><strong>{sender_key}</strong> {label} pour <strong>{fiche_nom}</strong>.</p>
-        <a href="[https://tonsite.com/1/fiche](https://tonsite.com/1/fiche)" style="display:inline-block; background:#18181b; color:white; padding:12px 24px; border-radius:10px; text-decoration:none; font-weight:600; margin-top:12px;">
+        <a href="https://tonsite.com/1/fiche" style="display:inline-block; background:#18181b; color:white; padding:12px 24px; border-radius:10px; text-decoration:none; font-weight:600; margin-top:12px;">
             Voir qui s'intéresse à ta fiche →
         </a>
     </div>
@@ -198,7 +187,7 @@ def recuperer_cle():
         rows = res.json() if res.ok else []
 
         if not rows:
-            # Ne pas révéler si l'email existe ou non pour des raisons de sécurité
+            # Ne pas révéler si l'email existe ou non (sécurité)
             return jsonify({"sent": True})
 
         key = rows[0]["key"]
@@ -266,13 +255,16 @@ def notifier_interet():
 # ── /1/conversation ────────────────────────────────────────────────────────────
 @site2_bp.route("/1/conversation", methods=["POST"])
 def site2_conversation():
-    # Import local pour éviter les imports circulaires
+    # Import ici pour éviter le circular import — on réutilise l'infra Echo en filet de sécurité
     from echo_api import prepare_shared_context, run_paid_cascade, run_free_cascade, is_paid_tier
     try:
         data = request.json or {}
         ctx  = prepare_shared_context(data, source_override="chat")
 
-        # Cascade propre à site2
+        # ── Cascade propre à site2 ────────────────────────────────────────────
+        # 1. Grok-4.1-fast (non-reasoning) via Requesty — en test
+        # 2. Qwen3-235B via Requesty en filet
+        # 3. Fallback sur la cascade Echo si Requesty échoue ou n'est pas configuré
         if client_requesty is not None:
             for model_key in ("grok", "qwen3"):
                 try:
@@ -280,7 +272,7 @@ def site2_conversation():
                     result = clean_and_parse_json_site2(raw)
                     return jsonify(result)
                 except Exception as e:
-                    print(f"[SITE2] {model_key}/Requesty échec ({e})")
+                    print(f"[SITE2] {model_key}/Requesty echec ({e})")
 
         if is_paid_tier(ctx["user_tier"]):
             return jsonify(run_paid_cascade(ctx, page_timeout=15))
@@ -294,9 +286,11 @@ def site2_conversation():
         print(f"Erreur /1/conversation: {e}")
         return jsonify(ERR_CRASH), 500
 
-# ── /1/generate-invoice ───────────────────────────────────────────────────────
+
+# ── /1/generate-invoice — Cascade DeepSeek → Grok → GLM via Requesty ────────
 @site2_bp.route("/1/generate-invoice", methods=["POST"])
 def generate_invoice():
+    from echo_api import client_zai, MODELS
     import json, re
 
     try:
@@ -353,7 +347,7 @@ def generate_invoice():
         )
 
         messages = [
-            {"role": "system", "system_prompt": system_prompt},
+            {"role": "system", "content": system_prompt},
             {"role": "user",   "content": user_prompt},
         ]
         raw = None
@@ -363,6 +357,7 @@ def generate_invoice():
             try:
                 raw = call_requesty("grok", messages, temp=0.2, timeout=25.0, max_tokens=800)
                 print("[INVOICE] Grok/Requesty OK")
+                print(f"[INVOICE] Raw Grok: {raw[:300]}")
             except Exception as e:
                 print(f"[INVOICE] Grok echec ({e})")
 
@@ -374,7 +369,7 @@ def generate_invoice():
             except Exception as e:
                 print(f"[INVOICE] Qwen echec ({e})")
 
-        # Tentative 3 : DeepSeek en filet de secours
+        # Tentative 3 : DeepSeek en filet
         if not raw:
             from echo_api import client_deepseek, MODELS
             if client_deepseek is not None:
@@ -391,8 +386,21 @@ def generate_invoice():
         if not raw:
             return jsonify({"error": "IA indisponible, reessaie dans quelques secondes"}), 503
 
-        # Parser le JSON de facture
-        parsed = clean_and_parse_json_site2(raw)
+        # Parser JSON
+        text = raw.strip()
+        if text.startswith("```json"): text = text[7:]
+        elif text.startswith("```"):   text = text[3:]
+        if text.endswith("```"):       text = text[:-3]
+        text = text.strip()
+
+        parsed = {}
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            m = re.search(r'\{.*\}', text, re.DOTALL)
+            if m:
+                try: parsed = json.loads(m.group(0))
+                except Exception: pass
 
         return jsonify({
             "emetteur":        parsed.get("emetteur")        or "",
@@ -416,21 +424,22 @@ def generate_invoice():
         print(f"[INVOICE] Erreur critique: {e}")
         return jsonify({"error": str(e)}), 500
 
-# ── /idea OU /2/analyse-idee — ALIAS DE ROUTES TOTALEMENT CONFIGURÉS ──────────
-@site2_bp.route("/2/analyse-idee", methods=["POST"])
 
+# ── /2/analyse-idee — DeepSeek → Gemini → GLM ────────────────────────────────
+@site2_bp.route("/2/analyse-idee", methods=["POST"])
 def analyse_idee():
     from echo_api import client_deepseek, client_gemini_paid, client_zai, MODELS
     from google.genai import types as gtypes
     from prompts2 import get_idea_system_prompt, get_idea_user_prompt
+    import json, re
 
     try:
-        data = request.json or {}
-        idea = (data.get("idea") or "").strip()
-        lang = (data.get("lang") or "fr").strip()
+        data  = request.json or {}
+        idea  = (data.get("idea") or "").strip()
+        lang  = (data.get("lang") or "fr").strip()
 
         if not idea or len(idea) < 10:
-            return jsonify({"error": "Idée trop courte ou invalide"}), 400
+            return jsonify({"error": "Idée trop courte"}), 400
 
         system_prompt = get_idea_system_prompt(lang)
         user_prompt   = get_idea_user_prompt(idea, lang)
@@ -442,9 +451,16 @@ def analyse_idee():
 
         raw = None
 
-        # Tentative 1 : GLM-4.5-Air via Z.AI
-        
-        # Tentative 2 : Gemini 3.1 flash lite
+        # Tentative 1 : Grok-4.1-fast via Requesty
+        if client_requesty is not None:
+            try:
+                raw = (call_requesty("grok", messages, temp=0.3, timeout=25.0, max_tokens=1200) or "").strip()
+                if not raw: raw = None
+                else: print("[IDEA] Grok/Requesty OK")
+            except Exception as e:
+                print(f"[IDEA] Grok echec ({e})")
+
+        # Tentative 2 : Gemini paid ultra (gemini-3.1-flash-lite)
         if not raw and client_gemini_paid is not None:
             try:
                 gemini_contents = [
@@ -455,102 +471,58 @@ def analyse_idee():
                     contents=gemini_contents,
                     config=gtypes.GenerateContentConfig(
                         system_instruction=system_prompt,
-                        max_output_tokens=1500,
+                        max_output_tokens=1200,
                         temperature=0.3,
                     )
                 )
-                raw = r.text
-                print("[IDEA] Gemini Ultra OK")
+                raw = (r.text or "").strip()
+                if not raw: raw = None
+                else: print("[IDEA] Gemini paid ultra OK")
             except Exception as e:
-                print(f"[IDEA] Gemini Ultra echec ({e})")
+                print(f"[IDEA] Gemini echec ({e})")
 
-        # Tentative 3 : Gemini 2.5 flash lite (filet)
-        if not raw and client_gemini_paid is not None:
+        # Tentative 3 : Grok-4-fast via Requesty (filet)
+        if not raw and client_requesty is not None:
             try:
-                gemini_contents = [
-                    {"role": "user", "parts": [gtypes.Part.from_text(text=user_prompt)]}
-                ]
-                r = client_gemini_paid.models.generate_content(
-                    model=MODELS["gemini_paid_standard"],
-                    contents=gemini_contents,
-                    config=gtypes.GenerateContentConfig(
-                        system_instruction=system_prompt,
-                        max_output_tokens=1500,
-                        temperature=0.3,
-                    )
+                res = client_requesty.chat.completions.create(
+                    model="xai/grok-4-fast",
+                    messages=messages,
+                    temperature=0.3,
+                    max_tokens=1200,
+                    timeout=25.0,
                 )
-                raw = r.text
-                print("[IDEA] Gemini Standard OK")
+                raw = (res.choices[0].message.content or "").strip()
+                if not raw: raw = None
+                else: print("[IDEA] Grok-4-fast/Requesty OK")
             except Exception as e:
-                print(f"[IDEA] Gemini Standard echec ({e})")
+                print(f"[IDEA] Grok-4-fast echec ({e})")
 
         if not raw:
             return jsonify({"error": "Analyse indisponible, réessaie dans quelques secondes"}), 503
 
-        # Parsing de la structure multiniveau V5.0
-       
+        # Parser JSON
+        text = raw.strip()
+        if text.startswith("```json"): text = text[7:]
+        elif text.startswith("```"):   text = text[3:]
+        if text.endswith("```"):       text = text[:-3]
+        text = text.strip()
+
+        parsed = {}
         try:
-            parsed = clean_and_parse_json_site2(raw)
-            if not parsed:
-                parsed = {}
-            
-            # --- CALCUL DYNAMIQUE DU SCORE ---
-            scores = parsed.get("mvp_viability_scores", {})
-            if not scores and "scores" in parsed:
-                scores = parsed.get("scores", {})
-                
-            user_demand = int(scores.get("user_demand_score", scores.get("user_demand", 5)))
-            build_efficiency = int(scores.get("build_efficiency_score", scores.get("build_efficiency", 5)))
-            defensibility = int(scores.get("defensibility_score", scores.get("defensibility", 5)))
-            
-            calculated_score = round((user_demand * 0.4) + (build_efficiency * 0.4) + (defensibility * 0.2))
-            parsed["verdict_score"] = calculated_score
-            
-            if "verdict" not in parsed or parsed["verdict"] in ["", None, "—"]:
-                if calculated_score >= 7:
-                    parsed["verdict"] = "PROMETTEUSE"
-                elif calculated_score >= 5:
-                    parsed["verdict"] = "PROMETTEUSE MAIS FRAGILE"
-                else:
-                    parsed["verdict"] = "TRÈS RISQUÉE"
+            parsed = json.loads(text)
+        except Exception:
+            m = re.search(r'\{.*\}', text, re.DOTALL)
+            if m:
+                try: parsed = json.loads(m.group(0))
+                except Exception: pass
 
-   
-            # --- SÉCURISATION DE L'ANALYSE CONCURRENTIELLE (Mise à jour ultra-tolérante) ---
-            comp = parsed.get("competitor_similarity", {})
-            if not comp and "competitors" in parsed:
-                comp = parsed.get("competitors", {})
-                
-            front_keys = [
-                "same_problem", "same_solution", "same_workflow", 
-                "same_target_customer", "same_business_model", "same_user_experience"
-            ]
-            
-            normalized_comp = {}
-            for key in front_keys:
-                short_key = key.replace("same_", "")
-                val = comp.get(key, comp.get(short_key, False))
-                val_str = str(val).lower().strip()
-                
-                if any(x in val_str for x in ["true", "yes", "oui", "1", "✓", "meme", "même"]):
-                    normalized_comp[key] = True
-                elif any(x in val_str for x in ["false", "no", "non", "0", "✗", "different", "différent"]):
-                    normalized_comp[key] = False
-                else:
-                    normalized_comp[key] = len(val_str) > 0 and val_str != "none" and "✗" not in val_str
-            
-            normalized_comp["verdict"] = comp.get("verdict", parsed.get("competitor_verdict", "Analyse indisponible"))
-            parsed["competitor_similarity"] = normalized_comp
+        if not parsed:
+            return jsonify({"error": "Réponse non parseable"}), 500
 
-            # Le seul et unique return final en cas de succès
-            return jsonify(parsed)
-            
-        except Exception as json_err:
-            print(f"[IDEA] Erreur critique parsing/scoring sur le texte brut: {raw}")
-            print(f"[IDEA] Détails: {json_err}")
-            return jsonify({"error": "Erreur de formatage des données par l'IA. Réessaie."}), 500
+        return jsonify(parsed)
 
     except Exception as e:
-        print(f"[IDEA] Erreur critique système: {e}")
+        print(f"[IDEA] Erreur critique: {e}")
         return jsonify({"error": str(e)}), 500
 
 # ── /1/supprimer-fiche — par Key + email, sans session requise ───────────────
@@ -593,6 +565,10 @@ def supprimer_fiche():
     except Exception as e:
         print(f"Erreur /1/supprimer-fiche: {e}")
         return jsonify(ERR_CRASH), 500
+
+# ── NOTE ── Le checkout Stripe et le webhook de déblocage de fiche vivent
+# maintenant dans Next.js (app/api/checkout-fiche/route.ts + le webhook
+# Stripe fusionné existant), pas ici. Flask garde seulement la vérification.
 
 # ── VÉRIFIER SI UNE FICHE EST DÉBLOQUÉE POUR UN USER ─────────────────────────
 @site2_bp.route("/1/check-unlock", methods=["POST"])
