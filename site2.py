@@ -451,9 +451,9 @@ WORLD_MODELS = {
     "na_1": "xai/grok-4-fast-non-reasoning",    # Requesty
     "na_2": "gemini-3.1-flash-lite",             # Requesty
     "na_3": "openai/gpt-4o-mini-search-preview", # OpenRouter
-    "cn_1": "deepseek-v4-flash",                 # DeepSeek direct
-    "cn_2": "GLM-4.7-Flash",                      # Z.AI direct
-    "cn_3": "deepinfra/Qwen/Qwen3-235B-A22B-Instruct-2507", # Requesty/DeepInfra
+    "cn_1": "deepseek-v4-flash",                                    # DeepSeek direct — premier
+    "cn_2": "deepinfra/Qwen/Qwen3-235B-A22B-Instruct-2507",            # Requesty — Qwen3-235B
+    "cn_3": "deepinfra/Qwen/Qwen3-Coder-480B-A35B-Instruct-Turbo",     # Requesty — Qwen Coder 480B
     "eu_1": "mistral/mistral-small-latest",      # Requesty
     "eu_2": "mistralai/mistral-small-2603",      # OpenRouter
     "eu_3": "mistral/mistral-small-2603",        # Requesty
@@ -515,8 +515,34 @@ def call_world_model(client, model_name: str, messages: list, timeout: float = 2
         for field in ("reasoning_content", "reasoning", "thinking"):
             alt = getattr(message, field, None)
             if alt and str(alt).strip():
-                print(f"[WORLD DEBUG] {model_name} — contenu trouvé dans {field}!")
-                content = str(alt)
+                alt_str = str(alt)
+                print(f"[WORLD DEBUG] {model_name} — contenu trouvé dans {field} ({len(alt_str)} chars)")
+                # GLM met son brouillon interne dans reasoning_content
+                # On cherche le dernier "Final Polish" ou "Draft final" pour extraire la vraie réponse
+                # Sinon on prend les 672 derniers chars qui sont généralement la réponse finale
+                final_markers = ["5.  **Final Polish", "Final Polish", "**Final", "Final Answer:", "Réponse finale:"]
+                extracted = None
+                for marker in final_markers:
+                    pos = alt_str.rfind(marker)
+                    if pos != -1:
+                        # Prendre ce qui suit le marker
+                        after = alt_str[pos:]
+                        # Enlever le marker lui-même et les lignes de formatage
+                        lines = after.split('\n')
+                        clean_lines = []
+                        for line in lines[1:]:
+                            line = line.strip().lstrip('*').lstrip('#').lstrip('-').strip()
+                            # Enlever les prefixes comme "    Je propose..."
+                            if line.startswith('    '):
+                                line = line.strip()
+                            if line and not line.startswith('*') and not line.startswith('#'):
+                                clean_lines.append(line)
+                        extracted = ' '.join(clean_lines[:3]).strip()
+                        if extracted and len(extracted) > 50:
+                            print(f"[WORLD DEBUG] {model_name} — extrait depuis marker '{marker}'")
+                            break
+                        extracted = None
+                content = extracted if extracted else alt_str[-800:].strip()
                 break
 
     if content is None:
@@ -540,9 +566,12 @@ def run_world_cascade(continent: str, messages: list, attempt: int = 0) -> str:
             (_client_or,      WORLD_MODELS["na_3"], 25.0),
         ],
         "cn": [
-            (client_deepseek, WORLD_MODELS["cn_1"], 60.0),
-            (client_zai,      WORLD_MODELS["cn_2"], 60.0),
-            (client_requesty, WORLD_MODELS["cn_3"], 60.0),  # Qwen3-235B fallback
+            (client_deepseek, WORLD_MODELS["cn_1"], 60.0),  # DeepSeek — premier
+            (client_requesty, WORLD_MODELS["cn_2"], 60.0),  # Qwen3-235B — deuxième
+            (client_requesty, WORLD_MODELS["cn_3"], 60.0),  # Qwen Coder 480B — troisième
+            (client_deepseek, WORLD_MODELS["cn_1"], 60.0),  # DeepSeek — retry boucle 1
+            (client_requesty, WORLD_MODELS["cn_2"], 60.0),  # Qwen3-235B — retry boucle 2
+            (client_requesty, WORLD_MODELS["cn_3"], 60.0),  # Qwen Coder 480B — retry boucle 3
         ],
         "eu": [
             (client_requesty, WORLD_MODELS["eu_1"], 20.0),
