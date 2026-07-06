@@ -1,5 +1,6 @@
 from flask import Blueprint, request, jsonify
 import os
+import re
 import time
 import resend
 from openai import OpenAI
@@ -13,12 +14,11 @@ resend.api_key = os.getenv("RESEND_API_KEY", "")
 RESEND_FROM = os.getenv("RESEND_FROM", "Echo AI <support@echosai.ca>")
 
 # ── RATE LIMIT récupération Key — 2x/heure max par email ─────────────────────
-_recovery_attempts = {}  # { email: [timestamp1, timestamp2, ...] }
+_recovery_attempts = {}
 
 def check_recovery_rate_limit(email: str) -> bool:
     now = time.time()
     attempts = _recovery_attempts.get(email, [])
-    # Garder seulement les tentatives de la dernière heure
     attempts = [t for t in attempts if now - t < 3600]
     if len(attempts) >= 2:
         return False
@@ -26,7 +26,7 @@ def check_recovery_rate_limit(email: str) -> bool:
     _recovery_attempts[email] = attempts
     return True
 
-# ── MODÈLES SITE2 — propre cascade, indépendante d'Echo ─────────────────────────
+# ── MODÈLES SITE2 ─────────────────────────────────────────────────────────────
 SITE2_MODELS = {
     "grok":  "xai/grok-4-1-fast-non-reasoning",
     "qwen3": "deepinfra/Qwen/Qwen3-235B-A22B-Instruct-2507",
@@ -40,7 +40,6 @@ client_requesty = (
 )
 
 def call_requesty(model_key: str, messages_openai, temp=0.5, timeout=20.0, max_tokens=2500):
-    """Appel Requesty — OpenAI-compatible."""
     if client_requesty is None:
         raise RuntimeError("Requesty non configuré")
     res = client_requesty.chat.completions.create(
@@ -55,12 +54,9 @@ def call_requesty(model_key: str, messages_openai, temp=0.5, timeout=20.0, max_t
         raise ValueError(f"Reponse vide de {model_key}")
     return content
 
-# ── PARSER JSON AVEC NETTOYAGE DES \n ────────────────────────────────────────
+# ── PARSER JSON ───────────────────────────────────────────────────────────────
 def clean_and_parse_json_site2(raw_text):
-    """Parser JSON unifié pour site2 — identique à echo_api.py"""
     import json
-    import re
-    
     if not raw_text or not isinstance(raw_text, str):
         raise ValueError("Reponse vide ou invalide.")
     text = raw_text.strip()
@@ -73,7 +69,6 @@ def clean_and_parse_json_site2(raw_text):
     try:
         parsed = json.loads(text)
         if isinstance(parsed, dict) and "response" in parsed:
-            # Nettoyer les \n littéraux dans la réponse
             if isinstance(parsed["response"], str):
                 parsed["response"] = parsed["response"].replace("\\n", "\n").replace("\\\\n", "\n")
             return parsed
@@ -111,12 +106,7 @@ def send_key_email(to_email: str, key: str, is_recovery: bool = False):
     </div>
     """
     try:
-        resend.Emails.send({
-            "from": RESEND_FROM,
-            "to": [to_email],
-            "subject": subject,
-            "html": html,
-        })
+        resend.Emails.send({"from": RESEND_FROM, "to": [to_email], "subject": subject, "html": html})
         return True
     except Exception as e:
         print(f"[RESEND] Erreur envoi: {e}")
@@ -138,24 +128,19 @@ def send_interet_email(to_email: str, fiche_nom: str, sender_key: str, type_inte
     </div>
     """
     try:
-        resend.Emails.send({
-            "from": RESEND_FROM,
-            "to": [to_email],
-            "subject": subject,
-            "html": html,
-        })
+        resend.Emails.send({"from": RESEND_FROM, "to": [to_email], "subject": subject, "html": html})
         return True
     except Exception as e:
         print(f"[RESEND] Erreur envoi interet: {e}")
         return False
 
-# ── /1/envoyer-cle (à la création de fiche) ──────────────────────────────────
+# ── /1/envoyer-cle ────────────────────────────────────────────────────────────
 @site2_bp.route("/1/envoyer-cle", methods=["POST"])
 def envoyer_cle():
     try:
-        data = request.json or {}
+        data  = request.json or {}
         email = (data.get("email") or "").strip()
-        key   = (data.get("key") or "").strip()
+        key   = (data.get("key")   or "").strip()
         if not email or not key:
             return jsonify({"error": "Email et clé requis"}), 400
         ok = send_key_email(email, key, is_recovery=False)
@@ -164,33 +149,27 @@ def envoyer_cle():
         print(f"Erreur /1/envoyer-cle: {e}")
         return jsonify(ERR_CRASH), 500
 
-# ── /1/recuperer-cle — rate limited 2x/heure ─────────────────────────────────
+# ── /1/recuperer-cle ──────────────────────────────────────────────────────────
 @site2_bp.route("/1/recuperer-cle", methods=["POST"])
 def recuperer_cle():
     try:
         import os, requests as req
-        data = request.json or {}
+        data  = request.json or {}
         email = (data.get("email") or "").strip()
         if not email:
             return jsonify({"error": "Email requis"}), 400
-
         if not check_recovery_rate_limit(email):
             return jsonify({"error": "rate_limited", "message": "Trop de demandes. Réessaie dans une heure."}), 429
-
         supabase_url = os.getenv("SUPABASE_URL", "")
         supabase_key = os.getenv("SUPABASE_SERVICE_KEY", "") or os.getenv("SUPABASE_ANON_KEY", "")
-
         res = req.get(
             f"{supabase_url}/rest/v1/fiches",
             params={"email_prive": f"eq.{email}", "select": "key"},
             headers={"apikey": supabase_key, "Authorization": f"Bearer {supabase_key}"},
         )
         rows = res.json() if res.ok else []
-
         if not rows:
-            # Ne pas révéler si l'email existe ou non (sécurité)
             return jsonify({"sent": True})
-
         key = rows[0]["key"]
         send_key_email(email, key, is_recovery=True)
         return jsonify({"sent": True})
@@ -203,19 +182,15 @@ def recuperer_cle():
 def notifier_interet():
     try:
         import os, requests as req
-        data = request.json or {}
-        fiche_id     = (data.get("fiche_id") or "").strip()
+        data         = request.json or {}
+        fiche_id     = (data.get("fiche_id")   or "").strip()
         sender_key   = (data.get("sender_key") or "Quelqu'un").strip()
-        type_interet = (data.get("type") or "like").strip()  # "like" ou "tres_interesse"
-
+        type_interet = (data.get("type")       or "like").strip()
         if not fiche_id:
             return jsonify({"error": "fiche_id requis"}), 400
-
         supabase_url = os.getenv("SUPABASE_URL", "")
         supabase_key = os.getenv("SUPABASE_SERVICE_KEY", "") or os.getenv("SUPABASE_ANON_KEY", "")
         headers = {"apikey": supabase_key, "Authorization": f"Bearer {supabase_key}"}
-
-        # Récupérer la fiche (nom + email du propriétaire)
         res = req.get(
             f"{supabase_url}/rest/v1/fiches",
             params={"id": f"eq.{fiche_id}", "select": "nom_projet,email_prive,likes,interets"},
@@ -224,48 +199,28 @@ def notifier_interet():
         rows = res.json() if res.ok else []
         if not rows:
             return jsonify({"error": "Fiche introuvable"}), 404
-
         fiche = rows[0]
-
-        # Incrémenter le compteur
-        field = "interets" if type_interet == "tres_interesse" else "likes"
+        field     = "interets" if type_interet == "tres_interesse" else "likes"
         new_count = (fiche.get(field) or 0) + 1
-        req.patch(
-            f"{supabase_url}/rest/v1/fiches",
-            params={"id": f"eq.{fiche_id}"},
-            headers={**headers, "Content-Type": "application/json"},
-            json={field: new_count},
-        )
-
-        # Enregistrer dans fiche_interets
-        req.post(
-            f"{supabase_url}/rest/v1/fiche_interets",
-            headers={**headers, "Content-Type": "application/json"},
-            json={"fiche_id": fiche_id, "sender_key": sender_key, "type": type_interet},
-        )
-
-        # Envoyer le courriel au propriétaire
+        req.patch(f"{supabase_url}/rest/v1/fiches", params={"id": f"eq.{fiche_id}"},
+                  headers={**headers, "Content-Type": "application/json"}, json={field: new_count})
+        req.post(f"{supabase_url}/rest/v1/fiche_interets",
+                 headers={**headers, "Content-Type": "application/json"},
+                 json={"fiche_id": fiche_id, "sender_key": sender_key, "type": type_interet})
         if fiche.get("email_prive"):
             send_interet_email(fiche["email_prive"], fiche["nom_projet"], sender_key, type_interet)
-
         return jsonify({"ok": True, "new_count": new_count})
     except Exception as e:
         print(f"Erreur /1/notifier-interet: {e}")
         return jsonify(ERR_CRASH), 500
 
-# ── /1/conversation ────────────────────────────────────────────────────────────
+# ── /1/conversation ───────────────────────────────────────────────────────────
 @site2_bp.route("/1/conversation", methods=["POST"])
 def site2_conversation():
-    # Import ici pour éviter le circular import — on réutilise l'infra Echo en filet de sécurité
     from echo_api import prepare_shared_context, run_paid_cascade, run_free_cascade, is_paid_tier
     try:
         data = request.json or {}
         ctx  = prepare_shared_context(data, source_override="chat")
-
-        # ── Cascade propre à site2 ────────────────────────────────────────────
-        # 1. Grok-4.1-fast (non-reasoning) via Requesty — en test
-        # 2. Qwen3-235B via Requesty en filet
-        # 3. Fallback sur la cascade Echo si Requesty échoue ou n'est pas configuré
         if client_requesty is not None:
             for model_key in ("grok", "qwen3"):
                 try:
@@ -274,25 +229,19 @@ def site2_conversation():
                     return jsonify(result)
                 except Exception as e:
                     print(f"[SITE2] {model_key}/Requesty echec ({e})")
-
         if is_paid_tier(ctx["user_tier"]):
             return jsonify(run_paid_cascade(ctx, page_timeout=15))
-        steps = [
-            ("ds", "deepseek", 8),
-            ("z",  "glm",     15),
-            ("or", "llama",   12),
-        ]
+        steps = [("ds", "deepseek", 8), ("z", "glm", 15), ("or", "llama", 12)]
         return jsonify(run_free_cascade(steps, ctx))
     except Exception as e:
         print(f"Erreur /1/conversation: {e}")
         return jsonify(ERR_CRASH), 500
 
-
-# ── /1/generate-invoice — Cascade DeepSeek → Grok → GLM via Requesty ────────
+# ── /1/generate-invoice ───────────────────────────────────────────────────────
 @site2_bp.route("/1/generate-invoice", methods=["POST"])
 def generate_invoice():
     from echo_api import client_zai, MODELS
-    import json, re
+    import json
 
     try:
         data      = request.json or {}
@@ -303,97 +252,60 @@ def generate_invoice():
         numero    = (data.get("numero")   or "INV-001").strip()
         date_str  = (data.get("dateStr")  or "").strip()
         due_str   = (data.get("dueStr")   or "").strip()
-
         if not free_text:
             return jsonify({"error": "Texte requis"}), 400
-
-        lang_instr = "Reponds en francais." if lang == "fr" else "Answer in English."
-        status_map = {"pending": "En attente" if lang == "fr" else "Pending",
-                      "paid":    "Payee"      if lang == "fr" else "Paid",
-                      "late":    "En retard"  if lang == "fr" else "Overdue"}
+        lang_instr   = "Reponds en francais." if lang == "fr" else "Answer in English."
+        status_map   = {"pending": "En attente" if lang == "fr" else "Pending",
+                        "paid":    "Payee"      if lang == "fr" else "Paid",
+                        "late":    "En retard"  if lang == "fr" else "Overdue"}
         status_label = status_map.get(status, "En attente")
-
         system_prompt = (
             "Tu es un expert en facturation professionnelle. "
             "Extrais TOUTES les informations du texte et retourne un JSON complet. "
-            "Regles: "
-            "1. EMETTEUR = premiere entreprise/personne (celle qui envoie la facture). "
-            "2. CLIENT = deuxieme personne/entreprise (celle qui paie). "
-            "3. Extrait adresse, email, telephone de chaque partie. "
-            "4. EMAIL = tout ce qui contient @. "
-            "5. TELEPHONE = tout numero de telephone. "
-            "6. MONTANT = additionne tous les montants pour obtenir montantHT. "
-            "7. Reformule la description de facon professionnelle. "
-            "8. Genere des conditions de paiement adaptees au statut. "
-            + lang_instr + " "
-            "Reponds UNIQUEMENT avec ce JSON, aucun texte avant ou apres: "
+            "Regles: 1. EMETTEUR = premiere entreprise/personne. 2. CLIENT = deuxieme. "
+            "3. Extrait adresse, email, telephone. 4. EMAIL = tout ce qui contient @. "
+            "5. TELEPHONE = tout numero. 6. MONTANT = additionne tous. "
+            "7. Reformule la description. 8. Genere conditions de paiement. "
+            + lang_instr + " Reponds UNIQUEMENT avec ce JSON: "
             '{"emetteur":"","adresseEmetteur":"","emailEmetteur":"","telEmetteur":"",'
-            '"neq":"","numTPS":"","numTVQ":"",'
-            '"client":"","adresseClient":"","telClient":"","emailClient":"",'
-            '"description":"","montantHT":0.00,"conditions":"","notes":""}'
+            '"neq":"","numTPS":"","numTVQ":"","client":"","adresseClient":"","telClient":"",'
+            '"emailClient":"","description":"","montantHT":0.00,"conditions":"","notes":""}'
         )
-
         user_prompt = (
-            "Voici toutes les informations a extraire et structurer en facture professionnelle:\n\n"
-            + free_text +
-            "\n\n---\n"
-            "Devise: " + currency + "\n"
-            "Statut: " + status_label + "\n"
-            "Numero de facture: " + numero + "\n"
-            "Date: " + date_str + "\n"
-            "Echeance: " + due_str + "\n\n"
-            "IMPORTANT: Extrait TOUS les details (noms, adresses, emails, telephones, montants). "
-            "Additionne tous les montants pour montantHT. "
-            "JSON uniquement, aucun texte supplementaire."
+            f"Informations:\n\n{free_text}\n\n---\nDevise: {currency}\nStatut: {status_label}\n"
+            f"Numero: {numero}\nDate: {date_str}\nEcheance: {due_str}\n\nJSON uniquement."
         )
-
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user",   "content": user_prompt},
-        ]
+        messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
         raw = None
-
-        # Tentative 1 : Grok via Requesty
         if client_requesty is not None:
             try:
                 raw = call_requesty("grok", messages, temp=0.2, timeout=25.0, max_tokens=800)
-                print("[INVOICE] Grok/Requesty OK")
-                print(f"[INVOICE] Raw Grok: {raw[:300]}")
+                print("[INVOICE] Grok OK")
             except Exception as e:
                 print(f"[INVOICE] Grok echec ({e})")
-
-        # Tentative 2 : Qwen via Requesty
         if not raw and client_requesty is not None:
             try:
                 raw = call_requesty("qwen3", messages, temp=0.2, timeout=25.0, max_tokens=800)
-                print("[INVOICE] Qwen/Requesty OK")
+                print("[INVOICE] Qwen OK")
             except Exception as e:
                 print(f"[INVOICE] Qwen echec ({e})")
-
-        # Tentative 3 : DeepSeek en filet
         if not raw:
             from echo_api import client_deepseek, MODELS
             if client_deepseek is not None:
                 try:
                     res = client_deepseek.chat.completions.create(
-                        model=MODELS["deepseek"], messages=messages,
-                        temperature=0.2, max_tokens=800, timeout=25.0,
-                    )
+                        model=MODELS["deepseek"], messages=messages, temperature=0.2, max_tokens=800, timeout=25.0)
                     raw = res.choices[0].message.content
-                    print("[INVOICE] DeepSeek filet OK")
+                    print("[INVOICE] DeepSeek OK")
                 except Exception as e:
                     print(f"[INVOICE] DeepSeek echec ({e})")
-
         if not raw:
-            return jsonify({"error": "IA indisponible, reessaie dans quelques secondes"}), 503
-
-        # Parser JSON
+            return jsonify({"error": "IA indisponible"}), 503
         text = raw.strip()
         if text.startswith("```json"): text = text[7:]
         elif text.startswith("```"):   text = text[3:]
         if text.endswith("```"):       text = text[:-3]
         text = text.strip()
-
         parsed = {}
         try:
             parsed = json.loads(text)
@@ -402,112 +314,70 @@ def generate_invoice():
             if m:
                 try: parsed = json.loads(m.group(0))
                 except Exception: pass
-
         return jsonify({
-            "emetteur":        parsed.get("emetteur")        or "",
-            "adresseEmetteur": parsed.get("adresseEmetteur") or "",
-            "emailEmetteur":   parsed.get("emailEmetteur")   or "",
-            "telEmetteur":     parsed.get("telEmetteur")     or "",
-            "neq":             parsed.get("neq")             or "",
-            "numTPS":          parsed.get("numTPS")          or "",
-            "numTVQ":          parsed.get("numTVQ")          or "",
-            "client":          parsed.get("client")          or "",
-            "adresseClient":   parsed.get("adresseClient")   or "",
-            "telClient":       parsed.get("telClient")       or "",
-            "emailClient":     parsed.get("emailClient")     or "",
-            "description":     parsed.get("description")     or "",
-            "montantHT":       parsed.get("montantHT")       or 0,
-            "conditions":      parsed.get("conditions")      or "",
-            "notes":           parsed.get("notes")           or "",
+            "emetteur": parsed.get("emetteur") or "", "adresseEmetteur": parsed.get("adresseEmetteur") or "",
+            "emailEmetteur": parsed.get("emailEmetteur") or "", "telEmetteur": parsed.get("telEmetteur") or "",
+            "neq": parsed.get("neq") or "", "numTPS": parsed.get("numTPS") or "", "numTVQ": parsed.get("numTVQ") or "",
+            "client": parsed.get("client") or "", "adresseClient": parsed.get("adresseClient") or "",
+            "telClient": parsed.get("telClient") or "", "emailClient": parsed.get("emailClient") or "",
+            "description": parsed.get("description") or "", "montantHT": parsed.get("montantHT") or 0,
+            "conditions": parsed.get("conditions") or "", "notes": parsed.get("notes") or "",
         })
-
     except Exception as e:
-        print(f"[INVOICE] Erreur critique: {e}")
+        print(f"[INVOICE] Erreur: {e}")
         return jsonify({"error": str(e)}), 500
 
-
-# ── /2/analyse-idee — DeepSeek → Gemini → GLM ────────────────────────────────
+# ── /2/analyse-idee ───────────────────────────────────────────────────────────
 @site2_bp.route("/2/analyse-idee", methods=["POST"])
 def analyse_idee():
     from echo_api import client_deepseek, client_gemini_paid, client_zai, MODELS
     from google.genai import types as gtypes
     from prompts2 import get_idea_system_prompt, get_idea_user_prompt
-    import json, re
+    import json
 
     try:
-        data  = request.json or {}
-        idea  = (data.get("idea") or "").strip()
-        lang  = (data.get("lang") or "fr").strip()
-
+        data = request.json or {}
+        idea = (data.get("idea") or "").strip()
+        lang = (data.get("lang") or "fr").strip()
         if not idea or len(idea) < 10:
             return jsonify({"error": "Idée trop courte"}), 400
-
         system_prompt = get_idea_system_prompt(lang)
         user_prompt   = get_idea_user_prompt(idea, lang)
-
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user",   "content": user_prompt},
-        ]
-
+        messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
         raw = None
-
-        # Tentative 1 : Grok-4.1-fast via Requesty
         if client_requesty is not None:
             try:
-                raw = (call_requesty("grok", messages, temp=0.3, timeout=25.0, max_tokens=1200) or "").strip()
-                if not raw: raw = None
-                else: print("[IDEA] Grok/Requesty OK")
+                res = client_requesty.chat.completions.create(
+                    model="xai/grok-4-fast-non-reasoning", messages=messages, temperature=0.3, max_tokens=1200, timeout=25.0)
+                raw = (res.choices[0].message.content or "").strip() or None
+                if raw: print("[IDEA] Grok-4-fast-non-reasoning OK")
             except Exception as e:
                 print(f"[IDEA] Grok echec ({e})")
-
-        # Tentative 2 : Gemini paid ultra (gemini-3.1-flash-lite)
         if not raw and client_gemini_paid is not None:
             try:
-                gemini_contents = [
-                    {"role": "user", "parts": [gtypes.Part.from_text(text=user_prompt)]}
-                ]
                 r = client_gemini_paid.models.generate_content(
                     model=MODELS["gemini_paid_ultra"],
-                    contents=gemini_contents,
-                    config=gtypes.GenerateContentConfig(
-                        system_instruction=system_prompt,
-                        max_output_tokens=1200,
-                        temperature=0.3,
-                    )
-                )
-                raw = (r.text or "").strip()
-                if not raw: raw = None
-                else: print("[IDEA] Gemini paid ultra OK")
+                    contents=[{"role": "user", "parts": [gtypes.Part.from_text(text=user_prompt)]}],
+                    config=gtypes.GenerateContentConfig(system_instruction=system_prompt, max_output_tokens=1200, temperature=0.3))
+                raw = (r.text or "").strip() or None
+                if raw: print("[IDEA] Gemini OK")
             except Exception as e:
                 print(f"[IDEA] Gemini echec ({e})")
-
-        # Tentative 3 : Grok-4-fast via Requesty (filet)
         if not raw and client_requesty is not None:
             try:
                 res = client_requesty.chat.completions.create(
-                    model="xai/grok-4-fast",
-                    messages=messages,
-                    temperature=0.3,
-                    max_tokens=1200,
-                    timeout=25.0,
-                )
-                raw = (res.choices[0].message.content or "").strip()
-                if not raw: raw = None
-                else: print("[IDEA] Grok-4-fast/Requesty OK")
+                    model="xai/grok-4-fast", messages=messages, temperature=0.3, max_tokens=1200, timeout=25.0)
+                raw = (res.choices[0].message.content or "").strip() or None
+                if raw: print("[IDEA] Grok-4-fast OK")
             except Exception as e:
                 print(f"[IDEA] Grok-4-fast echec ({e})")
-
         if not raw:
-            return jsonify({"error": "Analyse indisponible, réessaie dans quelques secondes"}), 503
-
-        # Parser JSON
+            return jsonify({"error": "Analyse indisponible"}), 503
         text = raw.strip()
         if text.startswith("```json"): text = text[7:]
         elif text.startswith("```"):   text = text[3:]
         if text.endswith("```"):       text = text[:-3]
         text = text.strip()
-
         parsed = {}
         try:
             parsed = json.loads(text)
@@ -516,164 +386,130 @@ def analyse_idee():
             if m:
                 try: parsed = json.loads(m.group(0))
                 except Exception: pass
-
         if not parsed:
             return jsonify({"error": "Réponse non parseable"}), 500
-
         return jsonify(parsed)
-
     except Exception as e:
-        print(f"[IDEA] Erreur critique: {e}")
+        print(f"[IDEA] Erreur: {e}")
         return jsonify({"error": str(e)}), 500
 
-# ── /1/supprimer-fiche — par Key + email, sans session requise ───────────────
+# ── /1/supprimer-fiche ────────────────────────────────────────────────────────
 @site2_bp.route("/1/supprimer-fiche", methods=["POST"])
 def supprimer_fiche():
     try:
         import os, requests as req
         data  = request.json or {}
-        key   = (data.get("key") or "").strip()
+        key   = (data.get("key")   or "").strip()
         email = (data.get("email") or "").strip()
-
         if not key or not email:
             return jsonify({"error": "Clé et courriel requis"}), 400
-
         supabase_url = os.getenv("SUPABASE_URL", "")
         supabase_key = os.getenv("SUPABASE_SERVICE_KEY", "") or os.getenv("SUPABASE_ANON_KEY", "")
         headers = {"apikey": supabase_key, "Authorization": f"Bearer {supabase_key}"}
-
-        # Vérifier que la Key ET l'email correspondent à la même fiche
-        res = req.get(
-            f"{supabase_url}/rest/v1/fiches",
-            params={"key": f"eq.{key}", "email_prive": f"eq.{email}", "select": "id"},
-            headers=headers,
-        )
+        res = req.get(f"{supabase_url}/rest/v1/fiches",
+                      params={"key": f"eq.{key}", "email_prive": f"eq.{email}", "select": "id"}, headers=headers)
         rows = res.json() if res.ok else []
         if not rows:
             return jsonify({"error": "Clé ou courriel incorrect."}), 403
-
         fiche_id = rows[0]["id"]
-
-        del_res = req.delete(
-            f"{supabase_url}/rest/v1/fiches",
-            params={"id": f"eq.{fiche_id}"},
-            headers=headers,
-        )
+        del_res  = req.delete(f"{supabase_url}/rest/v1/fiches", params={"id": f"eq.{fiche_id}"}, headers=headers)
         if not del_res.ok:
             return jsonify({"error": "Échec de la suppression."}), 500
-
         return jsonify({"deleted": True})
     except Exception as e:
         print(f"Erreur /1/supprimer-fiche: {e}")
         return jsonify(ERR_CRASH), 500
 
-# ── NOTE ── Le checkout Stripe et le webhook de déblocage de fiche vivent
-# maintenant dans Next.js (app/api/checkout-fiche/route.ts + le webhook
-# Stripe fusionné existant), pas ici. Flask garde seulement la vérification.
-
-# ── VÉRIFIER SI UNE FICHE EST DÉBLOQUÉE POUR UN USER ─────────────────────────
+# ── /1/check-unlock ───────────────────────────────────────────────────────────
 @site2_bp.route("/1/check-unlock", methods=["POST"])
 def check_unlock():
     try:
         import requests as req
         data        = request.json or {}
-        fiche_id    = (data.get("fiche_id") or "").strip()
+        fiche_id    = (data.get("fiche_id")    or "").strip()
         acheteur_id = (data.get("acheteur_id") or "").strip()
         if not fiche_id or not acheteur_id:
             return jsonify({"unlocked": False})
-
         supabase_url = os.getenv("SUPABASE_URL", "")
         supabase_key = os.getenv("SUPABASE_SERVICE_KEY", "") or os.getenv("SUPABASE_ANON_KEY", "")
         headers = {"apikey": supabase_key, "Authorization": f"Bearer {supabase_key}"}
-
-        res = req.get(
-            f"{supabase_url}/rest/v1/tunnels",
-            params={"fiche_id": f"eq.{fiche_id}", "acheteur_id": f"eq.{acheteur_id}", "select": "id"},
-            headers=headers,
-        )
+        res  = req.get(f"{supabase_url}/rest/v1/tunnels",
+                       params={"fiche_id": f"eq.{fiche_id}", "acheteur_id": f"eq.{acheteur_id}", "select": "id"},
+                       headers=headers)
         rows = res.json() if res.ok else []
         return jsonify({"unlocked": len(rows) > 0})
     except Exception as e:
         print(f"Erreur /1/check-unlock: {e}")
         return jsonify({"unlocked": False})
-    
-    # ── À AJOUTER DANS site2.py ──────────────────────────────────────────────────
-# Colle ce bloc à la fin de site2.py, avant la dernière ligne si y'en a une.
-#
-# Les clients (client_requesty, client_deepseek, client_zai, client_openrouter)
-# sont déjà déclarés plus haut dans site2.py / echo_api.py — on les réutilise.
-# ─────────────────────────────────────────────────────────────────────────────
 
-# ── MODÈLES WORLD (noms exacts — ne jamais modifier) ─────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── WORLD — CASCADE 3 CONTINENTS ─────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
 WORLD_MODELS = {
-    # Nord Amérique
-    "na_1": "xai/grok-4-fast-non-reasoning",     # Requesty
-    "na_2": "gemini-3.1-flash-lite",              # Requesty (Gemini via Requesty)
-    "na_3": "openai/gpt-4o-mini-search-preview",  # OpenRouter
-
-    # Chine
-    "cn_1": "deepseek-v4-flash",                  # DeepSeek direct
-    "cn_2": "GLM-4.5-Air",                        # Z.AI direct
-
-    # Europe / France
-    "eu_1": "mistral/mistral-small-latest",        # Requesty
-    "eu_2": "mistralai/mistral-small-2603",        # OpenRouter
-    "eu_3": "mistral/mistral-small-2603",          # Requesty
+    "na_1": "xai/grok-4-fast-non-reasoning",    # Requesty
+    "na_2": "gemini-3.1-flash-lite",             # Requesty
+    "na_3": "openai/gpt-4o-mini-search-preview", # OpenRouter
+    "cn_1": "deepseek-v4-flash",                 # DeepSeek direct
+    "cn_2": "GLM-4.7-Flash",                      # Z.AI direct
+    "cn_3": "deepinfra/Qwen/Qwen3-235B-A22B-Instruct-2507", # Requesty/DeepInfra
+    "eu_1": "mistral/mistral-small-latest",      # Requesty
+    "eu_2": "mistralai/mistral-small-2603",      # OpenRouter
+    "eu_3": "mistral/mistral-small-2603",        # Requesty
 }
 
-# ── SYSTEM PROMPTS PAR CONTINENT ET LANGUE ────────────────────────────────────
-WORLD_SYSTEM_PROMPTS = {
-    "na": {
-        "fr": "Tu représentes la perspective nord-américaine. Réponds en français de façon directe, pragmatique, axée sur l'innovation et la liberté individuelle. MAX 300 caractères. Texte brut uniquement, aucun markdown.",
-        "en": "You represent the North American perspective. Answer directly, pragmatically, focused on innovation and individual freedom. MAX 300 characters. Plain text only.",
-        "zh": "你代表北美观点。用中文直接、务实地回答，重点关注创新和个人自由。最多300字符。纯文本。",
-    },
-    "cn": {
-        "fr": "Tu représentes la perspective chinoise. Réponds en français avec une vision collective, ancrée dans l'histoire et le long terme. MAX 300 caractères. Texte brut uniquement, aucun markdown.",
-        "en": "You represent the Chinese perspective. Answer with a collective, balanced vision rooted in history and long-term thinking. MAX 300 characters. Plain text only.",
-        "zh": "你代表中国观点。用中文以集体、平衡的视野回答，植根于历史和长远思考。最多300字符。纯文本。",
-    },
-    "eu": {
-        "fr": "Tu représentes la perspective européenne. Réponds en français avec nuance, éthique, durabilité et esprit critique. MAX 300 caractères. Texte brut uniquement, aucun markdown.",
-        "en": "You represent the European perspective. Answer with nuance, ethics, sustainability, and critical thinking. MAX 300 characters. Plain text only.",
-        "zh": "你代表欧洲观点。用中文以细致、伦理和批判性思维回答。最多300字符。纯文本。",
-    },
-}
+def _strip_markdown(text: str) -> str:
+    """FIX 3 — retire le markdown que certains modèles insèrent malgré l'instruction."""
+    text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)
+    text = re.sub(r'\*([^*]+)\*',     r'\1', text)
+    text = re.sub(r'#{1,6}\s*',       '',    text)
+    text = re.sub(r'`([^`]+)`',       r'\1', text)
+    return text.strip()
 
-# ── CALL WORLD MODEL — OpenAI-compatible ─────────────────────────────────────
 def call_world_model(client, model_name: str, messages: list, timeout: float = 20.0) -> str:
-    """Appel générique OpenAI-compatible pour World. Retourne le texte brut."""
     if client is None:
         raise RuntimeError(f"Client non configuré pour {model_name}")
     res = client.chat.completions.create(
         model=model_name,
         messages=messages,
-        temperature=0.65,
-        max_tokens=180,  # ~300 caractères
+        temperature=0.7,
+        max_tokens=250,
         timeout=timeout,
     )
-    content = res.choices[0].message.content
+    choice        = res.choices[0]
+    finish_reason = getattr(choice, "finish_reason", "unknown")
+    message       = choice.message
+    content       = message.content
+
+    # DEBUG complet — log finish_reason + model_dump pour trouver où GLM cache sa réponse
+    print(f"[WORLD DEBUG] {model_name} | finish_reason={finish_reason} | content_len={len(content) if content else 0}")
+
+    # Si contenu vide — chercher dans tous les champs alternatifs (GLM, DeepSeek, Z.AI)
     if not content:
-        raise ValueError(f"Réponse vide de {model_name}")
-    return content.strip()[:300]
+        try:
+            raw_dump = message.model_dump()
+            print(f"[WORLD DEBUG] {model_name} model_dump = {raw_dump}")
+        except Exception as dump_err:
+            print(f"[WORLD DEBUG] model_dump error: {dump_err}")
 
-# ── CASCADE PAR CONTINENT (retry complet x1 si tout crash) ───────────────────
+        # Champs alternatifs connus: reasoning_content, reasoning, thinking
+        for field in ("reasoning_content", "reasoning", "thinking"):
+            alt = getattr(message, field, None)
+            if alt and str(alt).strip():
+                print(f"[WORLD DEBUG] {model_name} — contenu trouvé dans {field}!")
+                content = str(alt)
+                break
+
+    if content is None:
+        raise ValueError(f"Réponse None de {model_name} (finish_reason={finish_reason})")
+    content = content.strip()
+    if not content:
+        raise ValueError(f"Réponse vide de {model_name} (finish_reason={finish_reason})")
+    return _strip_markdown(content)[:420]
+
 def run_world_cascade(continent: str, messages: list, attempt: int = 0) -> str:
-    """
-    Tente chaque modèle du continent dans l'ordre.
-    Si tous échouent et attempt == 0 → retry complet une fois.
-    Ordre:
-      NA : na_1 → na_2 → na_3 → (retry na_1 → na_2 → na_3)
-      CN : cn_1 → cn_2 → (retry cn_1 → cn_2)
-      EU : eu_1 → eu_2 → eu_3 → (retry eu_1 → eu_2 → eu_3)
-    """
-    # Import ici pour éviter circular import
     from echo_api import client_deepseek, client_zai
-    import openai as _oai
-
-    # On réutilise client_requesty et on crée client_openrouter si besoin
-    # client_requesty est déclaré en haut de site2.py
-    # Pour OpenRouter : on le crée localement si pas dispo globalement
     try:
         from echo_api import client_openrouter as _client_or
     except ImportError:
@@ -688,6 +524,7 @@ def run_world_cascade(continent: str, messages: list, attempt: int = 0) -> str:
         "cn": [
             (client_deepseek, WORLD_MODELS["cn_1"], 20.0),
             (client_zai,      WORLD_MODELS["cn_2"], 20.0),
+            (client_requesty, WORLD_MODELS["cn_3"], 25.0),  # Qwen3-235B fallback
         ],
         "eu": [
             (client_requesty, WORLD_MODELS["eu_1"], 20.0),
@@ -704,79 +541,52 @@ def run_world_cascade(continent: str, messages: list, attempt: int = 0) -> str:
         except Exception as e:
             print(f"[WORLD][{continent.upper()}] {model_name} échec ({e})")
 
-    # Retry complet une fois
     if attempt < 1:
-        print(f"[WORLD][{continent.upper()}] Retry complet (attempt {attempt + 1})...")
-        import time
+        print(f"[WORLD][{continent.upper()}] Retry complet...")
         time.sleep(1.0)
         return run_world_cascade(continent, messages, attempt + 1)
 
     return "Service temporairement indisponible pour ce continent."
 
-
-# ── /world/conversation ────────────────────────────────────────────────────────
+# ── /world/conversation ───────────────────────────────────────────────────────
 @site2_bp.route("/world/conversation", methods=["POST"])
 def world_conversation():
-    """
-    Body JSON attendu:
-    {
-        "question":  "Ta question",
-        "continent": "na" | "cn" | "eu",
-        "lang":      "fr" | "en" | "zh",
-        "context":   "Réponses précédentes (string)",
-        "isFinal":   true | false,
-        "maxChars":  300
-    }
-    """
     try:
+        from prompts_world import get_world_system_prompt, get_world_user_prompt
+
         data      = request.json or {}
         question  = (data.get("question")  or "").strip()
         continent = (data.get("continent") or "eu").strip().lower()
         lang      = (data.get("lang")      or "fr").strip().lower()
         context   = (data.get("context")   or "").strip()
         is_final  = bool(data.get("isFinal", False))
-        max_chars = int(data.get("maxChars", 300))
+        round_num = int(data.get("round",    1))
+        max_chars = int(data.get("maxChars", 420))
 
         if not question:
             return jsonify({"error": "Question vide"}), 400
-
         if continent not in ("na", "cn", "eu"):
             continent = "eu"
         if lang not in ("fr", "en", "zh"):
             lang = "fr"
 
-        # System prompt du continent dans la bonne langue
-        system_prompt = WORLD_SYSTEM_PROMPTS[continent][lang]
+        # FIX 2 — tronquer le contexte pour éviter les réponses vides sur contexte trop long
+        if len(context) > 900:
+            context = context[-900:]
 
-        # Construction du message user avec contexte
-        if lang == "fr":
-            user_content = f'Question posée au monde : "{question}"\n\n'
-            if context:
-                user_content += f"=== Réponses des autres continents ===\n{context}\n\n"
-            if is_final:
-                user_content += f"C'est TON TOUR DE CONCLURE. Tu as le dernier mot. Tranche clairement. MAX {max_chars} caractères."
-            else:
-                user_content += f"Donne ta perspective. MAX {max_chars} caractères."
-        elif lang == "en":
-            user_content = f'Question asked to the world: "{question}"\n\n'
-            if context:
-                user_content += f"=== Other continents' responses ===\n{context}\n\n"
-            if is_final:
-                user_content += f"It's YOUR TURN TO CONCLUDE. You have the final word. Be clear. MAX {max_chars} characters."
-            else:
-                user_content += f"Give your perspective. MAX {max_chars} characters."
-        else:  # zh
-            user_content = f'向世界提出的问题："{question}"\n\n'
-            if context:
-                user_content += f"=== 其他大陆的回应 ===\n{context}\n\n"
-            if is_final:
-                user_content += f"现在轮到你总结。你有最终发言权。请明确表态。最多{max_chars}字符。"
-            else:
-                user_content += f"请给出你的观点。最多{max_chars}字符。"
+        system_prompt = get_world_system_prompt(continent, lang)
+        user_prompt   = get_world_user_prompt(
+            question=question,
+            continent=continent,
+            lang=lang,
+            context=context,
+            round_num=round_num,
+            is_final=is_final,
+        )
 
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user",   "content": user_content},
+            {"role": "user",   "content": user_prompt},
         ]
 
         response_text = run_world_cascade(continent, messages)
