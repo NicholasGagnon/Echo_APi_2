@@ -473,8 +473,8 @@ def call_world_model(client, model_name: str, messages: list, timeout: float = 2
     res = client.chat.completions.create(
         model=model_name,
         messages=messages,
-        temperature=0.7,
-        max_tokens=250,
+        temperature=0.5,
+        max_tokens=1200,
         timeout=timeout,
     )
     choice        = res.choices[0]
@@ -506,7 +506,7 @@ def call_world_model(client, model_name: str, messages: list, timeout: float = 2
     content = content.strip()
     if not content:
         raise ValueError(f"Réponse vide de {model_name} (finish_reason={finish_reason})")
-    return _strip_markdown(content)[:420]
+    return _strip_markdown(content)[:672]
 
 def run_world_cascade(continent: str, messages: list, attempt: int = 0) -> str:
     from echo_api import client_deepseek, client_zai
@@ -522,9 +522,9 @@ def run_world_cascade(continent: str, messages: list, attempt: int = 0) -> str:
             (_client_or,      WORLD_MODELS["na_3"], 25.0),
         ],
         "cn": [
-            (client_deepseek, WORLD_MODELS["cn_1"], 20.0),
-            (client_zai,      WORLD_MODELS["cn_2"], 20.0),
-            (client_requesty, WORLD_MODELS["cn_3"], 25.0),  # Qwen3-235B fallback
+            (client_deepseek, WORLD_MODELS["cn_1"], 60.0),
+            (client_zai,      WORLD_MODELS["cn_2"], 60.0),
+            (client_requesty, WORLD_MODELS["cn_3"], 60.0),  # Qwen3-235B fallback
         ],
         "eu": [
             (client_requesty, WORLD_MODELS["eu_1"], 20.0),
