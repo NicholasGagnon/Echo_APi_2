@@ -528,8 +528,9 @@ def call_world_model(client, model_name: str, messages: list, timeout: float = 2
                         # Prendre ce qui suit le marker
                         after = alt_str[pos:]
                         # Enlever le marker lui-même et les lignes de formatage
-                        lines = after.split('\n')
+                        lines = after.splitlines()
                         clean_lines = []
+                    
                         for line in lines[1:]:
                             line = line.strip().lstrip('*').lstrip('#').lstrip('-').strip()
                             # Enlever les prefixes comme "    Je propose..."
