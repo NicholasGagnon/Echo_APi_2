@@ -467,6 +467,24 @@ def _strip_markdown(text: str) -> str:
     text = re.sub(r'`([^`]+)`',       r'\1', text)
     return text.strip()
 
+
+def _clean_cut(text: str, max_chars: int) -> str:
+    """Coupe proprement a la derniere phrase complete avant max_chars."""
+    if len(text) <= max_chars:
+        return text
+    truncated = text[:max_chars]
+    last_end = -1
+    for punct in [". ", "! ", "? ", ".\n", "!\n", "?\n"]:
+        pos = truncated.rfind(punct)
+        if pos > last_end:
+            last_end = pos
+    if last_end > max_chars // 2:
+        return truncated[:last_end + 1].strip()
+    last_space = truncated.rfind(" ")
+    if last_space > max_chars // 2:
+        return truncated[:last_space].strip() + "\u2026"
+    return truncated.strip() + "\u2026"
+
 def call_world_model(client, model_name: str, messages: list, timeout: float = 20.0) -> str:
     if client is None:
         raise RuntimeError(f"Client non configuré pour {model_name}")
@@ -506,7 +524,7 @@ def call_world_model(client, model_name: str, messages: list, timeout: float = 2
     content = content.strip()
     if not content:
         raise ValueError(f"Réponse vide de {model_name} (finish_reason={finish_reason})")
-    return _strip_markdown(content)[:672]
+    return _clean_cut(_strip_markdown(content), 672)
 
 def run_world_cascade(continent: str, messages: list, attempt: int = 0) -> str:
     from echo_api import client_deepseek, client_zai
