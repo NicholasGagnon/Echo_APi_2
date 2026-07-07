@@ -8,7 +8,7 @@ from openai import OpenAI
 
 site2_bp = Blueprint("site2", __name__)
 
-ERR_CRASH = {"action": None, "response": "Une erreur inattendue s'est produite. Reessaie dans quelques secondes."}
+ERR_CRASH = {"action": None, "response": "salut"}
 
 resend.api_key = os.getenv("RESEND_API_KEY", "")
 RESEND_FROM = os.getenv("RESEND_FROM", "Echo AI <support@echosai.ca>")
