@@ -1365,23 +1365,15 @@ def analyse_avis():
 
 # ── WARMUP AVEC LING ──────────────────────────────────────────────────────────
 def _warmup_api():
-    """Warmup initial : réveille Ling et Echo au démarrage du serveur"""
+    """Warmup initial : réveille Ling, Echo et World au démarrage du serveur"""
     try:
         print("[BOOST] Reveil des routes Echo...")
         _requests_lib.get("http://127.0.0.1:5000/ping", timeout=2)
-        
+
         # Warmup Ling pour la classification d'intentions
         print("[BOOST] Warmup de Ling (classification d'intentions)...")
         try:
             if client_openrouter is not None:
-                warmup_ctx = {
-                    "system_prompt": "Tu es un classificateur d'intentions. Réponds en JSON minimaliste.",
-                    "output_tokens": 100,
-                    "messages_openai": [
-                        {"role": "system", "content": "Tu es un classificateur d'intentions."},
-                        {"role": "user", "content": "Classifie ceci : 'comment faire un gâteau'"},
-                    ],
-                }
                 _requests_lib.post(
                     "http://127.0.0.1:5000/horizon-warmup",
                     json={"partial": "comment"},
@@ -1390,7 +1382,19 @@ def _warmup_api():
                 print("[BOOST] Ling warmup réussi")
         except Exception as e:
             print(f"[BOOST] Ling warmup optionnel échoué: {e}")
-    
+
+        # Warmup World — réveille les modèles de cascade
+        print("[BOOST] Warmup de World...")
+        try:
+            _requests_lib.post(
+                "http://127.0.0.1:5000/world/warmup",
+                json={},
+                timeout=6,
+            )
+            print("[BOOST] World warmup réussi")
+        except Exception as e:
+            print(f"[BOOST] World warmup optionnel échoué: {e}")
+
     except Exception:
         pass
 

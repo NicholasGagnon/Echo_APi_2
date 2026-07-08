@@ -8,7 +8,7 @@ from openai import OpenAI
 
 site2_bp = Blueprint("site2", __name__)
 
-ERR_CRASH = {"action": None, "response": "salut"}
+ERR_CRASH = {"action": None, "response": "Une erreur inattendue s'est produite. Reessaie dans quelques secondes."}
 
 resend.api_key = os.getenv("RESEND_API_KEY", "")
 RESEND_FROM = os.getenv("RESEND_FROM", "Echo AI <support@echosai.ca>")
@@ -528,9 +528,8 @@ def call_world_model(client, model_name: str, messages: list, timeout: float = 2
                         # Prendre ce qui suit le marker
                         after = alt_str[pos:]
                         # Enlever le marker lui-même et les lignes de formatage
-                        lines = after.splitlines()
+                        lines = after.split('\n')
                         clean_lines = []
-                    
                         for line in lines[1:]:
                             line = line.strip().lstrip('*').lstrip('#').lstrip('-').strip()
                             # Enlever les prefixes comme "    Je propose..."
@@ -596,6 +595,51 @@ def run_world_cascade(continent: str, messages: list, attempt: int = 0) -> str:
 
     return "Service temporairement indisponible pour ce continent."
 
+# ── /world/warmup — réveille les modèles World au démarrage ─────────────────
+@site2_bp.route("/world/warmup", methods=["POST"])
+def world_warmup():
+    """
+    Ping léger sur les 3 cascades World pour réveiller Render.
+    Utilise des modèles ultra-légers via OpenRouter warmup client.
+    """
+    try:
+        from echo_api import client_openrouter_warmup
+    except ImportError:
+        return jsonify({"status": "no_client"}), 200
+
+    warmup_models = [
+        "inclusionai/ling-2.6-flash",
+        "amazon/nova-lite-v1",
+        "mistralai/ministral-3b-2512",
+    ]
+    warmup_msg = [
+        {"role": "system", "content": "You are a warmup ping. Reply with one word only."},
+        {"role": "user",   "content": "ping"},
+    ]
+    results = {}
+    for model in warmup_models:
+        try:
+            if client_openrouter_warmup is None:
+                break
+            res = client_openrouter_warmup.chat.completions.create(
+                model=model,
+                messages=warmup_msg,
+                temperature=0.1,
+                max_tokens=5,
+                timeout=5.0,
+            )
+            content_r = res.choices[0].message.content
+            if content_r:
+                results[model] = "ok"
+                print(f"[WORLD WARMUP] {model} OK")
+                break
+        except Exception as e:
+            results[model] = f"fail: {e}"
+            print(f"[WORLD WARMUP] {model} échec ({e})")
+
+    return jsonify({"status": "warmed", "results": results}), 200
+
+
 # ── /world/conversation ───────────────────────────────────────────────────────
 @site2_bp.route("/world/conversation", methods=["POST"])
 def world_conversation():
@@ -603,6 +647,12 @@ def world_conversation():
         from prompts_world import get_world_system_prompt, get_world_user_prompt
 
         data      = request.json or {}
+
+        # Warmup ping — retourner immédiatement sans appeler les modèles
+        if data.get("warmup"):
+            print("[WORLD] Warmup ping reçu — serveur prêt")
+            return jsonify({"status": "warm"}), 200
+
         question  = (data.get("question")  or "").strip()
         continent = (data.get("continent") or "eu").strip().lower()
         lang      = (data.get("lang")      or "fr").strip().lower()
