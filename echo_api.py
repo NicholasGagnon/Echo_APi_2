@@ -2,6 +2,7 @@
 import io
 import re
 import sys
+import time
 import logging
 logging.basicConfig(level=logging.INFO, stream=sys.stdout, force=True)
 import json
@@ -27,17 +28,20 @@ from site2 import site2_bp
 app.register_blueprint(site2_bp)
 
 # ── MODÈLES ────────────────────────────────────────────────────────────────────
+# NOTE : gemini-3.1-flash-lite (gemini_paid_ultra) retiré completement — prix trop eleve.
+# NOTE : tencent/hy3-preview retiré (ne répondait presque jamais) — remplacé par Grok-4-Fast
+#        (reasoning) via Requesty partout où hy3 était utilisé.
+# NOTE : openrouter/owl-alpha retiré (gratuit peu fiable, 404 sur OpenRouter).
+# NOTE : GLM-4.5-Air retiré des cascades actives (modèles peu fiables) — clé Z.AI et
+#        fonction call_glm() conservées pour tests futurs, non appelées activement.
 MODELS = {
     "gemini_paid_founder":  "gemini-3.5-flash",
-    "gemini_paid_ultra":    "gemini-3.1-flash-lite",
     "gemini_paid_standard": "gemini-2.5-flash-lite",
-    "mistral":    "amazon/nova-lite-v1",
-    "hy3":        "tencent/hy3-preview",
-    "owl":        "openrouter/owl-alpha",
+    "grok_reasoning": "xai/grok-4-fast",     # Requesty — remplace tencent (hy3) partout
     "llama":      "meta-llama/llama-3.3-70b-instruct",
     "ling":       "inclusionai/ling-2.6-flash",
     "deepseek":   "deepseek-v4-flash",
-    "glm":        "GLM-4.5-Air",
+    "glm":        "GLM-4.5-Air",              # conservé pour tests futurs — non utilisé activement
 }
 
 FREE_MAX_TOKENS = 2_500
@@ -48,6 +52,7 @@ API_KEY_PAID          = os.getenv("API_KEY_PAID", "").strip()
 OPENROUTER_API_KEY    = os.getenv("OPENROUTER_API_KEY", "").strip()
 DEEPSEEK_API_KEY      = os.getenv("DEEPSEEK_API_KEY", "").strip()
 ZAI_API_KEY           = os.getenv("ZAI_API_KEY", "").strip()
+REQUESTY_API_KEY      = os.getenv("REQUESTY_API_KEY", "").strip()
 CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
 
 client_gemini_paid = genai.Client(api_key=API_KEY_PAID) if API_KEY_PAID else None
@@ -73,6 +78,10 @@ client_deepseek = (
 client_zai = (
     OpenAI(base_url="https://api.z.ai/api/paas/v4", api_key=ZAI_API_KEY, http_client=_shared_http_client)
     if ZAI_API_KEY else None
+)
+client_requesty = (
+    OpenAI(base_url="https://router.requesty.ai/v1", api_key=REQUESTY_API_KEY, http_client=_shared_http_client)
+    if REQUESTY_API_KEY else None
 )
 
 _cf_session = _requests_lib.Session()
@@ -379,6 +388,21 @@ def call_openrouter(model_key, ctx, temp=0.5, timeout=20.0):
         raise ValueError(f"Reponse vide de {model_key}")
     return content
 
+def call_requesty(model_key, ctx, temp=0.5, timeout=20.0):
+    if client_requesty is None:
+        raise RuntimeError("Requesty non configuré")
+    res = client_requesty.chat.completions.create(
+        model=MODELS[model_key],
+        messages=ctx["messages_openai"],
+        temperature=temp,
+        max_tokens=ctx.get("output_tokens", FREE_MAX_TOKENS),
+        timeout=timeout,
+    )
+    content = res.choices[0].message.content
+    if content is None:
+        raise ValueError(f"Reponse vide de {model_key}")
+    return content
+
 def call_deepseek(ctx, temp=0.5, timeout=20.0):
     if client_deepseek is None:
         raise RuntimeError("DeepSeek non configuré")
@@ -395,6 +419,7 @@ def call_deepseek(ctx, temp=0.5, timeout=20.0):
     return content
 
 def call_glm(ctx, temp=0.5, timeout=20.0):
+    # Conservé pour tests futurs — non appelé activement dans les cascades.
     if client_zai is None:
         raise RuntimeError("Z.AI non configuré")
     res = client_zai.chat.completions.create(
@@ -424,9 +449,34 @@ def _dispatch_step(provider, model_key, ctx, timeout, parser):
     elif provider == "z":
         r = call_glm(ctx, temp=0.5, timeout=float(timeout))
         return parser(r)
+    elif provider == "rq":
+        r = call_requesty(model_key, ctx, temp=0.5, timeout=float(timeout))
+        return parser(r)
     else:  # "or"
         r = call_openrouter(model_key, ctx, temp=0.5, timeout=float(timeout))
         return parser(r)
+
+def _run_simple_cascade(steps, ctx, parser=None):
+    """Cascade simple sans logique de quota — utilisée pour les routes à cascade fixe (vitality, etc.)."""
+    if parser is None:
+        parser = clean_and_parse_json
+    for provider, model_key, timeout in steps:
+        if provider == "or" and client_openrouter is None:
+            continue
+        if provider == "ds" and client_deepseek is None:
+            continue
+        if provider == "rq" and client_requesty is None:
+            continue
+        if provider == "z" and client_zai is None:
+            continue
+        if is_model_locked(model_key):
+            continue
+        try:
+            return _dispatch_step(provider, model_key, ctx, timeout, parser)
+        except Exception as e:
+            print(f"[CASCADE] Echec {model_key} ({e})")
+            lock_model(model_key, 30)
+    return ERR_FINAL
 
 # ── CASCADE PAYANTE PAR TIER (NE COUVRE PAS /vitality) ─────────────────────────
 # Utilisée par /home, /chat, /history (payant). Cascade différente selon basic/premium/ultra/founder.
@@ -436,9 +486,9 @@ def run_paid_cascade(ctx, page_timeout: int = 10):
 
     if tier == "basic":
         steps = [
-            ("ds", "deepseek", t),
-            ("or", "llama",    t),
-            ("or", "hy3",      t),
+            ("ds", "deepseek",       t),
+            ("or", "llama",          t),
+            ("rq", "grok_reasoning", t),
         ]
     elif tier == "premium":
         steps = [
@@ -448,14 +498,14 @@ def run_paid_cascade(ctx, page_timeout: int = 10):
         ]
     elif tier == "ultra":
         steps = [
-            ("ds", "deepseek",          t),
-            ("g",  "gemini_paid_ultra", t),
-            ("ds", "deepseek",          t),
+            ("ds", "deepseek",       t),
+            ("rq", "grok_reasoning", t),
+            ("ds", "deepseek",       t),
         ]
     else:  # founder
         steps = [
             ("g",  "gemini_paid_founder", t),
-            ("g",  "gemini_paid_ultra",   t),
+            ("ds", "deepseek",            t),
             ("ds", "deepseek",            t),
         ]
 
@@ -481,6 +531,8 @@ def run_free_cascade(steps, ctx, parser=None, is_horizon=False):
         if provider == "ds" and client_deepseek is None:
             continue
         if provider == "z" and client_zai is None:
+            continue
+        if provider == "rq" and client_requesty is None:
             continue
         if is_model_locked(model_key):
             continue
@@ -560,7 +612,7 @@ def horizon_warmup():
         return jsonify({"status": "error"})
 
 # ── /home ──────────────────────────────────────────────────────────────────────
-# FREE : DeepSeek → tencent (hy3) → Llama
+# FREE : DeepSeek → Grok-4-Fast (Requesty) → Llama
 @app.route("/home", methods=["POST"])
 def home():
     try:
@@ -569,9 +621,9 @@ def home():
         if is_paid_tier(ctx["user_tier"]):
             return jsonify(run_paid_cascade(ctx, page_timeout=10))
         steps = [
-            ("ds", "deepseek",  8),
-            ("or", "hy3",      12),
-            ("or", "llama",    15),
+            ("ds", "deepseek",        8),
+            ("rq", "grok_reasoning", 12),
+            ("or", "llama",          15),
         ]
         return jsonify(run_free_cascade(steps, ctx))
     except Exception as e:
@@ -579,7 +631,7 @@ def home():
         return jsonify(ERR_CRASH), 500
 
 # ── /chat ──────────────────────────────────────────────────────────────────────
-# FREE : DeepSeek → tencent (hy3) → Llama
+# FREE : DeepSeek → Grok-4-Fast (Requesty) → Llama
 @app.route("/chat", methods=["POST"])
 def chat():
     try:
@@ -588,9 +640,9 @@ def chat():
         if is_paid_tier(ctx["user_tier"]):
             return jsonify(run_paid_cascade(ctx, page_timeout=10))
         steps = [
-            ("ds", "deepseek",  8),
-            ("or", "hy3",      12),
-            ("or", "llama",    15),
+            ("ds", "deepseek",        8),
+            ("rq", "grok_reasoning", 12),
+            ("or", "llama",          15),
         ]
         return jsonify(run_free_cascade(steps, ctx))
     except Exception as e:
@@ -598,36 +650,19 @@ def chat():
         return jsonify(ERR_CRASH), 500
 
 # ── /vitality ─────────────────────────────────────────────────────────────────
-# INTACT : seule route où GLM → DeepSeek → Llama reste en place, FREE et PAYANT.
-def _run_vitality_paid_cascade(ctx, page_timeout: int = 20):
-    tier = ctx["user_tier"]
-    steps = [
-        ("z",  "glm",      15),
-        ("ds", "deepseek", page_timeout),
-        ("or", "llama",    page_timeout),
-    ]
-    for provider, model_key, timeout in steps:
-        if is_model_locked(model_key):
-            continue
-        try:
-            return _dispatch_step(provider, model_key, ctx, timeout, clean_and_parse_json)
-        except Exception as e:
-            print(f"[PAID VITALITY {tier}] Echec {model_key} ({e})")
-            lock_model(model_key, 30)
-    return ERR_FINAL
-
+# Cascade unique (free ET payant) : DeepSeek → Llama → DeepSeek. GLM retiré.
 @app.route("/vitality", methods=["POST"])
 def vitality():
     try:
         data = request.json or {}
         ctx  = prepare_shared_context(data, source_override="vitality")
         steps = [
-            ("z",  "glm",      15),
             ("ds", "deepseek", 20),
             ("or", "llama",    20),
+            ("ds", "deepseek", 20),
         ]
         if is_paid_tier(ctx["user_tier"]):
-            result = _run_vitality_paid_cascade(ctx, page_timeout=20)
+            result = _run_simple_cascade(steps, ctx)
         else:
             result = run_free_cascade(steps, ctx)
         print(f"[VITALITY] action retournée: {result.get('action')}")
@@ -637,7 +672,7 @@ def vitality():
         return jsonify(ERR_CRASH), 500
 
 # ── /history ──────────────────────────────────────────────────────────────────
-# FREE fallback (après owl) : DeepSeek garde sa place, GLM passe en dernier
+# FREE : DeepSeek → Llama (owl retiré, amplement suffisant)
 @app.route("/history", methods=["POST"])
 def history():
     try:
@@ -645,31 +680,17 @@ def history():
         ctx  = prepare_shared_context(data, source_override="history")
         if is_paid_tier(ctx["user_tier"]):
             return jsonify(run_paid_cascade(ctx, page_timeout=12))
-        if get_failover_count() >= MAX_FREE_FAILOVERS:
-            return jsonify(ERR_QUOTA)
-        result = None
-        if not is_model_locked("owl"):
-            try:
-                r      = call_openrouter("owl", ctx, temp=0.5, timeout=15.0)
-                result = clean_and_parse_json(r)
-                print("[HISTORY] owl-alpha OK")
-            except Exception as e:
-                print(f"[HISTORY] owl-alpha echec ({e})")
-            finally:
-                lock_model("owl", 60)
-        if result is None:
-            fallback_steps = [
-                ("or", "mistral",  20),
-                ("ds", "deepseek", 20),
-            ]
-            result = run_free_cascade(fallback_steps, ctx)
-        return jsonify(result)
+        steps = [
+            ("ds", "deepseek", 15),
+            ("or", "llama",    15),
+        ]
+        return jsonify(run_free_cascade(steps, ctx))
     except Exception as e:
         print(f"Erreur /history: {e}")
         return jsonify(ERR_CRASH), 500
 
 # ── /books ────────────────────────────────────────────────────────────────────
-# Tous tiers : DeepSeek → Gemini 3.1 Flash Lite → DeepSeek (filet) — INTACT, pas de GLM ici
+# Tous tiers : DeepSeek → DeepSeek → DeepSeek, 2s entre chaque tentative.
 @app.route("/books", methods=["POST"])
 def books():
     try:
@@ -725,53 +746,20 @@ def books():
                 raise ValueError("Reponse vide de deepseek")
             return content
 
-        def run_books_call_gemini_flash(timeout):
-            gemini_hist = []
-            for msg in history[-10:]:
-                if msg.startswith("You: "):
-                    gemini_hist.append(types.Content(role="user",  parts=[types.Part.from_text(text=msg[5:])]))
-                elif msg.startswith("Echo: "):
-                    if gemini_hist:
-                        gemini_hist.append(types.Content(role="model", parts=[types.Part.from_text(text=msg[6:])]))
-            gemini_hist.append(types.Content(role="user", parts=[types.Part.from_text(text=message)]))
-            def fn():
-                return client_gemini_paid.models.generate_content(
-                    model=MODELS["gemini_paid_ultra"],
-                    contents=gemini_hist,
-                    config=types.GenerateContentConfig(
-                        system_instruction=system_prompt,
-                        max_output_tokens=output_tokens,
-                        temperature=0.5,
-                    )
-                )
-            resp = call_with_timeout(fn, timeout)
-            if not resp or not resp.text:
-                raise ValueError("Reponse Gemini vide")
-            return resp.text
-
-        books_steps = [
-            ("ds_books",     20),
-            ("gemini_flash", 20),
-            ("ds_books",     25),
-        ]
-
         full_text = ""
-        for provider, timeout in books_steps:
-            try:
-                if provider == "ds_books":
-                    if is_model_locked("deepseek"):
-                        continue
-                    full_text = run_books_call_deepseek(timeout)
-                elif provider == "gemini_flash":
-                    if is_model_locked("gemini_paid_ultra"):
-                        continue
-                    full_text = run_books_call_gemini_flash(timeout)
-                if full_text:
-                    break
-            except Exception as e:
-                model_tag = "deepseek" if provider == "ds_books" else "gemini_paid_ultra"
-                print(f"[BOOKS] Echec {model_tag} ({e})")
-                lock_model(model_tag, 30)
+        for attempt in range(3):
+            if is_model_locked("deepseek"):
+                print(f"[BOOKS] deepseek verrouillé, essai {attempt + 1} sauté")
+            else:
+                try:
+                    full_text = run_books_call_deepseek(20)
+                    if full_text:
+                        break
+                except Exception as e:
+                    print(f"[BOOKS] Echec deepseek (essai {attempt + 1}) ({e})")
+                    lock_model("deepseek", 30)
+            if attempt < 2:
+                time.sleep(2.0)
 
         if not full_text:
             return jsonify({"response": ERR_FINAL["response"], "inject": False, "action": None})
@@ -788,7 +776,7 @@ def books():
         return jsonify({"response": ERR_CRASH["response"], "inject": False, "action": None}), 500
 
 # ── /horizon ──────────────────────────────────────────────────────────────────
-# INTACT : pas de GLM dans cette route
+# gemini_paid_standard (2.5 Flash Lite) — seul modèle groundé — répété 3x avec 3s entre chaque essai.
 @app.route("/horizon", methods=["POST"])
 def horizon():
     try:
@@ -842,33 +830,20 @@ def horizon():
         }
 
         parsed = None
-        horizon_steps = [
-            ("gs", "gemini_paid_standard", 8),
-            ("gs", "gemini_paid_ultra",    8),
-            ("ds", "deepseek",             8),
-        ]
-
         for attempt in range(3):
-            for provider, model_key, timeout in horizon_steps:
-                try:
-                    print(f"[HORIZON] Pass {attempt+1} — {model_key}")
-                    if provider == "gs":
-                        r      = call_gemini_with_search(client_gemini_paid, model_key, ctx, timeout=timeout, temperature=0.5)
-                        parsed = clean_and_parse_horizon_json(r.text)
-                    else:
-                        r      = call_deepseek(ctx, temp=0.5, timeout=float(timeout))
-                        parsed = clean_and_parse_horizon_json(r)
-                    if parsed.get("response", "").strip():
-                        print(f"[HORIZON] Succes — {model_key}")
-                        break
-                    else:
-                        print(f"[HORIZON] Reponse vide — {model_key}")
-                except Exception as e:
-                    print(f"[HORIZON] Echec {model_key} ({e})")
-            if parsed and parsed.get("response", "").strip():
-                break
+            try:
+                print(f"[HORIZON] Tentative {attempt + 1}/3 — gemini_paid_standard")
+                r      = call_gemini_with_search(client_gemini_paid, "gemini_paid_standard", ctx, timeout=10, temperature=0.5)
+                parsed = clean_and_parse_horizon_json(r.text)
+                if parsed.get("response", "").strip():
+                    print(f"[HORIZON] Succes — tentative {attempt + 1}")
+                    break
+                else:
+                    print(f"[HORIZON] Reponse vide — tentative {attempt + 1}")
+            except Exception as e:
+                print(f"[HORIZON] Echec tentative {attempt + 1} ({e})")
             if attempt < 2:
-                print(f"[HORIZON] Retry complet pass {attempt+2}...")
+                time.sleep(3.0)
 
         if not parsed or not parsed.get("response", "").strip():
             return jsonify(ERR_HORIZON)
@@ -885,7 +860,6 @@ def horizon():
         return jsonify(ERR_HORIZON), 500
 
 # ── /memory-summary ───────────────────────────────────────────────────────────
-# INTACT : pas de GLM dans cette route
 @app.route("/memory-summary", methods=["POST"])
 def memory_summary():
     try:
@@ -1159,11 +1133,12 @@ def export_route():
         print(f"[EXPORT ERROR] {fmt}: {e}")
         return jsonify({"error": str(e)}), 500
 
-# ── /api/analyse-avis — Scanner Sonar (Perplexity) via OpenRouter ───────────
+# ── /api/analyse-avis — Scanner Sonar via OpenRouter ─────────────────────────
+# Cascade : GPT-4o-Mini-Search → (2s) → GPT-4o-Mini-Search → Llama.
 @app.route("/api/analyse-avis", methods=["POST"])
 def analyse_avis():
     """
-    Route pour analyser les avis d'un produit via Perplexity Sonar (web search natif).
+    Route pour analyser les avis d'un produit via GPT-4o-mini-search (web search natif).
     Accepte : {"url": "https://amazon.ca/..."}
     Retourne : {"product_name": "...", "positives": [...], "negatives": [...]}
     """
@@ -1179,8 +1154,6 @@ def analyse_avis():
         if client_openrouter is None:
             logging.info("[ANALYSE] ERREUR: client_openrouter est None")
             return jsonify({"error": "OpenRouter non configure"}), 503
-
-        logging.info(f"[ANALYSE] OpenRouter OK, DeepSeek: {client_deepseek is not None}")
 
         # Extraire l'ASIN si URL Amazon
         asin_match = re.search(r"/dp/([A-Z0-9]{10})", url)
@@ -1216,11 +1189,10 @@ def analyse_avis():
             {"role": "user", "content": user_prompt},
         ]
 
-        logging.info(f"[ANALYSE] gpt-4o-mini-search-preview : {url}")
         raw_response = None
 
-        # Tentative 1 : GPT-4o Mini Search (web search natif, cheap)
-        if client_openrouter is not None:
+        # Tentative 1 & 2 : GPT-4o Mini Search, avec 2s entre les deux essais
+        for attempt in range(2):
             try:
                 res = client_openrouter.chat.completions.create(
                     model="openai/gpt-4o-mini-search-preview",
@@ -1230,26 +1202,15 @@ def analyse_avis():
                     timeout=30.0,
                 )
                 raw_response = res.choices[0].message.content
-                logging.info("[ANALYSE] GPT-4o-mini-search OK")
+                if raw_response:
+                    logging.info(f"[ANALYSE] GPT-4o-mini-search OK (essai {attempt + 1})")
+                    break
             except Exception as e:
-                logging.info(f"[ANALYSE] GPT-4o-mini-search echec ({e}), fallback DeepSeek...")
+                logging.info(f"[ANALYSE] GPT-4o-mini-search echec (essai {attempt + 1}) ({e})")
+            if attempt == 0:
+                time.sleep(2.0)
 
-        # Tentative 2 : DeepSeek (connaissance training)
-        if not raw_response and client_deepseek is not None:
-            try:
-                res = client_deepseek.chat.completions.create(
-                    model=MODELS["deepseek"],
-                    messages=messages,
-                    temperature=0.3,
-                    max_tokens=700,
-                    timeout=20.0,
-                )
-                raw_response = res.choices[0].message.content
-                logging.info("[ANALYSE] DeepSeek fallback OK")
-            except Exception as e:
-                logging.info(f"[ANALYSE] DeepSeek echec ({e})")
-
-        # Tentative 3 : Llama
+        # Tentative 3 : Llama (fallback final)
         if not raw_response and client_openrouter is not None:
             try:
                 res = client_openrouter.chat.completions.create(

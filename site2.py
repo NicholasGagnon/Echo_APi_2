@@ -215,24 +215,27 @@ def notifier_interet():
         return jsonify(ERR_CRASH), 500
 
 # ── /1/conversation ───────────────────────────────────────────────────────────
+# Cascade : DeepSeek ➔ Grok-4-Fast-Non-Reasoning (Requesty) ➔ DeepSeek — même cascade pour tous les tiers.
 @site2_bp.route("/1/conversation", methods=["POST"])
 def site2_conversation():
-    from echo_api import prepare_shared_context, run_paid_cascade, run_free_cascade, is_paid_tier
+    from echo_api import prepare_shared_context, call_deepseek
     try:
         data = request.json or {}
         ctx  = prepare_shared_context(data, source_override="chat")
-        if client_requesty is not None:
-            for model_key in ("grok", "qwen3"):
-                try:
-                    raw    = call_requesty(model_key, ctx["messages_openai"], temp=0.5, timeout=20.0, max_tokens=ctx.get("output_tokens", 2500))
-                    result = clean_and_parse_json_site2(raw)
-                    return jsonify(result)
-                except Exception as e:
-                    print(f"[SITE2] {model_key}/Requesty echec ({e})")
-        if is_paid_tier(ctx["user_tier"]):
-            return jsonify(run_paid_cascade(ctx, page_timeout=15))
-        steps = [("ds", "deepseek", 8), ("z", "glm", 15), ("or", "llama", 12)]
-        return jsonify(run_free_cascade(steps, ctx))
+
+        steps = [("ds", None, 20), ("rq", "grok", 20), ("ds", None, 20)]
+        for provider, model_key, timeout in steps:
+            try:
+                if provider == "ds":
+                    raw = call_deepseek(ctx, temp=0.5, timeout=float(timeout))
+                else:
+                    raw = call_requesty(model_key, ctx["messages_openai"], temp=0.5,
+                                         timeout=float(timeout), max_tokens=ctx.get("output_tokens", 2500))
+                return jsonify(clean_and_parse_json_site2(raw))
+            except Exception as e:
+                tag = "deepseek" if provider == "ds" else model_key
+                print(f"[SITE2 CONVERSATION] Echec {tag} ({e})")
+        return jsonify(ERR_CRASH)
     except Exception as e:
         print(f"Erreur /1/conversation: {e}")
         return jsonify(ERR_CRASH), 500
@@ -328,10 +331,9 @@ def generate_invoice():
         return jsonify({"error": str(e)}), 500
 
 # ── /2/analyse-idee ───────────────────────────────────────────────────────────
+# Cascade : Grok-4-Fast-Non-Reasoning ➔ (2s) ➔ Grok-4-Fast-Non-Reasoning ➔ Grok-4-Fast (reasoning) — tout via Requesty.
 @site2_bp.route("/2/analyse-idee", methods=["POST"])
 def analyse_idee():
-    from echo_api import client_deepseek, client_gemini_paid, client_zai, MODELS
-    from google.genai import types as gtypes
     from prompts2 import get_idea_system_prompt, get_idea_user_prompt
     import json
 
@@ -345,32 +347,31 @@ def analyse_idee():
         user_prompt   = get_idea_user_prompt(idea, lang)
         messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
         raw = None
+
         if client_requesty is not None:
-            try:
-                res = client_requesty.chat.completions.create(
-                    model="xai/grok-4-fast-non-reasoning", messages=messages, temperature=0.3, max_tokens=1200, timeout=25.0)
-                raw = (res.choices[0].message.content or "").strip() or None
-                if raw: print("[IDEA] Grok-4-fast-non-reasoning OK")
-            except Exception as e:
-                print(f"[IDEA] Grok echec ({e})")
-        if not raw and client_gemini_paid is not None:
-            try:
-                r = client_gemini_paid.models.generate_content(
-                    model=MODELS["gemini_paid_ultra"],
-                    contents=[{"role": "user", "parts": [gtypes.Part.from_text(text=user_prompt)]}],
-                    config=gtypes.GenerateContentConfig(system_instruction=system_prompt, max_output_tokens=1200, temperature=0.3))
-                raw = (r.text or "").strip() or None
-                if raw: print("[IDEA] Gemini OK")
-            except Exception as e:
-                print(f"[IDEA] Gemini echec ({e})")
+            for attempt in range(2):
+                try:
+                    res = client_requesty.chat.completions.create(
+                        model="xai/grok-4-fast-non-reasoning", messages=messages,
+                        temperature=0.3, max_tokens=1200, timeout=25.0)
+                    raw = (res.choices[0].message.content or "").strip() or None
+                    if raw:
+                        print(f"[IDEA] Grok-4-Fast-Non-Reasoning OK (essai {attempt + 1})")
+                        break
+                except Exception as e:
+                    print(f"[IDEA] Grok-4-Fast-Non-Reasoning echec (essai {attempt + 1}) ({e})")
+                if attempt == 0:
+                    time.sleep(2.0)
+
         if not raw and client_requesty is not None:
             try:
                 res = client_requesty.chat.completions.create(
                     model="xai/grok-4-fast", messages=messages, temperature=0.3, max_tokens=1200, timeout=25.0)
                 raw = (res.choices[0].message.content or "").strip() or None
-                if raw: print("[IDEA] Grok-4-fast OK")
+                if raw: print("[IDEA] Grok-4-Fast OK")
             except Exception as e:
-                print(f"[IDEA] Grok-4-fast echec ({e})")
+                print(f"[IDEA] Grok-4-Fast echec ({e})")
+
         if not raw:
             return jsonify({"error": "Analyse indisponible"}), 503
         text = raw.strip()
@@ -446,11 +447,11 @@ def check_unlock():
 # ══════════════════════════════════════════════════════════════════════════════
 # ── WORLD — CASCADE 3 CONTINENTS ─────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
-
+# NOTE : continent NA — gemini-3.1-flash-lite retiré completement (prix trop eleve).
+# NOTE : continent NA — remplace GPT search (OpenRouter) par un "vrai" GPT via Requesty (gpt-4o-mini).
 WORLD_MODELS = {
     "na_1": "xai/grok-4-fast-non-reasoning",    # Requesty
-    "na_2": "gemini-3.1-flash-lite",             # Requesty
-    "na_3": "openai/gpt-4o-mini-search-preview", # OpenRouter
+    "na_2": "openai/gpt-4o-mini",                # Requesty
     "cn_1": "deepseek-v4-flash",                                    # DeepSeek direct — premier
     "cn_2": "deepinfra/Qwen/Qwen3-235B-A22B-Instruct-2507",            # Requesty — Qwen3-235B
     "cn_3": "deepinfra/Qwen/Qwen3-Coder-480B-A35B-Instruct-Turbo",     # Requesty — Qwen Coder 480B
@@ -550,10 +551,10 @@ def call_world_model(client, model_name: str, messages: list, timeout: float = 2
     content = content.strip()
     if not content:
         raise ValueError(f"Réponse vide de {model_name} (finish_reason={finish_reason})")
-    return _clean_cut(_strip_markdown(content), 672)
+    return _clean_cut(_strip_markdown(content), 650)
 
 def run_world_cascade(continent: str, messages: list, attempt: int = 0) -> str:
-    from echo_api import client_deepseek, client_zai
+    from echo_api import client_deepseek
     try:
         from echo_api import client_openrouter as _client_or
     except ImportError:
@@ -561,9 +562,9 @@ def run_world_cascade(continent: str, messages: list, attempt: int = 0) -> str:
 
     steps = {
         "na": [
-            (client_requesty, WORLD_MODELS["na_1"], 20.0),
-            (client_requesty, WORLD_MODELS["na_2"], 20.0),
-            (_client_or,      WORLD_MODELS["na_3"], 25.0),
+            (client_requesty, WORLD_MODELS["na_1"], 20.0),  # Grok-4-Fast-Non-Reasoning
+            (client_requesty, WORLD_MODELS["na_2"], 20.0),  # GPT-4o-mini (vrai GPT, via Requesty)
+            (client_requesty, WORLD_MODELS["na_1"], 20.0),  # Grok-4-Fast-Non-Reasoning — retry final
         ],
         "cn": [
             (client_deepseek, WORLD_MODELS["cn_1"], 60.0),  # DeepSeek — premier

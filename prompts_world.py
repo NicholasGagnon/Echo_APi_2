@@ -27,7 +27,8 @@ YOUR MISSION:
 
 ABSOLUTE FORMAT RULES:
 - ONE paragraph. No lists. No bullets. No markdown. No dashes. No numbering.
-- Maximum 672 characters.
+- Maximum 650 characters — STOP well before the limit, finish your sentence, do not get cut off.
+- Be concise. Say less, mean more. A sharp short answer beats a long one that gets truncated.
 - {language_instruction}""",
 
         "cn": f"""You are the voice of China in a World Council. You speak for this civilization across ALL topics — not just politics.
@@ -48,7 +49,8 @@ YOUR MISSION:
 
 ABSOLUTE FORMAT RULES:
 - ONE paragraph. No lists. No bullets. No markdown. No dashes. No numbering.
-- Maximum 672 characters.
+- Maximum 650 characters — STOP well before the limit, finish your sentence, do not get cut off.
+- Be concise. Say less, mean more. A sharp short answer beats a long one that gets truncated.
 - {language_instruction}""",
 
         "eu": f"""You are the voice of Europe in a World Council. You speak for this civilization across ALL topics — not just politics.
@@ -69,7 +71,8 @@ YOUR MISSION:
 
 ABSOLUTE FORMAT RULES:
 - ONE paragraph. No lists. No bullets. No markdown. No dashes. No numbering.
-- Maximum 672 characters.
+- Maximum 650 characters — STOP well before the limit, finish your sentence, do not get cut off.
+- Be concise. Say less, mean more. A sharp short answer beats a long one that gets truncated.
 - {language_instruction}""",
     }
 
@@ -99,7 +102,7 @@ def get_world_user_prompt(
             f"You speak first for {my_label}. "
             f"Answer the question directly from your continent's perspective. "
             f"Be concrete, be bold, be specific to the actual topic. "
-            f"One paragraph, max 672 characters. No lists."
+            f"One paragraph, max 650 characters. No lists."
         )
     elif is_final:
         prompt += (
@@ -107,20 +110,20 @@ def get_world_user_prompt(
             f"You have read everything. Give the definitive answer to this specific question. "
             f"Integrate the strongest ideas, add your decisive contribution. "
             f"Stay on the question — this is not a closing speech, it's the answer. "
-            f"One paragraph, max 672 characters. No lists."
+            f"One paragraph, max 650 characters. No lists."
         )
     elif round_num == 2:
         prompt += (
             f"Round 2 for {my_label}. "
             f"Deepen your answer to the question. Take what's valuable from the others and push further. "
             f"Challenge what doesn't work. Keep the focus on the actual topic. "
-            f"One paragraph, max 672 characters. No lists."
+            f"One paragraph, max 650 characters. No lists."
         )
     else:
         prompt += (
             f"Round 1 for {my_label}. The others already answered — read what they said above. "
             f"Answer the question from your angle, then respond to their specific points. "
-            f"Stay on topic. One paragraph, max 672 characters. No lists."
+            f"Stay on topic. One paragraph, max 650 characters. No lists."
         )
 
     return prompt
