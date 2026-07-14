@@ -240,94 +240,112 @@ def site2_conversation():
         print(f"Erreur /1/conversation: {e}")
         return jsonify(ERR_CRASH), 500
 
-# ── /1/generate-invoice ───────────────────────────────────────────────────────
-@site2_bp.route("/1/generate-invoice", methods=["POST"])
-def generate_invoice():
+# ── /1/generate-contrat ───────────────────────────────────────────────────────
+@site2_bp.route("/1/generate-contrat", methods=["POST"])
+def generate_contrat():
     from echo_api import client_zai, MODELS
     import json
+    import re
 
     try:
-        data      = request.json or {}
-        free_text = (data.get("freeText") or "").strip()
-        currency  = (data.get("currency") or "CAD").strip()
-        status    = (data.get("status")   or "pending").strip()
-        lang      = (data.get("lang")     or "fr").strip()
-        numero    = (data.get("numero")   or "INV-001").strip()
-        date_str  = (data.get("dateStr")  or "").strip()
-        due_str   = (data.get("dueStr")   or "").strip()
+        data       = request.json or {}
+        free_text  = (data.get("freeText") or "").strip()
+        lang       = (data.get("lang") or "fr").strip()
+        date_str   = (data.get("dateStr") or "").strip()
+
         if not free_text:
             return jsonify({"error": "Texte requis"}), 400
-        lang_instr   = "Reponds en francais." if lang == "fr" else "Answer in English."
-        status_map   = {"pending": "En attente" if lang == "fr" else "Pending",
-                        "paid":    "Payee"      if lang == "fr" else "Paid",
-                        "late":    "En retard"  if lang == "fr" else "Overdue"}
-        status_label = status_map.get(status, "En attente")
-        system_prompt = (
-            "Tu es un expert en facturation professionnelle. "
-            "Extrais TOUTES les informations du texte et retourne un JSON complet. "
-            "Regles: 1. EMETTEUR = premiere entreprise/personne. 2. CLIENT = deuxieme. "
-            "3. Extrait adresse, email, telephone. 4. EMAIL = tout ce qui contient @. "
-            "5. TELEPHONE = tout numero. 6. MONTANT = additionne tous. "
-            "7. Reformule la description. 8. Genere conditions de paiement. "
-            + lang_instr + " Reponds UNIQUEMENT avec ce JSON: "
-            '{"emetteur":"","adresseEmetteur":"","emailEmetteur":"","telEmetteur":"",'
-            '"neq":"","numTPS":"","numTVQ":"","client":"","adresseClient":"","telClient":"",'
-            '"emailClient":"","description":"","montantHT":0.00,"conditions":"","notes":""}'
-        )
-        user_prompt = (
-            f"Informations:\n\n{free_text}\n\n---\nDevise: {currency}\nStatut: {status_label}\n"
-            f"Numero: {numero}\nDate: {date_str}\nEcheance: {due_str}\n\nJSON uniquement."
-        )
-        messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
+
+        system_prompt = f"""
+Tu es un expert en contrats de vente entre particuliers au Québec.
+Analyse le texte et retourne UNIQUEMENT un JSON valide avec ces clés exactes :
+
+{{
+  "vendeur_nom": "...",
+  "vendeur_adresse": "...",
+  "acheteur_nom": "...",
+  "acheteur_adresse": "...",
+  "description_bien": "description détaillée",
+  "prix_total": "montant total",
+  "modalites_paiement": "modalités de paiement",
+  "date": "{date_str or 'aujourd’hui'}",
+  "notes": "autres informations importantes"
+}}
+
+Texte fourni :
+{free_text}
+
+Réponds uniquement avec le JSON, rien d'autre.
+""".strip()
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": "Génère le JSON maintenant."}
+        ]
+
         raw = None
+
+        # Cascade Grok → Qwen → DeepSeek
         if client_requesty is not None:
             try:
-                raw = call_requesty("grok", messages, temp=0.2, timeout=25.0, max_tokens=800)
-                print("[INVOICE] Grok OK")
+                raw = call_requesty("grok", messages, temp=0.1, timeout=30.0, max_tokens=1200)
+                print("[CONTRAT] Grok OK")
             except Exception as e:
-                print(f"[INVOICE] Grok echec ({e})")
+                print(f"[CONTRAT] Grok échec: {e}")
+
         if not raw and client_requesty is not None:
             try:
-                raw = call_requesty("qwen3", messages, temp=0.2, timeout=25.0, max_tokens=800)
-                print("[INVOICE] Qwen OK")
+                raw = call_requesty("qwen3", messages, temp=0.1, timeout=30.0, max_tokens=1200)
+                print("[CONTRAT] Qwen OK")
             except Exception as e:
-                print(f"[INVOICE] Qwen echec ({e})")
+                print(f"[CONTRAT] Qwen échec: {e}")
+
         if not raw:
             from echo_api import client_deepseek, MODELS
             if client_deepseek is not None:
                 try:
                     res = client_deepseek.chat.completions.create(
-                        model=MODELS["deepseek"], messages=messages, temperature=0.2, max_tokens=800, timeout=25.0)
+                        model=MODELS["deepseek"], messages=messages, temperature=0.1, max_tokens=1200, timeout=30.0)
                     raw = res.choices[0].message.content
-                    print("[INVOICE] DeepSeek OK")
+                    print("[CONTRAT] DeepSeek OK")
                 except Exception as e:
-                    print(f"[INVOICE] DeepSeek echec ({e})")
+                    print(f"[CONTRAT] DeepSeek échec: {e}")
+
         if not raw:
             return jsonify({"error": "IA indisponible"}), 503
+
+        # Nettoyage et parsing
         text = raw.strip()
         if text.startswith("```json"): text = text[7:]
-        elif text.startswith("```"):   text = text[3:]
-        if text.endswith("```"):       text = text[:-3]
+        elif text.startswith("```"): text = text[3:]
+        if text.endswith("```"): text = text[:-3]
         text = text.strip()
+
         parsed = {}
         try:
             parsed = json.loads(text)
-        except Exception:
+        except:
             m = re.search(r'\{.*\}', text, re.DOTALL)
             if m:
-                try: parsed = json.loads(m.group(0))
-                except Exception: pass
+                try:
+                    parsed = json.loads(m.group(0))
+                except:
+                    pass
+
         return jsonify({
-            "emetteur": parsed.get("emetteur") or "", "adresseEmetteur": parsed.get("adresseEmetteur") or "",
-            "emailEmetteur": parsed.get("emailEmetteur") or "", "telEmetteur": parsed.get("telEmetteur") or "",
-            "neq": parsed.get("neq") or "", "numTPS": parsed.get("numTPS") or "", "numTVQ": parsed.get("numTVQ") or "",
-            "client": parsed.get("client") or "", "adresseClient": parsed.get("adresseClient") or "",
-            "telClient": parsed.get("telClient") or "", "emailClient": parsed.get("emailClient") or "",
-            "description": parsed.get("description") or "", "montantHT": parsed.get("montantHT") or 0,
-            "conditions": parsed.get("conditions") or "", "notes": parsed.get("notes") or "",
+            "vendeur_nom": parsed.get("vendeur_nom") or "",
+            "vendeur_adresse": parsed.get("vendeur_adresse") or "",
+            "acheteur_nom": parsed.get("acheteur_nom") or "",
+            "acheteur_adresse": parsed.get("acheteur_adresse") or "",
+            "description_bien": parsed.get("description_bien") or "",
+            "prix_total": parsed.get("prix_total") or "",
+            "modalites_paiement": parsed.get("modalites_paiement") or "",
+            "date": parsed.get("date") or date_str,
+            "notes": parsed.get("notes") or "",
         })
+
     except Exception as e:
-        print(f"[INVOICE] Erreur: {e}")
+        print(f"[CONTRAT] Erreur: {e}")
         return jsonify({"error": str(e)}), 500
 
 # ── /2/analyse-idee ───────────────────────────────────────────────────────────
