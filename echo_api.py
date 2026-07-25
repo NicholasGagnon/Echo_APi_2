@@ -359,7 +359,7 @@ def call_gemini(client, model_key, ctx, timeout=25, temperature=0.5):
         )
     return call_with_timeout(fn, timeout)
 
-def call_gemini_with_search(client, model_key, ctx, timeout=30, temperature=0.5):
+def call_gemini_with_search(client, model_key, ctx, timeout=30, temperature=0.1):
     def fn():
         return client.models.generate_content(
             model=MODELS[model_key],
@@ -367,8 +367,9 @@ def call_gemini_with_search(client, model_key, ctx, timeout=30, temperature=0.5)
             config=types.GenerateContentConfig(
                 system_instruction=ctx["system_prompt"],
                 max_output_tokens=ctx["output_tokens"],
-                temperature=temperature,
-                tools=[types.Tool(google_search=types.GoogleSearch())],
+                temperature=0.1,  # 0.1 pour forcer l'extraction exacte des numéros/adresses
+                response_mime_type="application/json",  # <-- DÉBLOQUE LE GROUNDING JSON
+                tools=[{"google_search": {}}],  # <-- SYNTAXE STRICTE
             )
         )
     return call_with_timeout(fn, timeout)
@@ -632,11 +633,23 @@ def home():
 
 # ── /chat ──────────────────────────────────────────────────────────────────────
 # FREE : DeepSeek → Grok-4-Fast (Requesty) → Llama
+# ── /chat ──────────────────────────────────────────────────────────────────────
 @app.route("/chat", methods=["POST"])
 def chat():
     try:
         data = request.json or {}
         ctx  = prepare_shared_context(data, source_override="chat")
+
+        # 🖼️ FIX VISION : Si une image est envoyée, forcer Gemini (modèle multimodal)
+        if data.get("image"):
+            try:
+                print("[CHAT] Image détectée — Bascule sur Gemini Vision")
+                r = call_gemini(client_gemini_paid, "gemini_paid_standard", ctx, timeout=25, temperature=0.5)
+                return jsonify(clean_and_parse_json(r.text))
+            except Exception as e:
+                print(f"[CHAT VISION ERROR] Échec Gemini Vision: {e}")
+
+        # Cascade standard texte si pas d'image
         if is_paid_tier(ctx["user_tier"]):
             return jsonify(run_paid_cascade(ctx, page_timeout=10))
         steps = [
