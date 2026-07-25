@@ -240,114 +240,6 @@ def site2_conversation():
         print(f"Erreur /1/conversation: {e}")
         return jsonify(ERR_CRASH), 500
 
-# ── /1/generate-contrat ───────────────────────────────────────────────────────
-@site2_bp.route("/1/generate-contrat", methods=["POST"])
-def generate_contrat():
-    from echo_api import client_zai, MODELS
-    import json
-    import re
-
-    try:
-        data       = request.json or {}
-        free_text  = (data.get("freeText") or "").strip()
-        lang       = (data.get("lang") or "fr").strip()
-        date_str   = (data.get("dateStr") or "").strip()
-
-        if not free_text:
-            return jsonify({"error": "Texte requis"}), 400
-
-        system_prompt = f"""
-Tu es un expert en contrats de vente entre particuliers au Québec.
-Analyse le texte et retourne UNIQUEMENT un JSON valide avec ces clés exactes :
-
-{{
-  "vendeur_nom": "...",
-  "vendeur_adresse": "...",
-  "acheteur_nom": "...",
-  "acheteur_adresse": "...",
-  "description_bien": "description détaillée",
-  "prix_total": "montant total",
-  "modalites_paiement": "modalités de paiement",
-  "date": "{date_str or 'aujourd’hui'}",
-  "notes": "autres informations importantes"
-}}
-
-Texte fourni :
-{free_text}
-
-Réponds uniquement avec le JSON, rien d'autre.
-""".strip()
-
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": "Génère le JSON maintenant."}
-        ]
-
-        raw = None
-
-        # Cascade Grok → Qwen → DeepSeek
-        if client_requesty is not None:
-            try:
-                raw = call_requesty("grok", messages, temp=0.1, timeout=30.0, max_tokens=1200)
-                print("[CONTRAT] Grok OK")
-            except Exception as e:
-                print(f"[CONTRAT] Grok échec: {e}")
-
-        if not raw and client_requesty is not None:
-            try:
-                raw = call_requesty("qwen3", messages, temp=0.1, timeout=30.0, max_tokens=1200)
-                print("[CONTRAT] Qwen OK")
-            except Exception as e:
-                print(f"[CONTRAT] Qwen échec: {e}")
-
-        if not raw:
-            from echo_api import client_deepseek, MODELS
-            if client_deepseek is not None:
-                try:
-                    res = client_deepseek.chat.completions.create(
-                        model=MODELS["deepseek"], messages=messages, temperature=0.1, max_tokens=1200, timeout=30.0)
-                    raw = res.choices[0].message.content
-                    print("[CONTRAT] DeepSeek OK")
-                except Exception as e:
-                    print(f"[CONTRAT] DeepSeek échec: {e}")
-
-        if not raw:
-            return jsonify({"error": "IA indisponible"}), 503
-
-        # Nettoyage et parsing
-        text = raw.strip()
-        if text.startswith("```json"): text = text[7:]
-        elif text.startswith("```"): text = text[3:]
-        if text.endswith("```"): text = text[:-3]
-        text = text.strip()
-
-        parsed = {}
-        try:
-            parsed = json.loads(text)
-        except:
-            m = re.search(r'\{.*\}', text, re.DOTALL)
-            if m:
-                try:
-                    parsed = json.loads(m.group(0))
-                except:
-                    pass
-
-        return jsonify({
-            "vendeur_nom": parsed.get("vendeur_nom") or "",
-            "vendeur_adresse": parsed.get("vendeur_adresse") or "",
-            "acheteur_nom": parsed.get("acheteur_nom") or "",
-            "acheteur_adresse": parsed.get("acheteur_adresse") or "",
-            "description_bien": parsed.get("description_bien") or "",
-            "prix_total": parsed.get("prix_total") or "",
-            "modalites_paiement": parsed.get("modalites_paiement") or "",
-            "date": parsed.get("date") or date_str,
-            "notes": parsed.get("notes") or "",
-        })
-
-    except Exception as e:
-        print(f"[CONTRAT] Erreur: {e}")
-        return jsonify({"error": str(e)}), 500
-
 # ── /1/generate-invoice ───────────────────────────────────────────────────────
 @site2_bp.route("/1/generate-invoice", methods=["POST"])
 def generate_invoice():
@@ -437,7 +329,6 @@ def generate_invoice():
     except Exception as e:
         print(f"[INVOICE] Erreur: {e}")
         return jsonify({"error": str(e)}), 500
-
 
 # ── /2/analyse-idee ───────────────────────────────────────────────────────────
 # Cascade : Grok-4-Fast-Non-Reasoning ➔ (2s) ➔ Grok-4-Fast-Non-Reasoning ➔ Grok-4-Fast (reasoning) — tout via Requesty.
