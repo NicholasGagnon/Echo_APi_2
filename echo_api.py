@@ -61,26 +61,27 @@ client_gemini_paid = genai.Client(api_key=API_KEY_PAID) if API_KEY_PAID else Non
 import httpx
 _shared_http_client = httpx.Client(timeout=35.0)
 
+# ✅ CORRECTION : URLs brutes sans crochets ni markdown
 client_openrouter = (
-    OpenAI(base_url="[https://openrouter.ai/api/v1](https://openrouter.ai/api/v1)", api_key=OPENROUTER_API_KEY, http_client=_shared_http_client)
+    OpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_API_KEY, http_client=_shared_http_client)
     if OPENROUTER_API_KEY else None
 )
 _no_retry_http = httpx.Client(timeout=6.0)
 client_openrouter_warmup = (
-    OpenAI(base_url="[https://openrouter.ai/api/v1](https://openrouter.ai/api/v1)", api_key=OPENROUTER_API_KEY,
+    OpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_API_KEY,
            http_client=_no_retry_http, max_retries=0)
     if OPENROUTER_API_KEY else None
 )
 client_deepseek = (
-    OpenAI(base_url="[https://api.deepseek.com](https://api.deepseek.com)", api_key=DEEPSEEK_API_KEY, http_client=_shared_http_client)
+    OpenAI(base_url="https://api.deepseek.com", api_key=DEEPSEEK_API_KEY, http_client=_shared_http_client)
     if DEEPSEEK_API_KEY else None
 )
 client_zai = (
-    OpenAI(base_url="[https://api.z.ai/api/paas/v4](https://api.z.ai/api/paas/v4)", api_key=ZAI_API_KEY, http_client=_shared_http_client)
+    OpenAI(base_url="https://api.z.ai/api/paas/v4", api_key=ZAI_API_KEY, http_client=_shared_http_client)
     if ZAI_API_KEY else None
 )
 client_requesty = (
-    OpenAI(base_url="[https://router.requesty.ai/v1](https://router.requesty.ai/v1)", api_key=REQUESTY_API_KEY, http_client=_shared_http_client)
+    OpenAI(base_url="https://router.requesty.ai/v1", api_key=REQUESTY_API_KEY, http_client=_shared_http_client)
     if REQUESTY_API_KEY else None
 )
 
@@ -1205,6 +1206,25 @@ def analyse_avis():
             except Exception as e:
                 logging.info(f"[ANALYSE] Groq (Requesty) echec ({e})")
 
+        # ✅ FALLBACK DE SECOURS SUR GEMINI SI LES OUTILS WEB ÉCHOUENT
+        if not raw_response and client_gemini_paid is not None:
+            try:
+                logging.info("[ANALYSE] Tentative Fallback Gemini...")
+                res_g = client_gemini_paid.models.generate_content(
+                    model=MODELS["gemini_paid_standard"],
+                    contents=[{"role": "user", "parts": [types.Part.from_text(text=user_prompt)]}],
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_prompt,
+                        max_output_tokens=2500,
+                        temperature=0.3
+                    )
+                )
+                raw_response = res_g.text
+                if raw_response:
+                    logging.info("[ANALYSE] Fallback Gemini OK")
+            except Exception as e:
+                logging.info(f"[ANALYSE] Fallback Gemini echec ({e})")
+
         if not raw_response:
             return jsonify({"error": "Analyse indisponible, reessaie dans quelques secondes"}), 503
 
@@ -1257,13 +1277,13 @@ def analyse_avis():
 def _warmup_api():
     try:
         print("[BOOST] Reveil des routes Echo...")
-        _requests_lib.get("http://127.0.0.1:5000/ping", timeout=2)
+        _requests_lib.get("[http://127.0.0.1:5000/ping](http://127.0.0.1:5000/ping)", timeout=2)
 
         print("[BOOST] Warmup de Ling (classification d'intentions)...")
         try:
             if client_openrouter is not None:
                 _requests_lib.post(
-                    "http://127.0.0.1:5000/horizon-warmup",
+                    "[http://127.0.0.1:5000/horizon-warmup](http://127.0.0.1:5000/horizon-warmup)",
                     json={"partial": "comment"},
                     timeout=5,
                 )
@@ -1274,7 +1294,7 @@ def _warmup_api():
         print("[BOOST] Warmup de World...")
         try:
             _requests_lib.post(
-                "http://127.0.0.1:5000/world/warmup",
+                "[http://127.0.0.1:5000/world/warmup](http://127.0.0.1:5000/world/warmup)",
                 json={},
                 timeout=6,
             )
