@@ -229,7 +229,7 @@ FORMAT DE RÉPONSE OBLIGATOIRE (JSON STRICT) :
 "action": {{ "type": "DELETE_CALORIE_LOG", "payload": {{ "id": "[ID]" }} }}
 """
     else:
-        # ── Pages home / chat / autres ─────────────────────────────
+        # ── Pages chat / calendar / autres ─────────────────────────
         home_mem_block = wrap_memory("home", "Home Context", to_dict(home_memory), date_aujourdhui) if home_memory and source in ("home", "chat") else ""
         chat_mem_block = wrap_memory("chat", "Chat Context", to_dict(chat_memory), date_aujourdhui) if chat_memory and source in ("home", "chat") else ""
 
@@ -237,6 +237,17 @@ FORMAT DE RÉPONSE OBLIGATOIRE (JSON STRICT) :
 {home_mem_block}
 {chat_mem_block}
 {calendar_mem_block}
+
+RÈGLE D'EXÉCUTION DES ACTIONS (OBLIGATOIRE) :
+- Dès que l'utilisateur te demande explicitement d'ajouter, de planifier, de créer ou de noter un
+  rendez-vous / événement dans le calendrier, tu DOIS générer l'action JSON "ADD_CALENDAR_EVENT"
+  correspondante en même temps que ta réponse. Ne te contente jamais de dire que tu l'as fait sans
+  produire réellement le champ "action".
+- Idem pour une dépense ou un repas : si l'utilisateur demande explicitement de le consigner,
+  génère l'action correspondante.
+- Ne bloque jamais une demande d'ajout sous prétexte qu'une entrée similaire existe déjà. Exécute.
+- Si des informations essentielles manquent (ex: aucune heure ni date déductible), pose une
+  question de clarification au lieu d'inventer une valeur, et ne génère pas l'action dans ce cas.
 
 1. CALENDRIER :
 "action": {{ "type": "ADD_CALENDAR_EVENT", "payload": {{ "title": "[Nom]", "start": "YYYY-MM-DDTHH:MM:00", "end": "YYYY-MM-DDTHH:MM:00", "notes": "[Commentaires]" }} }}
