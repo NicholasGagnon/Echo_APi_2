@@ -1,4 +1,5 @@
-﻿import os
+﻿# echo_api.py
+import os
 import io
 import re
 import sys
@@ -24,24 +25,24 @@ load_dotenv()
 app = Flask(__name__)
 CORS(app)
 
+# ── ENREGISTREMENT DES BLUEPRINTS AGENTS ──────────────────────────────────────
 from site2 import site2_bp
+from correcteur_agent import correcteur_bp
+from contenu_agent import contenu_bp
+
 app.register_blueprint(site2_bp)
+app.register_blueprint(correcteur_bp)
+app.register_blueprint(contenu_bp)
 
 # ── MODÈLES ────────────────────────────────────────────────────────────────────
-# NOTE : gemini-3.1-flash-lite (gemini_paid_ultra) retiré completement — prix trop eleve.
-# NOTE : tencent/hy3-preview retiré (ne répondait presque jamais) — remplacé par Grok-4-Fast
-#        (reasoning) via Requesty partout où hy3 était utilisé.
-# NOTE : openrouter/owl-alpha retiré (gratuit peu fiable, 404 sur OpenRouter).
-# NOTE : GLM-4.5-Air retiré des cascades actives (modèles peu fiables) — clé Z.AI et
-#        fonction call_glm() conservées pour tests futurs, non appelées activement.
 MODELS = {
     "gemini_paid_founder":  "gemini-3.5-flash",
     "gemini_paid_standard": "gemini-2.5-flash-lite",
-    "grok_reasoning": "xai/grok-4-fast",     # Requesty — remplace tencent (hy3) partout
+    "grok_reasoning": "xai/grok-4-fast",
     "llama":      "meta-llama/llama-3.3-70b-instruct",
     "ling":       "inclusionai/ling-2.6-flash",
     "deepseek":   "deepseek-v4-flash",
-    "glm":        "GLM-4.5-Air",              # conservé pour tests futurs — non utilisé activement
+    "glm":        "GLM-4.5-Air",
 }
 
 FREE_MAX_TOKENS = 2_500
@@ -61,26 +62,25 @@ import httpx
 _shared_http_client = httpx.Client(timeout=35.0)
 
 client_openrouter = (
-    OpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_API_KEY, http_client=_shared_http_client)
+    OpenAI(base_url="[https://openrouter.ai/api/v1](https://openrouter.ai/api/v1)", api_key=OPENROUTER_API_KEY, http_client=_shared_http_client)
     if OPENROUTER_API_KEY else None
 )
-# Client sans retry pour warmup — évite les messages d'erreur rouge sur Render
 _no_retry_http = httpx.Client(timeout=6.0)
 client_openrouter_warmup = (
-    OpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_API_KEY,
+    OpenAI(base_url="[https://openrouter.ai/api/v1](https://openrouter.ai/api/v1)", api_key=OPENROUTER_API_KEY,
            http_client=_no_retry_http, max_retries=0)
     if OPENROUTER_API_KEY else None
 )
 client_deepseek = (
-    OpenAI(base_url="https://api.deepseek.com", api_key=DEEPSEEK_API_KEY, http_client=_shared_http_client)
+    OpenAI(base_url="[https://api.deepseek.com](https://api.deepseek.com)", api_key=DEEPSEEK_API_KEY, http_client=_shared_http_client)
     if DEEPSEEK_API_KEY else None
 )
 client_zai = (
-    OpenAI(base_url="https://api.z.ai/api/paas/v4", api_key=ZAI_API_KEY, http_client=_shared_http_client)
+    OpenAI(base_url="[https://api.z.ai/api/paas/v4](https://api.z.ai/api/paas/v4)", api_key=ZAI_API_KEY, http_client=_shared_http_client)
     if ZAI_API_KEY else None
 )
 client_requesty = (
-    OpenAI(base_url="https://router.requesty.ai/v1", api_key=REQUESTY_API_KEY, http_client=_shared_http_client)
+    OpenAI(base_url="[https://router.requesty.ai/v1](https://router.requesty.ai/v1)", api_key=REQUESTY_API_KEY, http_client=_shared_http_client)
     if REQUESTY_API_KEY else None
 )
 
@@ -154,7 +154,6 @@ def clean_and_parse_json(raw_text):
     try:
         parsed = json.loads(text)
         if isinstance(parsed, dict) and "response" in parsed:
-            # Nettoyer les \n littéraux dans la réponse
             if isinstance(parsed["response"], str):
                 parsed["response"] = parsed["response"].replace("\\n", "\n").replace("\\\\n", "\n")
             return parsed
@@ -359,7 +358,7 @@ def call_gemini(client, model_key, ctx, timeout=25, temperature=0.5):
         )
     return call_with_timeout(fn, timeout)
 
-def call_gemini_with_search(client, model_key, ctx, timeout=30, temperature=0.1):
+def call_gemini_with_search(client, model_key, ctx, timeout=30, temperature=0.2):
     def fn():
         return client.models.generate_content(
             model=MODELS[model_key],
@@ -367,9 +366,8 @@ def call_gemini_with_search(client, model_key, ctx, timeout=30, temperature=0.1)
             config=types.GenerateContentConfig(
                 system_instruction=ctx["system_prompt"],
                 max_output_tokens=ctx["output_tokens"],
-                temperature=0.1,  # 0.1 pour forcer l'extraction exacte des numéros/adresses
-                response_mime_type="application/json",  # <-- DÉBLOQUE LE GROUNDING JSON
-                tools=[{"google_search": {}}],  # <-- SYNTAXE STRICTE
+                temperature=0.2,
+                tools=[{"google_search": {}}],
             )
         )
     return call_with_timeout(fn, timeout)
@@ -420,7 +418,6 @@ def call_deepseek(ctx, temp=0.5, timeout=20.0):
     return content
 
 def call_glm(ctx, temp=0.5, timeout=20.0):
-    # Conservé pour tests futurs — non appelé activement dans les cascades.
     if client_zai is None:
         raise RuntimeError("Z.AI non configuré")
     res = client_zai.chat.completions.create(
@@ -437,7 +434,6 @@ def call_glm(ctx, temp=0.5, timeout=20.0):
 
 # ── DISPATCH COMMUN POUR LES CASCADES ──────────────────────────────────────────
 def _dispatch_step(provider, model_key, ctx, timeout, parser):
-    """Exécute une étape de cascade et retourne le résultat parsé."""
     if provider == "g":
         r = call_gemini(client_gemini_paid, model_key, ctx, timeout=timeout, temperature=0.5)
         return parser(r.text)
@@ -453,12 +449,11 @@ def _dispatch_step(provider, model_key, ctx, timeout, parser):
     elif provider == "rq":
         r = call_requesty(model_key, ctx, temp=0.5, timeout=float(timeout))
         return parser(r)
-    else:  # "or"
+    else:
         r = call_openrouter(model_key, ctx, temp=0.5, timeout=float(timeout))
         return parser(r)
 
 def _run_simple_cascade(steps, ctx, parser=None):
-    """Cascade simple sans logique de quota — utilisée pour les routes à cascade fixe (vitality, etc.)."""
     if parser is None:
         parser = clean_and_parse_json
     for provider, model_key, timeout in steps:
@@ -479,8 +474,6 @@ def _run_simple_cascade(steps, ctx, parser=None):
             lock_model(model_key, 30)
     return ERR_FINAL
 
-# ── CASCADE PAYANTE PAR TIER (NE COUVRE PAS /vitality) ─────────────────────────
-# Utilisée par /home, /chat, /history (payant). Cascade différente selon basic/premium/ultra/founder.
 def run_paid_cascade(ctx, page_timeout: int = 10):
     tier = ctx["user_tier"]
     t    = page_timeout
@@ -503,7 +496,7 @@ def run_paid_cascade(ctx, page_timeout: int = 10):
             ("rq", "grok_reasoning", t),
             ("ds", "deepseek",       t),
         ]
-    else:  # founder
+    else:
         steps = [
             ("g",  "gemini_paid_founder", t),
             ("ds", "deepseek",            t),
@@ -520,7 +513,6 @@ def run_paid_cascade(ctx, page_timeout: int = 10):
             lock_model(model_key, 30)
     return ERR_FINAL
 
-# ── CASCADE FREE ───────────────────────────────────────────────────────────────
 def run_free_cascade(steps, ctx, parser=None, is_horizon=False):
     if parser is None:
         parser = clean_and_parse_json
@@ -554,7 +546,6 @@ def run_free_cascade(steps, ctx, parser=None, is_horizon=False):
 def ping():
     return jsonify({"status": "awake"})
 
-# ── /horizon-warmup ───────────────────────────────────────────────────────────
 HORIZON_WARMUP_CACHE: dict = {}
 
 @app.route("/horizon-warmup", methods=["POST"])
@@ -612,8 +603,6 @@ def horizon_warmup():
         print(f"[WARMUP] Erreur : {e}")
         return jsonify({"status": "error"})
 
-# ── /home ──────────────────────────────────────────────────────────────────────
-# FREE : DeepSeek → Grok-4-Fast (Requesty) → Llama
 @app.route("/home", methods=["POST"])
 def home():
     try:
@@ -631,16 +620,12 @@ def home():
         print(f"Erreur /home: {e}")
         return jsonify(ERR_CRASH), 500
 
-# ── /chat ──────────────────────────────────────────────────────────────────────
-# FREE : DeepSeek → Grok-4-Fast (Requesty) → Llama
-# ── /chat ──────────────────────────────────────────────────────────────────────
 @app.route("/chat", methods=["POST"])
 def chat():
     try:
         data = request.json or {}
         ctx  = prepare_shared_context(data, source_override="chat")
 
-        # 🖼️ FIX VISION : Si une image est envoyée, forcer Gemini (modèle multimodal)
         if data.get("image"):
             try:
                 print("[CHAT] Image détectée — Bascule sur Gemini Vision")
@@ -649,7 +634,6 @@ def chat():
             except Exception as e:
                 print(f"[CHAT VISION ERROR] Échec Gemini Vision: {e}")
 
-        # Cascade standard texte si pas d'image
         if is_paid_tier(ctx["user_tier"]):
             return jsonify(run_paid_cascade(ctx, page_timeout=10))
         steps = [
@@ -662,8 +646,6 @@ def chat():
         print(f"Erreur /chat: {e}")
         return jsonify(ERR_CRASH), 500
 
-# ── /vitality ─────────────────────────────────────────────────────────────────
-# Cascade unique (free ET payant) : DeepSeek → Llama → DeepSeek. GLM retiré.
 @app.route("/vitality", methods=["POST"])
 def vitality():
     try:
@@ -684,8 +666,6 @@ def vitality():
         print(f"Erreur /vitality: {e}")
         return jsonify(ERR_CRASH), 500
 
-# ── /history ──────────────────────────────────────────────────────────────────
-# FREE : DeepSeek → Llama (owl retiré, amplement suffisant)
 @app.route("/history", methods=["POST"])
 def history():
     try:
@@ -702,8 +682,6 @@ def history():
         print(f"Erreur /history: {e}")
         return jsonify(ERR_CRASH), 500
 
-# ── /books ────────────────────────────────────────────────────────────────────
-# Tous tiers : DeepSeek → DeepSeek → DeepSeek, 2s entre chaque tentative.
 @app.route("/books", methods=["POST"])
 def books():
     try:
@@ -788,8 +766,6 @@ def books():
         print(f"Erreur /books: {e}")
         return jsonify({"response": ERR_CRASH["response"], "inject": False, "action": None}), 500
 
-# ── /horizon ──────────────────────────────────────────────────────────────────
-# gemini_paid_standard (2.5 Flash Lite) — seul modèle groundé — répété 3x avec 3s entre chaque essai.
 @app.route("/horizon", methods=["POST"])
 def horizon():
     try:
@@ -809,17 +785,11 @@ def horizon():
             f"DATE ET HEURE ACTUELLES : {date_str}, {heure_str} (heure locale du serveur).\n"
             f"ANNEE EN COURS : 2026. Toutes les informations doivent etre actuelles et valides en 2026.\n\n"
             f"INSTRUCTION OBLIGATOIRE — GOOGLE SEARCH ACTIVE :\n"
-            f"Tu disposes d'un outil de recherche Google en temps reel. "
-            f"Tu DOIS l'utiliser pour repondre a cette requete. "
-            f"N'utilise PAS ta memoire interne comme source principale. "
-            f"Cherche d'abord. Transmets ce que tu trouves. Rien d'autre.\n\n"
-            f"REQUETE : {query}\n\n"
-            f"REGLES DE TRANSMISSION :\n"
-            f"- Retourne uniquement des informations confirmees par ta recherche Google.\n"
-            f"- Si une donnee (adresse, telephone, horaire, prix, URL) est introuvable : utilise le jeton approprie.\n"
-            f"- Retourne jusqu'a 10 resultats confirmes — moins si tu n'en trouves pas davantage.\n"
-            f"- Une reponse incomplete est acceptable. Une reponse inventee est un echec.\n\n"
-            f"Reponds UNIQUEMENT en JSON valide avec les cles : response, attributes, matrix."
+            f"Utilise Google Search pour effectuer une recherche en temps reel et repondre de maniere ultra precise et donnee a jour sur : {query}\n\n"
+            f"REGLES :\n"
+            f"- Fais la recherche Google d'abord.\n"
+            f"- Donne une reponse claire, structuree et detaillee avec les vraies informations trouvees sur le web.\n"
+            f"- Inclus les faits, chiffres, sources ou details pertinents si disponibles."
         )
 
         horizon_system = generate_system_prompt(
@@ -845,18 +815,18 @@ def horizon():
         parsed = None
         for attempt in range(3):
             try:
-                print(f"[HORIZON] Tentative {attempt + 1}/3 — gemini_paid_standard")
-                r      = call_gemini_with_search(client_gemini_paid, "gemini_paid_standard", ctx, timeout=10, temperature=0.5)
-                parsed = clean_and_parse_horizon_json(r.text)
-                if parsed.get("response", "").strip():
-                    print(f"[HORIZON] Succes — tentative {attempt + 1}")
-                    break
-                else:
-                    print(f"[HORIZON] Reponse vide — tentative {attempt + 1}")
+                print(f"[HORIZON] Grounding Search — Tentative {attempt + 1}/3")
+                r = call_gemini_with_search(client_gemini_paid, "gemini_paid_standard", ctx, timeout=25, temperature=0.2)
+                
+                if r and r.text:
+                    parsed = clean_and_parse_horizon_json(r.text)
+                    if parsed.get("response", "").strip():
+                        print(f"[HORIZON] Succes Grounding — tentative {attempt + 1}")
+                        break
             except Exception as e:
                 print(f"[HORIZON] Echec tentative {attempt + 1} ({e})")
             if attempt < 2:
-                time.sleep(3.0)
+                time.sleep(2.0)
 
         if not parsed or not parsed.get("response", "").strip():
             return jsonify(ERR_HORIZON)
@@ -872,7 +842,6 @@ def horizon():
         print(f"[HORIZON] Erreur critique: {e}")
         return jsonify(ERR_HORIZON), 500
 
-# ── /memory-summary ───────────────────────────────────────────────────────────
 @app.route("/memory-summary", methods=["POST"])
 def memory_summary():
     try:
@@ -928,14 +897,12 @@ def memory_summary():
             except Exception as e:
                 print(f"[MEMORY] {mm_name} echec ({e})")
 
-
         return jsonify({"summary": prev_summary or ""})
 
     except Exception as e:
         print(f"[MEMORY] Erreur critique: {e}")
         return jsonify({"summary": ""}), 500
 
-# ── /export ───────────────────────────────────────────────────────────────────
 def px_to_pt(px_str: str) -> float:
     try:
         return round(float(str(px_str).replace("px","").strip()) * 0.75, 1)
@@ -1071,7 +1038,6 @@ def html_to_docx(html: str, title: str) -> io.BytesIO:
     buf.seek(0)
     return buf
 
-
 @app.route("/export", methods=["POST"])
 def export_route():
     data  = request.get_json(silent=True) or {}
@@ -1146,15 +1112,8 @@ def export_route():
         print(f"[EXPORT ERROR] {fmt}: {e}")
         return jsonify({"error": str(e)}), 500
 
-# ── /api/analyse-avis — Scanner Sonar via OpenRouter ─────────────────────────
-# Cascade : GPT-4o-Mini-Search → (2s) → GPT-4o-Mini-Search → Llama.
 @app.route("/api/analyse-avis", methods=["POST"])
 def analyse_avis():
-    """
-    Route pour analyser les avis d'un produit via GPT-4o-mini-search (web search natif).
-    Accepte : {"url": "https://amazon.ca/..."}
-    Retourne : {"product_name": "...", "positives": [...], "negatives": [...]}
-    """
     try:
         data = request.json or {}
         url  = (data.get("url")  or "").strip()
@@ -1164,14 +1123,8 @@ def analyse_avis():
         if not url:
             return jsonify({"error": "URL requise"}), 400
 
-        if client_openrouter is None:
-            logging.info("[ANALYSE] ERREUR: client_openrouter est None")
-            return jsonify({"error": "OpenRouter non configure"}), 503
-
-        # Extraire l'ASIN si URL Amazon
         asin_match = re.search(r"/dp/([A-Z0-9]{10})", url)
         asin_hint = f" (ASIN: {asin_match.group(1)})" if asin_match else ""
-        logging.info(f"[ANALYSE] ASIN: {asin_hint or 'non detecte'}")
 
         lang_instruction = (
             "Réponds en français. Les points doivent être en français."
@@ -1204,112 +1157,81 @@ def analyse_avis():
 
         raw_response = None
 
-        # Tentative 1 & 2 : GPT-4o Mini Search, avec 2s entre les deux essais
-        for attempt in range(2):
+        if client_requesty is not None:
             try:
-                res = client_openrouter.chat.completions.create(
-                    model="openai/gpt-4o-mini-search-preview",
+                res = client_requesty.chat.completions.create(
+                    model="nebius/openai/gpt-oss-120b",
                     messages=messages,
                     temperature=0.3,
-                    max_tokens=700,
+                    max_tokens=2500,
                     timeout=30.0,
+                    extra_body={"plugins": [{"id": "web"}]}
                 )
                 raw_response = res.choices[0].message.content
                 if raw_response:
-                    logging.info(f"[ANALYSE] GPT-4o-mini-search OK (essai {attempt + 1})")
-                    break
+                    logging.info("[ANALYSE] Nebius (Requesty) OK")
             except Exception as e:
-                logging.info(f"[ANALYSE] GPT-4o-mini-search echec (essai {attempt + 1}) ({e})")
-            if attempt == 0:
-                time.sleep(2.0)
+                logging.info(f"[ANALYSE] Nebius (Requesty) echec ({e})")
 
-        # Tentative 3 : Llama (fallback final)
         if not raw_response and client_openrouter is not None:
             try:
                 res = client_openrouter.chat.completions.create(
-                    model=MODELS["llama"],
+                    model="openai/gpt-oss-120b",
                     messages=messages,
                     temperature=0.3,
-                    max_tokens=700,
-                    timeout=20.0,
+                    max_tokens=2500,
+                    timeout=30.0,
+                    extra_body={"plugins": [{"id": "web"}]}
                 )
                 raw_response = res.choices[0].message.content
-                logging.info("[ANALYSE] Llama fallback OK")
+                if raw_response:
+                    logging.info("[ANALYSE] OpenRouter OK")
             except Exception as e:
-                logging.info(f"[ANALYSE] Llama echec ({e})")
+                logging.info(f"[ANALYSE] OpenRouter echec ({e})")
+
+        if not raw_response and client_requesty is not None:
+            try:
+                res = client_requesty.chat.completions.create(
+                    model="groq/openai/gpt-oss-120b",
+                    messages=messages,
+                    temperature=0.3,
+                    max_tokens=2500,
+                    timeout=25.0,
+                    extra_body={"plugins": [{"id": "web"}]}
+                )
+                raw_response = res.choices[0].message.content
+                if raw_response:
+                    logging.info("[ANALYSE] Groq (Requesty) OK")
+            except Exception as e:
+                logging.info(f"[ANALYSE] Groq (Requesty) echec ({e})")
 
         if not raw_response:
             return jsonify({"error": "Analyse indisponible, reessaie dans quelques secondes"}), 503
 
-        # Parser la reponse
         try:
             import json as _json
 
             text = raw_response.strip()
-            # Nettoyer les blocs markdown
             if text.startswith("```json"): text = text[7:]
             elif text.startswith("```"):   text = text[3:]
             if text.endswith("```"):       text = text[:-3]
             text = text.strip()
 
             parsed = {}
-            # Tentative 1 : JSON direct
             try:
                 parsed = _json.loads(text)
             except Exception:
                 pass
 
-            # Tentative 2 : extraire le bloc JSON du texte libre
             if not parsed or "positives" not in parsed:
                 m = re.search(r'\{[^{}]*"positives"[^{}]*\}', text, re.DOTALL)
                 if m:
                     try: parsed = _json.loads(m.group(0))
                     except Exception: pass
 
-            # Tentative 3 : GPT a répondu en texte libre — parser les listes numérotées
-            if not parsed or "positives" not in parsed:
-                logging.info(f"[ANALYSE] Fallback extraction texte libre: {text[:200]}")
-
-                def extract_list(marker, stop_marker, raw):
-                    """Extrait une liste numérotée entre deux marqueurs"""
-                    items = []
-                    in_section = False
-                    for line in raw.split("\n"):
-                        l = line.strip()
-                        if marker.lower() in l.lower():
-                            in_section = True; continue
-                        if in_section and stop_marker and stop_marker.lower() in l.lower():
-                            break
-                        if in_section and l:
-                            # Nettoyer : "1. texte", "- texte", "• texte"
-                            cleaned = re.sub(r"^[\d]+[.)\s]+|^[-•*]+\s*", "", l).strip()
-                            if cleaned and len(cleaned) > 5:
-                                items.append(cleaned)
-                    return items[:5]
-
-                # Chercher sections positives / negatives dans texte libre
-                positives_raw = extract_list("point fort", "défaut", text) or extract_list("positive", "negative", text) or extract_list("avantage", "inconvénient", text)
-                negatives_raw = extract_list("défaut", "xxx_fin", text) or extract_list("negative", "xxx_fin", text) or extract_list("inconvénient", "xxx_fin", text)
-
-                # Extraire le nom du produit depuis la première ligne non vide
-                product_raw = "Produit Analyse"
-                for line in text.split("\n"):
-                    l = line.strip()
-                    if l and not l.startswith("#") and len(l) < 80 and "point fort" not in l.lower() and "défaut" not in l.lower():
-                        product_raw = re.sub(r"^#+\s*|[*_]+", "", l).strip()
-                        if product_raw: break
-
-                parsed = {
-                    "product_name": parsed.get("product_name") or product_raw,
-                    "positives": parsed.get("positives") or positives_raw,
-                    "negatives": parsed.get("negatives") or negatives_raw,
-                }
-
             positives    = parsed.get("positives") or []
             negatives    = parsed.get("negatives") or []
             product_name = parsed.get("product_name") or "Produit Analyse"
-
-            logging.info(f"[ANALYSE] OK: {product_name} | {len(positives)}pos {len(negatives)}neg")
 
             if not isinstance(positives, list) or len(positives) == 0:
                 positives = ["Donnees insuffisantes"]
@@ -1323,28 +1245,20 @@ def analyse_avis():
             })
 
         except Exception as e:
-            logging.info(f"[ANALYSE] Erreur parsing: {e} — raw: {raw_response[:300]}")
             return jsonify({"error": "Erreur parsing reponse"}), 500
 
     except Exception as e:
-        import traceback
-        tb = traceback.format_exc()
-        tb_last = [l for l in tb.split("\n") if l.strip()][-1] if tb else "vide"
         return jsonify({
             "product_name": "ERREUR DEBUG",
             "positives": [f"Exception: {str(e)}"],
-            "negatives": [f"Ligne: {tb_last}"],
+            "negatives": ["Ligne inconnue"],
         })
 
-
-# ── WARMUP AVEC LING ──────────────────────────────────────────────────────────
 def _warmup_api():
-    """Warmup initial : réveille Ling, Echo et World au démarrage du serveur"""
     try:
         print("[BOOST] Reveil des routes Echo...")
         _requests_lib.get("http://127.0.0.1:5000/ping", timeout=2)
 
-        # Warmup Ling pour la classification d'intentions
         print("[BOOST] Warmup de Ling (classification d'intentions)...")
         try:
             if client_openrouter is not None:
@@ -1357,7 +1271,6 @@ def _warmup_api():
         except Exception as e:
             print(f"[BOOST] Ling warmup optionnel échoué: {e}")
 
-        # Warmup World — réveille les modèles de cascade
         print("[BOOST] Warmup de World...")
         try:
             _requests_lib.post(

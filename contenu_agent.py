@@ -1,9 +1,9 @@
+# contenu_agent.py
 import os
 import sys
 import re
 import logging
-from flask import Flask, request, jsonify
-from flask_cors import CORS
+from flask import Blueprint, request, jsonify
 from google import genai
 from google.genai import types
 from openai import OpenAI
@@ -20,10 +20,10 @@ from prompts_contenu import (
 load_dotenv()
 logging.basicConfig(level=logging.INFO, stream=sys.stdout, force=True)
 
-app = Flask(__name__)
-CORS(app)
+# ── BLUEPRINT FLASK ──────────────────────────────────────────────────────────
+contenu_bp = Blueprint('contenu_bp', __name__)
 
-# ── CLÉS & CLIENTS ────────────────────────────────────────────────────────
+# ── CLÉS & CLIENTS ──────────────────────────────────────────────────────────
 API_KEY_PAID      = os.getenv("API_KEY_PAID", "").strip()
 REQUESTY_API_KEY  = os.getenv("REQUESTY_API_KEY", "").strip()
 DEEPSEEK_API_KEY  = os.getenv("DEEPSEEK_API_KEY", "").strip()
@@ -47,24 +47,14 @@ FALLBACK_PROMPT = {"provider": "g",  "model_id": "gemini-2.5-flash-lite"}
 
 
 def nettoie_formatage_impression(texte: str) -> str:
-    """
-    Conserve les balises Markdown (# pour titres, ** pour gras, - pour listes)
-    nécessaires pour le rendu CSS/HTML d'impression dans le frontend.
-    Nettoie uniquement les espaces superflus et les balises HTML indésirables.
-    """
     if not texte:
         return ""
-    
     t = texte.strip()
-    # Supprime d'éventuels conteneurs de code ```markdown générés par le LLM
     t = re.sub(r'^```markdown\s*', '', t, flags=re.IGNORECASE)
     t = re.sub(r'^```html\s*', '', t, flags=re.IGNORECASE)
     t = re.sub(r'^```\s*', '', t)
     t = re.sub(r'\s*```$', '', t)
-    
-    # Élimine les sauts de ligne multiples excessifs (plus de 2 consécutifs)
     t = re.sub(r'\n{3,}', '\n\n', t)
-    
     return t.strip()
 
 
@@ -108,7 +98,7 @@ def execute_llm_call(provider: str, model_id: str, system_prompt: str, user_prom
     raise RuntimeError(f"Provider inconnu : {provider}")
 
 
-@app.route("/api/contenu/prompt-maitre", methods=["POST"])
+@contenu_bp.route("/api/contenu/prompt-maitre", methods=["POST"])
 def route_prompt_maitre():
     try:
         data = request.json or {}
@@ -130,7 +120,7 @@ def route_prompt_maitre():
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/api/contenu/decoupage", methods=["POST"])
+@contenu_bp.route("/api/contenu/decoupage", methods=["POST"])
 def route_decoupage():
     try:
         data = request.json or {}
@@ -139,14 +129,19 @@ def route_decoupage():
 
         sys_p = get_decoupage_system(nb_points)
         usr_p = get_decoupage_user(prompt_maitre, nb_points)
-        texte = execute_llm_call(MODEL_DECOUPAGE["provider"], MODEL_DECOUPAGE["model_id"], sys_p, usr_p)
+
+        try:
+            texte = execute_llm_call(MODEL_DECOUPAGE["provider"], MODEL_DECOUPAGE["model_id"], sys_p, usr_p)
+        except Exception as e:
+            print(f"[DECOUPAGE] DeepSeek échec ({e}) — fallback Gemini")
+            texte = execute_llm_call(FALLBACK_PROMPT["provider"], FALLBACK_PROMPT["model_id"], sys_p, usr_p)
 
         return jsonify({"liste_points": texte})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/api/contenu/generer-bloc", methods=["POST"])
+@contenu_bp.route("/api/contenu/generer-bloc", methods=["POST"])
 def route_generer_bloc():
     try:
         data = request.json or {}
@@ -159,7 +154,11 @@ def route_generer_bloc():
         sys_p = get_prompt_bloc_system(type_contenu)
         usr_p = get_prompt_bloc_user(prompt_maitre, tranche, numero, total)
 
-        texte_brut = execute_llm_call(MODEL_REDACTION["provider"], MODEL_REDACTION["model_id"], sys_p, usr_p)
+        try:
+            texte_brut = execute_llm_call(MODEL_REDACTION["provider"], MODEL_REDACTION["model_id"], sys_p, usr_p)
+        except Exception as e:
+            print(f"[BLOC {numero}] DeepSeek échec ({e}) — fallback Gemini")
+            texte_brut = execute_llm_call(FALLBACK_PROMPT["provider"], FALLBACK_PROMPT["model_id"], sys_p, usr_p)
 
         return jsonify({"texte_bloc": nettoie_formatage_impression(texte_brut)})
     except Exception as e:
@@ -167,7 +166,7 @@ def route_generer_bloc():
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/api/contenu/generer-raccord", methods=["POST"])
+@contenu_bp.route("/api/contenu/generer-raccord", methods=["POST"])
 def route_generer_raccord():
     try:
         data = request.json or {}
@@ -177,12 +176,12 @@ def route_generer_raccord():
         sys_p = get_prompt_raccord_system()
         usr_p = get_prompt_raccord_user(fin_a, debut_b)
 
-        texte = execute_llm_call(MODEL_REDACTION["provider"], MODEL_REDACTION["model_id"], sys_p, usr_p)
+        try:
+            texte = execute_llm_call(MODEL_REDACTION["provider"], MODEL_REDACTION["model_id"], sys_p, usr_p)
+        except Exception as e:
+            print(f"[RACCORD] DeepSeek échec ({e}) — fallback Gemini")
+            texte = execute_llm_call(FALLBACK_PROMPT["provider"], FALLBACK_PROMPT["model_id"], sys_p, usr_p)
+
         return jsonify({"texte_raccord": nettoie_formatage_impression(texte)})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
-
-if __name__ == "__main__":
-    print("[STUDIO BACKEND] Moteur d'impression prêt. Formatage Markdown préservé.")
-    app.run(host="0.0.0.0", port=5004, debug=True)
