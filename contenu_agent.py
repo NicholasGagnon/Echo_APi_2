@@ -40,10 +40,11 @@ client_deepseek = (
     if DEEPSEEK_API_KEY else None
 )
 
-MODEL_PROMPT    = {"provider": "rq", "model_id": "xai/grok-4-fast-non-reasoning"}
-MODEL_DECOUPAGE = {"provider": "ds", "model_id": "deepseek-v4-flash"}
-MODEL_REDACTION = {"provider": "ds", "model_id": "deepseek-v4-flash"}
-FALLBACK_PROMPT = {"provider": "g",  "model_id": "gemini-2.5-flash-lite"}
+MODEL_DEEPSEEK = {"provider": "ds", "model_id": "deepseek-v4-flash"}
+MODEL_GROK     = {"provider": "rq", "model_id": "xai/grok-4-fast-non-reasoning"}
+
+# Cascade unifiée utilisée par toutes les routes : DeepSeek → Grok-4-Fast-Non-Reasoning (Requesty) → DeepSeek
+CASCADE_STEPS = [MODEL_DEEPSEEK, MODEL_GROK, MODEL_DEEPSEEK]
 
 
 def nettoie_formatage_impression(texte: str) -> str:
@@ -98,6 +99,23 @@ def execute_llm_call(provider: str, model_id: str, system_prompt: str, user_prom
     raise RuntimeError(f"Provider inconnu : {provider}")
 
 
+def execute_cascade(system_prompt: str, user_prompt: str, label: str = "") -> str:
+    """Cascade DeepSeek → Grok-4-Fast-Non-Reasoning (Requesty) → DeepSeek, utilisée par toutes les routes."""
+    last_err = None
+    for i, step in enumerate(CASCADE_STEPS):
+        try:
+            texte = execute_llm_call(step["provider"], step["model_id"], system_prompt, user_prompt)
+            if texte and texte.strip():
+                if i > 0:
+                    print(f"[{label}] {step['model_id']} OK (essai {i + 1})")
+                return texte
+            print(f"[{label}] {step['model_id']} a renvoyé une réponse vide (essai {i + 1})")
+        except Exception as e:
+            last_err = e
+            print(f"[{label}] {step['model_id']} échec (essai {i + 1}) ({e})")
+    raise RuntimeError(f"Tous les modèles ont échoué pour {label} : {last_err}")
+
+
 @contenu_bp.route("/api/contenu/prompt-maitre", methods=["POST"])
 def route_prompt_maitre():
     try:
@@ -110,10 +128,7 @@ def route_prompt_maitre():
         sys_p = get_prompt_createur_system(type_contenu)
         usr_p = get_prompt_createur_user(sujet, type_contenu)
 
-        try:
-            texte = execute_llm_call(MODEL_PROMPT["provider"], MODEL_PROMPT["model_id"], sys_p, usr_p)
-        except Exception:
-            texte = execute_llm_call(FALLBACK_PROMPT["provider"], FALLBACK_PROMPT["model_id"], sys_p, usr_p)
+        texte = execute_cascade(sys_p, usr_p, label="PROMPT-MAITRE")
 
         return jsonify({"prompt_maitre": texte.strip()})
     except Exception as e:
@@ -130,11 +145,7 @@ def route_decoupage():
         sys_p = get_decoupage_system(nb_points)
         usr_p = get_decoupage_user(prompt_maitre, nb_points)
 
-        try:
-            texte = execute_llm_call(MODEL_DECOUPAGE["provider"], MODEL_DECOUPAGE["model_id"], sys_p, usr_p)
-        except Exception as e:
-            print(f"[DECOUPAGE] DeepSeek échec ({e}) — fallback Gemini")
-            texte = execute_llm_call(FALLBACK_PROMPT["provider"], FALLBACK_PROMPT["model_id"], sys_p, usr_p)
+        texte = execute_cascade(sys_p, usr_p, label="DECOUPAGE")
 
         return jsonify({"liste_points": texte})
     except Exception as e:
@@ -154,11 +165,7 @@ def route_generer_bloc():
         sys_p = get_prompt_bloc_system(type_contenu)
         usr_p = get_prompt_bloc_user(prompt_maitre, tranche, numero, total)
 
-        try:
-            texte_brut = execute_llm_call(MODEL_REDACTION["provider"], MODEL_REDACTION["model_id"], sys_p, usr_p)
-        except Exception as e:
-            print(f"[BLOC {numero}] DeepSeek échec ({e}) — fallback Gemini")
-            texte_brut = execute_llm_call(FALLBACK_PROMPT["provider"], FALLBACK_PROMPT["model_id"], sys_p, usr_p)
+        texte_brut = execute_cascade(sys_p, usr_p, label=f"BLOC {numero}")
 
         return jsonify({"texte_bloc": nettoie_formatage_impression(texte_brut)})
     except Exception as e:
@@ -176,11 +183,7 @@ def route_generer_raccord():
         sys_p = get_prompt_raccord_system()
         usr_p = get_prompt_raccord_user(fin_a, debut_b)
 
-        try:
-            texte = execute_llm_call(MODEL_REDACTION["provider"], MODEL_REDACTION["model_id"], sys_p, usr_p)
-        except Exception as e:
-            print(f"[RACCORD] DeepSeek échec ({e}) — fallback Gemini")
-            texte = execute_llm_call(FALLBACK_PROMPT["provider"], FALLBACK_PROMPT["model_id"], sys_p, usr_p)
+        texte = execute_cascade(sys_p, usr_p, label="RACCORD")
 
         return jsonify({"texte_raccord": nettoie_formatage_impression(texte)})
     except Exception as e:
