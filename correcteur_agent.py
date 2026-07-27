@@ -176,6 +176,82 @@ def correcteur_step():
         return jsonify({"error": f"Erreur d'infrastructure : {e}"}), 500
 
 
+# ── CASCADE DE GÉNÉRATION DE CONTRAT D'ACHAT ────────────────────────────────
+CONTRAT_CASCADE = [
+    {"provider": "rq", "model_id": "grok-4-fast-non-reasoning", "label": "Grok (Requesty)"},
+    {"provider": "ds", "model_id": "deepseek-v4-flash",         "label": "DeepSeek"},
+    {"provider": "rq", "model_id": "grok-4-fast-non-reasoning", "label": "Grok (Secours)"},
+]
+
+
+def generate_contrat_with_cascade(free_text: str, lang: str, date_str: str) -> dict:
+    system_prompt = (
+        "Tu es un expert juridique spécialisé en rédaction de contrats de vente de gré à gré au Québec (Canada). "
+        "Ta mission est d'analyser les informations fournies et de retourner EXCLUSIVEMENT un objet JSON valide "
+        "sans aucune clôture de code (pas de ```json), contenant les champs exacts suivants :\n"
+        "{\n"
+        '  "vendeur_nom": "Nom du vendeur",\n'
+        '  "vendeur_adresse": "Adresse du vendeur",\n'
+        '  "acheteur_nom": "Nom de l\'acheteur",\n'
+        '  "acheteur_adresse": "Adresse de l\'acheteur",\n'
+        '  "description_bien": "Description détaillée et précise du bien",\n'
+        '  "prix_total": "Prix total avec symbole monétaire",\n'
+        '  "modalites_paiement": "Détails et modalités du paiement",\n'
+        '  "date": "YYYY-MM-DD",\n'
+        '  "notes": "Notes légales ou clauses particulières si nécessaires"\n'
+        "}"
+    )
+
+    user_prompt = f"Langue souhaitée: {lang}\nDate: {date_str}\nInformations brutes:\n{free_text}"
+
+    last_error = None
+    for step_info in CONTRAT_CASCADE:
+        provider = step_info["provider"]
+        model_id = step_info["model_id"]
+        label = step_info["label"]
+
+        try:
+            logging.info(f"[CONTRAT] Tentative sur {label} ({model_id})...")
+            raw = execute_llm_call(provider, model_id, system_prompt, user_prompt)
+            if not raw.strip():
+                raise ValueError("Réponse vide du modèle.")
+
+            cleaned = strip_code_fences(raw)
+            data = json.loads(cleaned)
+
+            if "description_bien" in data and "prix_total" in data:
+                data["model_used"] = model_id
+                return data
+            else:
+                raise ValueError("JSON incomplet.")
+
+        except Exception as e:
+            last_error = e
+            logging.warning(f"[CONTRAT ÉCHEC] {label} a échoué : {e}. Passage au fallback suivant...")
+            time.sleep(1.0)
+
+    raise RuntimeError(f"Toute la cascade a échoué. Dernière erreur : {last_error}")
+
+
+@correcteur_bp.route("/1/generate-contrat", methods=["POST"])
+def generate_contrat_endpoint():
+    try:
+        data = request.json or {}
+        free_text = data.get("freeText", "").strip()
+        lang = data.get("lang", "fr").strip()
+        date_str = data.get("dateStr", "").strip()
+
+        if not free_text:
+            return jsonify({"error": "Les informations du contrat sont vides."}), 400
+
+        result = generate_contrat_with_cascade(free_text, lang, date_str)
+        return jsonify(result)
+
+    except Exception as e:
+        logging.error(f"[CONTRAT CRITICAL] {e}")
+        return jsonify({"error": f"Erreur lors de la génération : {str(e)}"}), 500
+
+
 @correcteur_bp.route("/ping-correcteur")
 def ping_correcteur():
     return jsonify({"status": "correcteur_engine_online"})

@@ -20,6 +20,9 @@ from dotenv import load_dotenv
 
 from prompts import generate_system_prompt
 
+# ── IMPORT OLLAMA LOCAL ───────────────────────────────────────────────────────
+from ollama import ollama_bp
+
 load_dotenv()
 
 app = Flask(__name__)
@@ -33,6 +36,7 @@ from contenu_agent import contenu_bp
 app.register_blueprint(site2_bp)
 app.register_blueprint(correcteur_bp)
 app.register_blueprint(contenu_bp)
+app.register_blueprint(ollama_bp)
 
 # ── MODÈLES ────────────────────────────────────────────────────────────────────
 MODELS = {
@@ -61,7 +65,6 @@ client_gemini_paid = genai.Client(api_key=API_KEY_PAID) if API_KEY_PAID else Non
 import httpx
 _shared_http_client = httpx.Client(timeout=35.0)
 
-# ✅ CORRECTION : URLs brutes sans crochets ni markdown
 client_openrouter = (
     OpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_API_KEY, http_client=_shared_http_client)
     if OPENROUTER_API_KEY else None
@@ -603,23 +606,6 @@ def horizon_warmup():
     except Exception as e:
         print(f"[WARMUP] Erreur : {e}")
         return jsonify({"status": "error"})
-
-@app.route("/home", methods=["POST"])
-def home():
-    try:
-        data = request.json or {}
-        ctx  = prepare_shared_context(data, source_override="home")
-        if is_paid_tier(ctx["user_tier"]):
-            return jsonify(run_paid_cascade(ctx, page_timeout=10))
-        steps = [
-            ("ds", "deepseek",        8),
-            ("rq", "grok_reasoning", 12),
-            ("or", "llama",          15),
-        ]
-        return jsonify(run_free_cascade(steps, ctx))
-    except Exception as e:
-        print(f"Erreur /home: {e}")
-        return jsonify(ERR_CRASH), 500
 
 @app.route("/chat", methods=["POST"])
 def chat():
@@ -1206,7 +1192,6 @@ def analyse_avis():
             except Exception as e:
                 logging.info(f"[ANALYSE] Groq (Requesty) echec ({e})")
 
-        # ✅ FALLBACK DE SECOURS SUR GEMINI SI LES OUTILS WEB ÉCHOUENT
         if not raw_response and client_gemini_paid is not None:
             try:
                 logging.info("[ANALYSE] Tentative Fallback Gemini...")
