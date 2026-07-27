@@ -58,7 +58,7 @@ def execute_llm_call(provider: str, model_id: str, system_prompt: str, user_prom
         if client_requesty is None:
             raise RuntimeError("Requesty indisponible.")
         res = client_requesty.chat.completions.create(
-            model=model_id, messages=messages, temperature=0.3, max_tokens=16000, timeout=90.0
+            model=model_id, messages=messages, temperature=0.3, max_tokens=32000, timeout=90.0
         )
         finish_reason = res.choices[0].finish_reason
         print(f"[FINISH_REASON] {model_id} (rq) -> {finish_reason}")
@@ -68,7 +68,7 @@ def execute_llm_call(provider: str, model_id: str, system_prompt: str, user_prom
         if client_deepseek is None:
             raise RuntimeError("DeepSeek indisponible.")
         res = client_deepseek.chat.completions.create(
-            model=model_id, messages=messages, temperature=0.3, max_tokens=16000, timeout=90.0,
+            model=model_id, messages=messages, temperature=0.3, max_tokens=32000, timeout=90.0,
             extra_body={"thinking": {"type": "disabled"}},
         )
         finish_reason = res.choices[0].finish_reason
