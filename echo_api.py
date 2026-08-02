@@ -1161,7 +1161,7 @@ def analyse_avis():
         if client_requesty is not None:
             try:
                 res = client_requesty.chat.completions.create(
-                    model="nebius/openai/gpt-oss-120b",
+                    model="fireworks/gpt-oss-120b",
                     messages=messages,
                     temperature=0.3,
                     max_tokens=2500,
@@ -1170,9 +1170,9 @@ def analyse_avis():
                 )
                 raw_response = res.choices[0].message.content
                 if raw_response:
-                    logging.info("[ANALYSE] Nebius (Requesty) OK")
+                    logging.info("[ANALYSE]_fireworks (Requesty) OK")
             except Exception as e:
-                logging.info(f"[ANALYSE] Nebius (Requesty) echec ({e})")
+                logging.info(f"[ANALYSE]_fireworks (Requesty) echec ({e})")
 
         if not raw_response and client_openrouter is not None:
             try:
