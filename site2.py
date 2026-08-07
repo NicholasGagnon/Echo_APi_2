@@ -452,7 +452,7 @@ def check_unlock():
 WORLD_MODELS = {
     "na_1": "xai/grok-4-fast-non-reasoning",    # Requesty
     "na_2": "openai/gpt-4o-mini",                # Requesty
-    "cn_1": "deepseek-v4-flash",                                    # DeepSeek direct — premier
+    "cn_1": "DeepSeek-V4-Flash-0731",                                    # DeepSeek direct — premier
     "cn_2": "deepinfra/Qwen/Qwen3-235B-A22B-Instruct-2507",            # Requesty — Qwen3-235B
     "cn_3": "deepinfra/Qwen/Qwen3-Coder-480B-A35B-Instruct-Turbo",     # Requesty — Qwen Coder 480B
     "eu_1": "mistral/mistral-small-latest",      # Requesty

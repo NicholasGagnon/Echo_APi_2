@@ -41,7 +41,7 @@ MODELS = {
     "grok_reasoning": "xai/grok-4-fast",
     "llama":      "meta-llama/llama-3.3-70b-instruct",
     "ling":       "inclusionai/ling-2.6-flash",
-    "deepseek":   "deepseek-v4-flash",
+    "deepseek":   "DeepSeek-V4-Flash-0731",
     "glm":        "GLM-4.5-Air",
 }
 

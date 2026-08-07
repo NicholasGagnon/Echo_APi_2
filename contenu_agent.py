@@ -40,7 +40,7 @@ client_deepseek = (
     if DEEPSEEK_API_KEY else None
 )
 
-MODEL_DEEPSEEK = {"provider": "ds", "model_id": "deepseek-v4-flash"}
+MODEL_DEEPSEEK = {"provider": "ds", "model_id": "DeepSeek-V4-Flash-0731"}
 MODEL_GROK     = {"provider": "rq", "model_id": "xai/grok-4-fast-non-reasoning"}
 
 # Cascade unifiée utilisée par toutes les routes : DeepSeek → Grok-4-Fast-Non-Reasoning (Requesty) → DeepSeek

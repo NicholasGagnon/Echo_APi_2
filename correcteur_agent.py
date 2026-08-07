@@ -38,7 +38,7 @@ client_deepseek = (
 
 # ── FAMILLES DISPONIBLES ─────────────────────────────────────────────────────
 FAMILIES = {
-    "deepseek": {"provider": "ds", "model_id": "deepseek-v4-flash"},
+    "deepseek": {"provider": "ds", "model_id": "DeepSeek-V4-Flash-0731"},
     "gemini":   {"provider": "g",  "model_id": "gemini-2.5-flash-lite"},
     "grok":     {"provider": "rq", "model_id": "grok-4-fast-non-reasoning"},
     "chatgpt":  {"provider": "rq", "model_id": "gpt-4o-mini"},
