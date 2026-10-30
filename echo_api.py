@@ -34,15 +34,15 @@ app.register_blueprint(site2_bp)
 app.register_blueprint(correcteur_bp)
 app.register_blueprint(contenu_bp)
 
-# ── MODÈLES ────────────────────────────────────────────────────────────────────
+# ── MODÈLES OFFICIELS ─────────────────────────────────────────────────────────
 MODELS = {
-    "gemini_paid_founder":  "gemini-3.5-flash",
     "gemini_paid_standard": "gemini-2.5-flash-lite",
-    "grok_reasoning": "xai/grok-4-fast",
-    "llama":      "meta-llama/llama-3.3-70b-instruct",
-    "ling":       "inclusionai/ling-2.6-flash",
-    "deepseek":   "deepseek-v4-flash",
-    "glm":        "GLM-4.5-Air",
+    "luna":                 "openai/gpt-6-luna",
+    "grok_reasoning":       "xai/grok-4-fast",
+    "grok_fast":            "xai/grok-4-fast-non-reasoning",
+    "llama":                "meta-llama/llama-3.3-70b-instruct",
+    "deepseek":             "deepseek-flash",
+    "ling":                 "inclusionai/ling-3.0-flash",
 }
 
 FREE_MAX_TOKENS = 2_500
@@ -52,7 +52,6 @@ PAID_MAX_TOKENS = 5_000
 API_KEY_PAID          = os.getenv("API_KEY_PAID", "").strip()
 OPENROUTER_API_KEY    = os.getenv("OPENROUTER_API_KEY", "").strip()
 DEEPSEEK_API_KEY      = os.getenv("DEEPSEEK_API_KEY", "").strip()
-ZAI_API_KEY           = os.getenv("ZAI_API_KEY", "").strip()
 REQUESTY_API_KEY      = os.getenv("REQUESTY_API_KEY", "").strip()
 CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
 
@@ -61,7 +60,6 @@ client_gemini_paid = genai.Client(api_key=API_KEY_PAID) if API_KEY_PAID else Non
 import httpx
 _shared_http_client = httpx.Client(timeout=35.0)
 
-# ✅ CORRECTION : URLs brutes sans crochets ni markdown
 client_openrouter = (
     OpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_API_KEY, http_client=_shared_http_client)
     if OPENROUTER_API_KEY else None
@@ -75,10 +73,6 @@ client_openrouter_warmup = (
 client_deepseek = (
     OpenAI(base_url="https://api.deepseek.com", api_key=DEEPSEEK_API_KEY, http_client=_shared_http_client)
     if DEEPSEEK_API_KEY else None
-)
-client_zai = (
-    OpenAI(base_url="https://api.z.ai/api/paas/v4", api_key=ZAI_API_KEY, http_client=_shared_http_client)
-    if ZAI_API_KEY else None
 )
 client_requesty = (
     OpenAI(base_url="https://router.requesty.ai/v1", api_key=REQUESTY_API_KEY, http_client=_shared_http_client)
@@ -418,21 +412,6 @@ def call_deepseek(ctx, temp=0.5, timeout=20.0):
         raise ValueError("Reponse vide de deepseek")
     return content
 
-def call_glm(ctx, temp=0.5, timeout=20.0):
-    if client_zai is None:
-        raise RuntimeError("Z.AI non configuré")
-    res = client_zai.chat.completions.create(
-        model=MODELS["glm"],
-        messages=ctx["messages_openai"],
-        temperature=temp,
-        max_tokens=ctx.get("output_tokens", FREE_MAX_TOKENS),
-        timeout=timeout,
-    )
-    content = res.choices[0].message.content
-    if content is None:
-        raise ValueError("Reponse vide de glm")
-    return content
-
 # ── DISPATCH COMMUN POUR LES CASCADES ──────────────────────────────────────────
 def _dispatch_step(provider, model_key, ctx, timeout, parser):
     if provider == "g":
@@ -443,9 +422,6 @@ def _dispatch_step(provider, model_key, ctx, timeout, parser):
         return parser(r.text)
     elif provider == "ds":
         r = call_deepseek(ctx, temp=0.5, timeout=float(timeout))
-        return parser(r)
-    elif provider == "z":
-        r = call_glm(ctx, temp=0.5, timeout=float(timeout))
         return parser(r)
     elif provider == "rq":
         r = call_requesty(model_key, ctx, temp=0.5, timeout=float(timeout))
@@ -464,8 +440,6 @@ def _run_simple_cascade(steps, ctx, parser=None):
             continue
         if provider == "rq" and client_requesty is None:
             continue
-        if provider == "z" and client_zai is None:
-            continue
         if is_model_locked(model_key):
             continue
         try:
@@ -483,25 +457,25 @@ def run_paid_cascade(ctx, page_timeout: int = 10):
         steps = [
             ("ds", "deepseek",       t),
             ("or", "llama",          t),
-            ("rq", "grok_reasoning", t),
+            ("rq", "luna",           t),
         ]
     elif tier == "premium":
         steps = [
-            ("ds", "deepseek", t),
-            ("or", "llama",    t),
-            ("ds", "deepseek", t),
+            ("rq", "luna",           t),
+            ("ds", "deepseek",       t),
+            ("or", "llama",          t),
         ]
     elif tier == "ultra":
         steps = [
-            ("ds", "deepseek",       t),
+            ("rq", "luna",           t),
             ("rq", "grok_reasoning", t),
             ("ds", "deepseek",       t),
         ]
-    else:
+    else:  # founder : Luna + Gemini Lite + DeepSeek Flash
         steps = [
-            ("g",  "gemini_paid_founder", t),
-            ("ds", "deepseek",            t),
-            ("ds", "deepseek",            t),
+            ("rq", "luna",                 t),
+            ("g",  "gemini_paid_standard", t),
+            ("ds", "deepseek",             t),
         ]
 
     for provider, model_key, timeout in steps:
@@ -523,8 +497,6 @@ def run_free_cascade(steps, ctx, parser=None, is_horizon=False):
         if provider == "or" and client_openrouter is None:
             continue
         if provider == "ds" and client_deepseek is None:
-            continue
-        if provider == "z" and client_zai is None:
             continue
         if provider == "rq" and client_requesty is None:
             continue
@@ -573,17 +545,21 @@ def horizon_warmup():
             "gemini_contents": [{"role": "user", "parts": [types.Part.from_text(text=prompt)]}],
         }
         raw = None
+        # Cascade de warmup ultra-légère et économique via OpenRouter
         for wm_name, wm_id in [
-            ("ling",         "inclusionai/ling-2.6-flash"),
+            ("ling-3.0",     "inclusionai/ling-3.0-flash"),
             ("nova-lite",    "amazon/nova-lite-v1"),
             ("ministral-3b", "mistralai/ministral-3b-2512"),
         ]:
             try:
-                if client_openrouter_warmup is None: break
+                if client_openrouter_warmup is None:
+                    break
                 res = client_openrouter_warmup.chat.completions.create(
                     model=wm_id,
                     messages=ctx["messages_openai"],
-                    temperature=0.1, max_tokens=150, timeout=4.0,
+                    temperature=0.1,
+                    max_tokens=150,
+                    timeout=4.0,
                 )
                 raw = res.choices[0].message.content
                 if raw:
@@ -613,7 +589,7 @@ def home():
             return jsonify(run_paid_cascade(ctx, page_timeout=10))
         steps = [
             ("ds", "deepseek",        8),
-            ("rq", "grok_reasoning", 12),
+            ("rq", "luna",           10),
             ("or", "llama",          15),
         ]
         return jsonify(run_free_cascade(steps, ctx))
@@ -639,7 +615,7 @@ def chat():
             return jsonify(run_paid_cascade(ctx, page_timeout=10))
         steps = [
             ("ds", "deepseek",        8),
-            ("rq", "grok_reasoning", 12),
+            ("rq", "luna",           10),
             ("or", "llama",          15),
         ]
         return jsonify(run_free_cascade(steps, ctx))
@@ -654,7 +630,7 @@ def vitality():
         ctx  = prepare_shared_context(data, source_override="vitality")
         steps = [
             ("ds", "deepseek", 20),
-            ("or", "llama",    20),
+            ("rq", "luna",     20),
             ("ds", "deepseek", 20),
         ]
         if is_paid_tier(ctx["user_tier"]):
@@ -676,7 +652,7 @@ def history():
             return jsonify(run_paid_cascade(ctx, page_timeout=12))
         steps = [
             ("ds", "deepseek", 15),
-            ("or", "llama",    15),
+            ("rq", "luna",     15),
         ]
         return jsonify(run_free_cascade(steps, ctx))
     except Exception as e:
@@ -723,36 +699,31 @@ def books():
             msgs.append({"role": "user", "content": message})
             return msgs
 
-        def run_books_call_deepseek(timeout):
-            if client_deepseek is None:
-                raise RuntimeError("DeepSeek non configuré")
-            res = client_deepseek.chat.completions.create(
-                model=MODELS["deepseek"],
-                messages=build_openai_messages(history),
-                temperature=0.5,
-                max_tokens=output_tokens,
-                timeout=float(timeout),
-            )
-            content = res.choices[0].message.content
-            if not content:
-                raise ValueError("Reponse vide de deepseek")
-            return content
-
-        full_text = ""
-        for attempt in range(3):
-            if is_model_locked("deepseek"):
-                print(f"[BOOKS] deepseek verrouillé, essai {attempt + 1} sauté")
-            else:
+        def run_books_call():
+            if client_deepseek:
                 try:
-                    full_text = run_books_call_deepseek(20)
-                    if full_text:
-                        break
+                    res = client_deepseek.chat.completions.create(
+                        model=MODELS["deepseek"],
+                        messages=build_openai_messages(history),
+                        temperature=0.5,
+                        max_tokens=output_tokens,
+                        timeout=20.0,
+                    )
+                    return res.choices[0].message.content
                 except Exception as e:
-                    print(f"[BOOKS] Echec deepseek (essai {attempt + 1}) ({e})")
-                    lock_model("deepseek", 30)
-            if attempt < 2:
-                time.sleep(2.0)
+                    print(f"[BOOKS] DeepSeek fallback to Luna ({e})")
+            if client_requesty:
+                res = client_requesty.chat.completions.create(
+                    model=MODELS["luna"],
+                    messages=build_openai_messages(history),
+                    temperature=0.5,
+                    max_tokens=output_tokens,
+                    timeout=20.0,
+                )
+                return res.choices[0].message.content
+            raise RuntimeError("Aucun client disponible pour books")
 
+        full_text = run_books_call()
         if not full_text:
             return jsonify({"response": ERR_FINAL["response"], "inject": False, "action": None})
 
@@ -871,7 +842,6 @@ def memory_summary():
         ctx = {
             "system_prompt":   "Tu es un compresseur de mémoire conversationnelle. Réponds uniquement avec le résumé demandé.",
             "output_tokens":   600,
-            "gemini_contents": [{"role": "user", "parts": [types.Part.from_text(text=prompt)]}],
             "messages_openai": [
                 {"role": "system", "content": "Tu es un compresseur de mémoire conversationnelle."},
                 {"role": "user",   "content": prompt},
@@ -879,17 +849,20 @@ def memory_summary():
             "user_tier": user_tier,
         }
 
+        # Compression ultra-économique via OpenRouter
         for mm_name, mm_id in [
-            ("ling",         "inclusionai/ling-2.6-flash"),
+            ("ling-3.0",     "inclusionai/ling-3.0-flash"),
             ("nova-lite",    "amazon/nova-lite-v1"),
-            ("ministral-3b", "mistralai/ministral-3b-2512"),
         ]:
             try:
-                if client_openrouter_warmup is None: break
-                res = client_openrouter_warmup.chat.completions.create(
+                if client_openrouter is None:
+                    break
+                res = client_openrouter.chat.completions.create(
                     model=mm_id,
                     messages=ctx["messages_openai"],
-                    temperature=0.1, max_tokens=600, timeout=15.0,
+                    temperature=0.1,
+                    max_tokens=600,
+                    timeout=12.0,
                 )
                 summary = (res.choices[0].message.content or "").strip()
                 if summary:
@@ -1161,52 +1134,18 @@ def analyse_avis():
         if client_requesty is not None:
             try:
                 res = client_requesty.chat.completions.create(
-                    model="fireworks/gpt-oss-120b",
-                    messages=messages,
-                    temperature=0.3,
-                    max_tokens=2500,
-                    timeout=30.0,
-                    extra_body={"plugins": [{"id": "web"}]}
-                )
-                raw_response = res.choices[0].message.content
-                if raw_response:
-                    logging.info("[ANALYSE]_fireworks (Requesty) OK")
-            except Exception as e:
-                logging.info(f"[ANALYSE]_fireworks (Requesty) echec ({e})")
-
-        if not raw_response and client_openrouter is not None:
-            try:
-                res = client_openrouter.chat.completions.create(
-                    model="openai/gpt-oss-120b",
-                    messages=messages,
-                    temperature=0.3,
-                    max_tokens=2500,
-                    timeout=30.0,
-                    extra_body={"plugins": [{"id": "web"}]}
-                )
-                raw_response = res.choices[0].message.content
-                if raw_response:
-                    logging.info("[ANALYSE] OpenRouter OK")
-            except Exception as e:
-                logging.info(f"[ANALYSE] OpenRouter echec ({e})")
-
-        if not raw_response and client_requesty is not None:
-            try:
-                res = client_requesty.chat.completions.create(
-                    model="groq/openai/gpt-oss-120b",
+                    model=MODELS["luna"],
                     messages=messages,
                     temperature=0.3,
                     max_tokens=2500,
                     timeout=25.0,
-                    extra_body={"plugins": [{"id": "web"}]}
                 )
                 raw_response = res.choices[0].message.content
                 if raw_response:
-                    logging.info("[ANALYSE] Groq (Requesty) OK")
+                    logging.info("[ANALYSE] Luna (Requesty) OK")
             except Exception as e:
-                logging.info(f"[ANALYSE] Groq (Requesty) echec ({e})")
+                logging.info(f"[ANALYSE] Luna (Requesty) echec ({e})")
 
-        # ✅ FALLBACK DE SECOURS SUR GEMINI SI LES OUTILS WEB ÉCHOUENT
         if not raw_response and client_gemini_paid is not None:
             try:
                 logging.info("[ANALYSE] Tentative Fallback Gemini...")
@@ -1278,30 +1217,6 @@ def _warmup_api():
     try:
         print("[BOOST] Reveil des routes Echo...")
         _requests_lib.get("[http://127.0.0.1:5000/ping](http://127.0.0.1:5000/ping)", timeout=2)
-
-        print("[BOOST] Warmup de Ling (classification d'intentions)...")
-        try:
-            if client_openrouter is not None:
-                _requests_lib.post(
-                    "[http://127.0.0.1:5000/horizon-warmup](http://127.0.0.1:5000/horizon-warmup)",
-                    json={"partial": "comment"},
-                    timeout=5,
-                )
-                print("[BOOST] Ling warmup réussi")
-        except Exception as e:
-            print(f"[BOOST] Ling warmup optionnel échoué: {e}")
-
-        print("[BOOST] Warmup de World...")
-        try:
-            _requests_lib.post(
-                "[http://127.0.0.1:5000/world/warmup](http://127.0.0.1:5000/world/warmup)",
-                json={},
-                timeout=6,
-            )
-            print("[BOOST] World warmup réussi")
-        except Exception as e:
-            print(f"[BOOST] World warmup optionnel échoué: {e}")
-
     except Exception:
         pass
 

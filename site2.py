@@ -5,7 +5,6 @@ import time
 import resend
 from openai import OpenAI
 
-
 site2_bp = Blueprint("site2", __name__)
 
 ERR_CRASH = {"action": None, "response": "Une erreur inattendue s'est produite. Reessaie dans quelques secondes."}
@@ -28,8 +27,11 @@ def check_recovery_rate_limit(email: str) -> bool:
 
 # ── MODÈLES SITE2 ─────────────────────────────────────────────────────────────
 SITE2_MODELS = {
-    "grok":  "xai/grok-4-1-fast-non-reasoning",
-    "qwen3": "deepinfra/Qwen/Qwen3-235B-A22B-Instruct-2507",
+    "grok":        "xai/grok-4-1-fast-non-reasoning",
+    "grok_fast":   "xai/grok-4-fast-non-reasoning",
+    "qwen3":       "deepinfra/Qwen/Qwen3-235B-A22B-Instruct-2507",
+    "luna":        "azure/gpt-6-luna@eastus2",
+    "gemini_lite": "google/gemini-2.5-flash-lite",
 }
 
 REQUESTY_API_KEY = os.getenv("REQUESTY_API_KEY", "").strip()
@@ -39,11 +41,11 @@ client_requesty = (
     if REQUESTY_API_KEY else None
 )
 
-def call_requesty(model_key: str, messages_openai, temp=0.5, timeout=20.0, max_tokens=2500):
+def call_requesty(model_name: str, messages_openai, temp=0.5, timeout=20.0, max_tokens=2500):
     if client_requesty is None:
         raise RuntimeError("Requesty non configuré")
     res = client_requesty.chat.completions.create(
-        model=SITE2_MODELS[model_key],
+        model=model_name,
         messages=messages_openai,
         temperature=temp,
         max_tokens=max_tokens,
@@ -51,7 +53,7 @@ def call_requesty(model_key: str, messages_openai, temp=0.5, timeout=20.0, max_t
     )
     content = res.choices[0].message.content
     if content is None:
-        raise ValueError(f"Reponse vide de {model_key}")
+        raise ValueError(f"Reponse vide de {model_name}")
     return content
 
 # ── PARSER JSON ───────────────────────────────────────────────────────────────
@@ -122,7 +124,7 @@ def send_interet_email(to_email: str, fiche_nom: str, sender_key: str, type_inte
     <div style="font-family: sans-serif; max-width: 480px; margin: 0 auto;">
         <h2>{emoji} Nouvelle activité sur ta fiche</h2>
         <p><strong>{sender_key}</strong> {label} pour <strong>{fiche_nom}</strong>.</p>
-        <a href="https://tonsite.com/1/fiche" style="display:inline-block; background:#18181b; color:white; padding:12px 24px; border-radius:10px; text-decoration:none; font-weight:600; margin-top:12px;">
+        <a href="[https://tonsite.com/1/fiche](https://tonsite.com/1/fiche)" style="display:inline-block; background:#18181b; color:white; padding:12px 24px; border-radius:10px; text-decoration:none; font-weight:600; margin-top:12px;">
             Voir qui s'intéresse à ta fiche →
         </a>
     </div>
@@ -215,7 +217,6 @@ def notifier_interet():
         return jsonify(ERR_CRASH), 500
 
 # ── /1/conversation ───────────────────────────────────────────────────────────
-# Cascade : DeepSeek ➔ Grok-4-Fast-Non-Reasoning (Requesty) ➔ DeepSeek — même cascade pour tous les tiers.
 @site2_bp.route("/1/conversation", methods=["POST"])
 def site2_conversation():
     from echo_api import prepare_shared_context, call_deepseek
@@ -223,7 +224,7 @@ def site2_conversation():
         data = request.json or {}
         ctx  = prepare_shared_context(data, source_override="chat")
 
-        steps = [("ds", None, 20), ("rq", "grok", 20), ("ds", None, 20)]
+        steps = [("ds", None, 20), ("rq", SITE2_MODELS["grok_fast"], 20), ("ds", None, 20)]
         for provider, model_key, timeout in steps:
             try:
                 if provider == "ds":
@@ -243,9 +244,6 @@ def site2_conversation():
 # ── /1/generate-invoice ───────────────────────────────────────────────────────
 @site2_bp.route("/1/generate-invoice", methods=["POST"])
 def generate_invoice():
-    from echo_api import client_zai, MODELS
-    import json
-
     try:
         data      = request.json or {}
         free_text = (data.get("freeText") or "").strip()
@@ -280,30 +278,41 @@ def generate_invoice():
         )
         messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
         raw = None
+
         if client_requesty is not None:
             try:
-                raw = call_requesty("grok", messages, temp=0.2, timeout=25.0, max_tokens=800)
-                print("[INVOICE] Grok OK")
+                raw = call_requesty(SITE2_MODELS["luna"], messages, temp=0.2, timeout=20.0, max_tokens=800)
+                print("[INVOICE] Luna OK")
             except Exception as e:
-                print(f"[INVOICE] Grok echec ({e})")
-        if not raw and client_requesty is not None:
-            try:
-                raw = call_requesty("qwen3", messages, temp=0.2, timeout=25.0, max_tokens=800)
-                print("[INVOICE] Qwen OK")
-            except Exception as e:
-                print(f"[INVOICE] Qwen echec ({e})")
+                print(f"[INVOICE] Luna echec ({e})")
+            
+            if not raw:
+                try:
+                    raw = call_requesty(SITE2_MODELS["grok_fast"], messages, temp=0.2, timeout=20.0, max_tokens=800)
+                    print("[INVOICE] Grok OK")
+                except Exception as e:
+                    print(f"[INVOICE] Grok echec ({e})")
+
         if not raw:
             from echo_api import client_deepseek, MODELS
             if client_deepseek is not None:
                 try:
                     res = client_deepseek.chat.completions.create(
-                        model=MODELS["deepseek"], messages=messages, temperature=0.2, max_tokens=800, timeout=25.0)
+                        model=MODELS.get("deepseek", "deepseek-flash"),
+                        messages=messages,
+                        temperature=0.2,
+                        max_tokens=800,
+                        timeout=25.0
+                    )
                     raw = res.choices[0].message.content
                     print("[INVOICE] DeepSeek OK")
                 except Exception as e:
                     print(f"[INVOICE] DeepSeek echec ({e})")
+
         if not raw:
             return jsonify({"error": "IA indisponible"}), 503
+
+        import json
         text = raw.strip()
         if text.startswith("```json"): text = text[7:]
         elif text.startswith("```"):   text = text[3:]
@@ -331,7 +340,6 @@ def generate_invoice():
         return jsonify({"error": str(e)}), 500
 
 # ── /2/analyse-idee ───────────────────────────────────────────────────────────
-# Cascade : Grok-4-Fast-Non-Reasoning ➔ (2s) ➔ Grok-4-Fast-Non-Reasoning ➔ Grok-4-Fast (reasoning) — tout via Requesty.
 @site2_bp.route("/2/analyse-idee", methods=["POST"])
 def analyse_idee():
     from prompts2 import get_idea_system_prompt, get_idea_user_prompt
@@ -349,28 +357,24 @@ def analyse_idee():
         raw = None
 
         if client_requesty is not None:
-            for attempt in range(2):
-                try:
-                    res = client_requesty.chat.completions.create(
-                        model="xai/grok-4-fast-non-reasoning", messages=messages,
-                        temperature=0.3, max_tokens=1200, timeout=25.0)
-                    raw = (res.choices[0].message.content or "").strip() or None
-                    if raw:
-                        print(f"[IDEA] Grok-4-Fast-Non-Reasoning OK (essai {attempt + 1})")
-                        break
-                except Exception as e:
-                    print(f"[IDEA] Grok-4-Fast-Non-Reasoning echec (essai {attempt + 1}) ({e})")
-                if attempt == 0:
-                    time.sleep(2.0)
-
-        if not raw and client_requesty is not None:
             try:
                 res = client_requesty.chat.completions.create(
-                    model="xai/grok-4-fast", messages=messages, temperature=0.3, max_tokens=1200, timeout=25.0)
+                    model=SITE2_MODELS["grok_fast"], messages=messages,
+                    temperature=0.3, max_tokens=1200, timeout=20.0)
                 raw = (res.choices[0].message.content or "").strip() or None
-                if raw: print("[IDEA] Grok-4-Fast OK")
+                if raw: print("[IDEA] Grok-Fast OK")
             except Exception as e:
-                print(f"[IDEA] Grok-4-Fast echec ({e})")
+                print(f"[IDEA] Grok-Fast echec ({e})")
+
+            if not raw:
+                try:
+                    res = client_requesty.chat.completions.create(
+                        model=SITE2_MODELS["luna"], messages=messages,
+                        temperature=0.3, max_tokens=1200, timeout=20.0)
+                    raw = (res.choices[0].message.content or "").strip() or None
+                    if raw: print("[IDEA] Luna OK")
+                except Exception as e:
+                    print(f"[IDEA] Luna echec ({e})")
 
         if not raw:
             return jsonify({"error": "Analyse indisponible"}), 503
@@ -447,30 +451,30 @@ def check_unlock():
 # ══════════════════════════════════════════════════════════════════════════════
 # ── WORLD — CASCADE 3 CONTINENTS ─────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
-# NOTE : continent NA — gemini-3.1-flash-lite retiré completement (prix trop eleve).
-# NOTE : continent NA — remplace GPT search (OpenRouter) par un "vrai" GPT via Requesty (gpt-4o-mini).
 WORLD_MODELS = {
-    "na_1": "xai/grok-4-fast-non-reasoning",    # Requesty
-    "na_2": "openai/gpt-4o-mini",                # Requesty
-    "cn_1": "deepseek-v4-flash",                                       # DeepSeek direct — premier
-    "cn_2": "deepinfra/Qwen/Qwen3-235B-A22B-Instruct-2507",            # Requesty — Qwen3-235B
-    "cn_3": "deepinfra/Qwen/Qwen3-Coder-480B-A35B-Instruct-Turbo",     # Requesty — Qwen Coder 480B
-    "eu_1": "mistral/mistral-small-latest",      # Requesty
-    "eu_2": "mistralai/mistral-small-2603",      # OpenRouter
-    "eu_3": "mistral/mistral-small-2603",        # Requesty
+    # ── Amérique du Nord (xAI / OpenAI)
+    "na_1": "xai/grok-4-fast-non-reasoning",
+    "na_2": "openai/gpt-6-luna",
+
+    # ── Chine / Asie (DeepSeek / Qwen Alibaba / Zhipu GLM)
+    "cn_1": "deepseek-flash",
+    "cn_2": "deepinfra/Qwen/Qwen3-235B-A22B-Instruct-2507",
+    "cn_3": "thudm/glm-4-9b-chat",
+
+    # ── Europe (Mistral AI - France)
+    "eu_1": "mistral/mistral-small-latest",
+    "eu_2": "mistral/mistral-large-latest",
+    "eu_3": "mistral/mistral-small-2603",
 }
 
 def _strip_markdown(text: str) -> str:
-    """FIX 3 — retire le markdown que certains modèles insèrent malgré l'instruction."""
     text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)
     text = re.sub(r'\*([^*]+)\*',     r'\1', text)
     text = re.sub(r'#{1,6}\s*',       '',    text)
     text = re.sub(r'`([^`]+)`',       r'\1', text)
     return text.strip()
 
-
 def _clean_cut(text: str, max_chars: int) -> str:
-    """Coupe proprement a la derniere phrase complete avant max_chars."""
     if len(text) <= max_chars:
         return text
     truncated = text[:max_chars]
@@ -498,85 +502,31 @@ def call_world_model(client, model_name: str, messages: list, timeout: float = 2
     )
     choice        = res.choices[0]
     finish_reason = getattr(choice, "finish_reason", "unknown")
-    message       = choice.message
-    content       = message.content
-
-    # DEBUG complet — log finish_reason + model_dump pour trouver où GLM cache sa réponse
-    print(f"[WORLD DEBUG] {model_name} | finish_reason={finish_reason} | content_len={len(content) if content else 0}")
-
-    # Si contenu vide — chercher dans tous les champs alternatifs (GLM, DeepSeek, Z.AI)
-    if not content:
-        try:
-            raw_dump = message.model_dump()
-            print(f"[WORLD DEBUG] {model_name} model_dump = {raw_dump}")
-        except Exception as dump_err:
-            print(f"[WORLD DEBUG] model_dump error: {dump_err}")
-
-        # Champs alternatifs connus: reasoning_content, reasoning, thinking
-        for field in ("reasoning_content", "reasoning", "thinking"):
-            alt = getattr(message, field, None)
-            if alt and str(alt).strip():
-                alt_str = str(alt)
-                print(f"[WORLD DEBUG] {model_name} — contenu trouvé dans {field} ({len(alt_str)} chars)")
-                # GLM met son brouillon interne dans reasoning_content
-                # On cherche le dernier "Final Polish" ou "Draft final" pour extraire la vraie réponse
-                # Sinon on prend les 672 derniers chars qui sont généralement la réponse finale
-                final_markers = ["5.  **Final Polish", "Final Polish", "**Final", "Final Answer:", "Réponse finale:"]
-                extracted = None
-                for marker in final_markers:
-                    pos = alt_str.rfind(marker)
-                    if pos != -1:
-                        # Prendre ce qui suit le marker
-                        after = alt_str[pos:]
-                        # Enlever le marker lui-même et les lignes de formatage
-                        lines = after.split('\n')
-                        clean_lines = []
-                        for line in lines[1:]:
-                            line = line.strip().lstrip('*').lstrip('#').lstrip('-').strip()
-                            # Enlever les prefixes comme "    Je propose..."
-                            if line.startswith('    '):
-                                line = line.strip()
-                            if line and not line.startswith('*') and not line.startswith('#'):
-                                clean_lines.append(line)
-                        extracted = ' '.join(clean_lines[:3]).strip()
-                        if extracted and len(extracted) > 50:
-                            print(f"[WORLD DEBUG] {model_name} — extrait depuis marker '{marker}'")
-                            break
-                        extracted = None
-                content = extracted if extracted else alt_str[-800:].strip()
-                break
-
+    content       = choice.message.content
     if content is None:
-        raise ValueError(f"Réponse None de {model_name} (finish_reason={finish_reason})")
+        raise ValueError(f"Réponse None de {model_name} ({finish_reason})")
     content = content.strip()
     if not content:
-        raise ValueError(f"Réponse vide de {model_name} (finish_reason={finish_reason})")
+        raise ValueError(f"Réponse vide de {model_name} ({finish_reason})")
     return _clean_cut(_strip_markdown(content), 650)
 
 def run_world_cascade(continent: str, messages: list, attempt: int = 0) -> str:
     from echo_api import client_deepseek
-    try:
-        from echo_api import client_openrouter as _client_or
-    except ImportError:
-        _client_or = None
 
     steps = {
         "na": [
-            (client_requesty, WORLD_MODELS["na_1"], 20.0),  # Grok-4-Fast-Non-Reasoning
-            (client_requesty, WORLD_MODELS["na_2"], 20.0),  # GPT-4o-mini (vrai GPT, via Requesty)
-            (client_requesty, WORLD_MODELS["na_1"], 20.0),  # Grok-4-Fast-Non-Reasoning — retry final
+            (client_requesty, WORLD_MODELS["na_1"], 20.0),
+            (client_requesty, WORLD_MODELS["na_2"], 20.0),
+            (client_requesty, WORLD_MODELS["na_1"], 20.0),
         ],
         "cn": [
-            (client_deepseek, WORLD_MODELS["cn_1"], 60.0),  # DeepSeek — premier
-            (client_requesty, WORLD_MODELS["cn_2"], 60.0),  # Qwen3-235B — deuxième
-            (client_requesty, WORLD_MODELS["cn_3"], 60.0),  # Qwen Coder 480B — troisième
-            (client_deepseek, WORLD_MODELS["cn_1"], 60.0),  # DeepSeek — retry boucle 1
-            (client_requesty, WORLD_MODELS["cn_2"], 60.0),  # Qwen3-235B — retry boucle 2
-            (client_requesty, WORLD_MODELS["cn_3"], 60.0),  # Qwen Coder 480B — retry boucle 3
+            (client_deepseek, WORLD_MODELS["cn_1"], 30.0),
+            (client_requesty, WORLD_MODELS["cn_2"], 30.0),
+            (client_requesty, WORLD_MODELS["cn_3"], 20.0),
         ],
         "eu": [
             (client_requesty, WORLD_MODELS["eu_1"], 20.0),
-            (_client_or,      WORLD_MODELS["eu_2"], 20.0),
+            (client_requesty, WORLD_MODELS["eu_2"], 20.0),
             (client_requesty, WORLD_MODELS["eu_3"], 20.0),
         ],
     }.get(continent, [])
@@ -590,68 +540,22 @@ def run_world_cascade(continent: str, messages: list, attempt: int = 0) -> str:
             print(f"[WORLD][{continent.upper()}] {model_name} échec ({e})")
 
     if attempt < 1:
-        print(f"[WORLD][{continent.upper()}] Retry complet...")
         time.sleep(1.0)
         return run_world_cascade(continent, messages, attempt + 1)
 
     return "Service temporairement indisponible pour ce continent."
 
-# ── /world/warmup — réveille les modèles World au démarrage ─────────────────
 @site2_bp.route("/world/warmup", methods=["POST"])
 def world_warmup():
-    """
-    Ping léger sur les 3 cascades World pour réveiller Render.
-    Utilise des modèles ultra-légers via OpenRouter warmup client.
-    """
-    try:
-        from echo_api import client_openrouter_warmup
-    except ImportError:
-        return jsonify({"status": "no_client"}), 200
+    return jsonify({"status": "ready"}), 200
 
-    warmup_models = [
-        "inclusionai/ling-2.6-flash",
-        "amazon/nova-lite-v1",
-        "mistralai/ministral-3b-2512",
-    ]
-    warmup_msg = [
-        {"role": "system", "content": "You are a warmup ping. Reply with one word only."},
-        {"role": "user",   "content": "ping"},
-    ]
-    results = {}
-    for model in warmup_models:
-        try:
-            if client_openrouter_warmup is None:
-                break
-            res = client_openrouter_warmup.chat.completions.create(
-                model=model,
-                messages=warmup_msg,
-                temperature=0.1,
-                max_tokens=5,
-                timeout=5.0,
-            )
-            content_r = res.choices[0].message.content
-            if content_r:
-                results[model] = "ok"
-                print(f"[WORLD WARMUP] {model} OK")
-                break
-        except Exception as e:
-            results[model] = f"fail: {e}"
-            print(f"[WORLD WARMUP] {model} échec ({e})")
-
-    return jsonify({"status": "warmed", "results": results}), 200
-
-
-# ── /world/conversation ───────────────────────────────────────────────────────
 @site2_bp.route("/world/conversation", methods=["POST"])
 def world_conversation():
     try:
         from prompts_world import get_world_system_prompt, get_world_user_prompt
-
         data      = request.json or {}
 
-        # Warmup ping — retourner immédiatement sans appeler les modèles
         if data.get("warmup"):
-            print("[WORLD] Warmup ping reçu — serveur prêt")
             return jsonify({"status": "warm"}), 200
 
         question  = (data.get("question")  or "").strip()
@@ -669,7 +573,6 @@ def world_conversation():
         if lang not in ("fr", "en", "zh"):
             lang = "fr"
 
-        # FIX 2 — tronquer le contexte pour éviter les réponses vides sur contexte trop long
         if len(context) > 900:
             context = context[-900:]
 
@@ -690,7 +593,170 @@ def world_conversation():
 
         response_text = run_world_cascade(continent, messages)
         return jsonify({"response": response_text[:max_chars]})
-
     except Exception as e:
         print(f"[WORLD] Erreur critique: {e}")
         return jsonify(ERR_CRASH), 500
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── SECTION SOLUTION — TRIPLE CASCADE PARALLÈLE AVEC RECHERCHE WEB EN DIRECT ──
+# ══════════════════════════════════════════════════════════════════════════════
+from concurrent.futures import ThreadPoolExecutor
+
+MODEL_LUNA_PRIMARY = "openai/gpt-6-luna"
+MODEL_LUNA_AZURE   = "azure/gpt-6-luna@eastus2"
+MODEL_GEMINI_LITE  = "google/gemini-2.5-flash-lite"
+MODEL_GROK         = "xai/grok-4-fast-non-reasoning"
+MODEL_DEEPSEEK     = "deepseek-flash"
+
+def _call_single_model(client, model_name: str, messages: list, timeout: float = 35.0, temp: float = 0.4, enable_web: bool = False) -> str:
+    """Appel d'un modèle avec activation de la recherche web en direct si demandée."""
+    if client is None:
+        raise RuntimeError(f"Client non disponible pour {model_name}")
+    
+    kwargs = {
+        "model": model_name,
+        "messages": messages,
+        "temperature": temp,
+        "max_tokens": 20000,
+        "timeout": timeout,
+    }
+
+    # Activation de la recherche web en direct pour Requesty et OpenRouter
+    if enable_web:
+        base_url = str(getattr(client, "base_url", ""))
+        if "requesty" in base_url or "openrouter" in base_url:
+            kwargs["extra_body"] = {"plugins": [{"id": "web"}]}
+
+    res = client.chat.completions.create(**kwargs)
+    content = res.choices[0].message.content
+    if not content or not content.strip():
+        raise ValueError(f"Contenu vide retourné par {model_name}")
+    return content.strip()
+
+# ── 1. CASCADE IA HAUT-GAUCHE : SOURCES FIABLES & DOCUMENTATION (WEB ACTIF) ──
+# Ordre : Luna Direct -> Luna Azure -> Gemini 2.5 Flash Lite -> Grok
+def execute_doc_cascade(question: str, lang: str = "fr") -> str:
+    from prompts_solution import get_solution_system_prompt, get_solution_user_prompt
+    from echo_api import client_openrouter
+
+    messages = [
+        {"role": "system", "content": get_solution_system_prompt("doc", lang)},
+        {"role": "user",   "content": get_solution_user_prompt("doc", question, lang=lang)}
+    ]
+
+    steps = [
+        ("Requesty-Luna", client_requesty, MODEL_LUNA_PRIMARY, 25.0),
+        ("Requesty-Azure", client_requesty, MODEL_LUNA_AZURE, 25.0),
+        ("Requesty/OR", client_requesty or client_openrouter, MODEL_GEMINI_LITE, 20.0),
+        ("Requesty", client_requesty, MODEL_GROK, 20.0),
+    ]
+
+    for name, client, model_name, timeout in steps:
+        try:
+            out = _call_single_model(client, model_name, messages, timeout=timeout, temp=0.2, enable_web=True)
+            print(f"[SOLUTION][DOCS-WEB] {model_name} OK")
+            return out
+        except Exception as e:
+            print(f"[SOLUTION][DOCS-WEB] Échec {model_name} ({e})")
+
+    return "Impossible de récupérer les documentations officielles pour le moment."
+
+# ── 2. CASCADE IA HAUT-DROITE : FORUMS & RÉALITÉ DU TERRAIN (WEB ACTIF) ──────
+# Ordre : DeepSeek (timeout adapté) -> Luna Direct -> Luna Azure -> Gemini Lite
+def execute_forum_cascade(question: str, lang: str = "fr") -> str:
+    from prompts_solution import get_solution_system_prompt, get_solution_user_prompt
+    from echo_api import client_deepseek, client_openrouter
+
+    messages = [
+        {"role": "system", "content": get_solution_system_prompt("forum", lang)},
+        {"role": "user",   "content": get_solution_user_prompt("forum", question, lang=lang)}
+    ]
+
+    steps = [
+        ("DeepSeek", client_deepseek, MODEL_DEEPSEEK, 45.0),  # 👈 45s pour laisser le temps de chercher
+        ("Requesty-Luna", client_requesty, MODEL_LUNA_PRIMARY, 25.0),
+        ("Requesty-Azure", client_requesty, MODEL_LUNA_AZURE, 25.0),
+        ("Requesty/OR", client_requesty or client_openrouter, MODEL_GEMINI_LITE, 20.0),
+    ]
+
+    for name, client, model_name, timeout in steps:
+        try:
+            out = _call_single_model(client, model_name, messages, timeout=timeout, temp=0.4, enable_web=True)
+            print(f"[SOLUTION][FORUM-WEB] {model_name} OK")
+            return out
+        except Exception as e:
+            print(f"[SOLUTION][FORUM-WEB] Échec {model_name} ({e})")
+
+    return "Aucun contournement du terrain détecté sur les forums pour le moment."
+
+# ── 3. CASCADE IA DU BAS : ARBITRE SANS FILTRE & PLAN D'ACTION CASH ──────────
+# Ordre : DeepSeek (45s pour bien digérer les 2 sources) -> Luna Direct -> Luna Azure -> Grok
+def execute_arbiter_cascade(question: str, doc_text: str, forum_text: str, lang: str = "fr") -> str:
+    from prompts_solution import get_solution_system_prompt, get_solution_user_prompt
+    from echo_api import client_deepseek
+
+    messages = [
+        {"role": "system", "content": get_solution_system_prompt("arbiter", lang)},
+        {"role": "user",   "content": get_solution_user_prompt("arbiter", question, doc_text=doc_text, forum_text=forum_text, lang=lang)}
+    ]
+
+    steps = [
+        ("DeepSeek", client_deepseek, MODEL_DEEPSEEK, 45.0),  # 👈 Timeout confortable pour la synthèse complète
+        ("Requesty-Luna", client_requesty, MODEL_LUNA_PRIMARY, 25.0),
+        ("Requesty-Azure", client_requesty, MODEL_LUNA_AZURE, 25.0),
+        ("Requesty", client_requesty, MODEL_GROK, 25.0),
+    ]
+
+    for name, client, model_name, timeout in steps:
+        try:
+            out = _call_single_model(client, model_name, messages, timeout=timeout, temp=0.3, enable_web=False)
+            print(f"[SOLUTION][ARBITRE] {model_name} OK")
+            return out
+        except Exception as e:
+            print(f"[SOLUTION][ARBITRE] Échec {model_name} ({e})")
+
+    return "Arbitrage impossible suite à une indisponibilité technique temporaire."
+
+# ── ROUTE HTTP PRINCIPALE SOLUTION (PARALLÉLISÉE) ─────────────────────────────
+@site2_bp.route("/solution/resolve", methods=["POST"])
+@site2_bp.route("/api/solution/resolve", methods=["POST"])
+def solution_resolve():
+    """
+    Exécute Doc et Forum SIMULTANÉMENT via un pool de threads,
+    puis envoie les deux résultats consolidés à l'Arbitre.
+    """
+    try:
+        data     = request.json or {}
+        question = (data.get("question") or "").strip()
+        lang     = (data.get("lang") or "fr").strip().lower()
+
+        if not question:
+            return jsonify({"error": "Question requise"}), 400
+
+        print(f"[SOLUTION] Lancement parallèle pour : {question[:60]}...")
+
+        # 1. Parallélisation : Doc et Forum tournent en même temps
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            future_doc   = executor.submit(execute_doc_cascade, question, lang)
+            future_forum = executor.submit(execute_forum_cascade, question, lang)
+
+            doc_result   = future_doc.result()
+            forum_result = future_forum.result()
+
+        # 2. Arbitrage : prend le relais dès que les deux threads sont complétés
+        final_solution = execute_arbiter_cascade(question, doc_result, forum_result, lang=lang)
+
+        return jsonify({
+            "docResponse": doc_result,
+            "forumResponse": forum_result,
+            "finalSolution": final_solution,
+        }), 200
+
+    except Exception as e:
+        print(f"[SOLUTION] Erreur générale: {e}")
+        return jsonify({
+            "docResponse": "Erreur lors de l'analyse documentaire.",
+            "forumResponse": "Erreur lors de l'analyse des forums.",
+            "finalSolution": f"Une erreur interne est survenue : {str(e)}",
+        }), 500
